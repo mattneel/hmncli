@@ -189,6 +189,7 @@ Pinned here so they don't fall out of context. Each needs a decision before the 
 - **Capstone allocation.** Capstone allocates internally, which cuts against static allocation. Acceptable at the decode boundary if we copy into our own static-layout instruction records and free immediately. Worth prototyping to confirm the overhead is bounded.
 - **LLVM version pinning.** Pin to whatever version `llvm-zig` currently tracks, or pin to a specific LLVM major and only bump deliberately? The latter is safer for reproducibility; the former reduces maintenance. Decide once the first build works end-to-end and we know what surface area we actually use.
 - **Target-specific IR passes.** LLVM's generic passes handle most optimization. Guest-specific passes (flag elision, ROM-constant propagation, guest-memory alias analysis) may be worth adding — but only when profiling shows they matter. Do not pre-optimize.
+- **PC-as-destination and privileged state.** The `v0` checkpoint currently stays green with `PC` writes restricted to the modeled `BX LR` return path. Honest handling of `mov pc, rN`, `subs pc, pc, #N`, and related forms exposes `CPSR`/`SPSR` and banked-register semantics as a separate model-expansion pass. Until that pass exists, treat those forms as structured unsupported rather than silently approximating them. When `v0.5` (`thumb.gba`) work begins, re-verify `arm.gba` under honest `PC` handling.
 
 ## Terminology
 
