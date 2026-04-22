@@ -815,6 +815,12 @@ fn resolveBxTarget(
     address: u32,
     reg: u4,
 ) BuildError!armv4t_decode.DecodedInstruction {
+    if (isThumbPopRestoreBxReturnEpilogue(image, isa, address, reg)) {
+        // This is the narrow Thumb epilogue shape we already executed through
+        // the restoring `pop`: treat the trailing `bx` as a plain function
+        // return surface instead of trying to recover the restored target.
+        return .{ .bx_lr = {} };
+    }
     if (isa == .thumb and reg == 6) {
         const previous = try previousInstruction(image, isa, address);
         if (previous.instruction == .bl) {
@@ -822,6 +828,26 @@ fn resolveBxTarget(
         }
     }
     return .{ .bx_target = normalizeCodeTarget(try resolvePreviousRegisterValue(image, isa, address, reg)) };
+}
+
+fn isThumbPopRestoreBxReturnEpilogue(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+    reg: u4,
+) bool {
+    if (isa != .thumb) return false;
+    if (reg == 15) return false;
+
+    const previous = previousInstruction(image, isa, address) catch return false;
+    const pop_mask = switch (previous.instruction) {
+        .pop => |mask| mask,
+        else => return false,
+    };
+
+    // Keep this self-limiting: only the exact `pop {same_reg}; bx same_reg`
+    // epilogue is recognized as a return surface.
+    return pop_mask == (@as(u16, 1) << reg);
 }
 
 fn resolveDevkitArmCrt0StartupThumbBlxR3Target(
@@ -1837,7 +1863,22 @@ test "devkitARM crt0 startup blx r3 veneer rejects invalid literal targets" {
     }
 }
 
-test "tonc fixtures diverge after the startup veneer is resolved exactly" {
+test "thumb pop restore bx return epilogue resolves as a return surface" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var rom: [4]u8 = .{ 0x01, 0xBC, 0x00, 0x47 };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-pop-bx-return.gba", .data = &rom });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-bx-return.gba");
+    defer image.deinit(std.testing.allocator);
+
+    const resolved = try resolveBxTarget(image, .thumb, 0x0800_0002, 0);
+    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .bx_lr = {} }, resolved);
+}
+
+test "tonc fixtures advance past the Thumb return epilogue surface" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1850,7 +1891,7 @@ test "tonc fixtures diverge after the startup veneer is resolved exactly" {
         .{
             .rom_path = "tests/fixtures/real/tonc/sbb_reg.gba",
             .old_blocker = "Unsupported opcode 0x0000001E at 0x080003FA for armv4t",
-            .next_blocker = "Unsupported opcode 0x00004700 at 0x08000456 for armv4t",
+            .next_blocker = "Unsupported SWI 0x000005 at 0x08000820 for gba",
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
@@ -1865,7 +1906,7 @@ test "tonc fixtures diverge after the startup veneer is resolved exactly" {
         .{
             .rom_path = "tests/fixtures/real/tonc/irq_demo.gba",
             .old_blocker = "Unsupported opcode 0x00000017 at 0x08000374 for armv4t",
-            .next_blocker = "Unsupported opcode 0x00004708 at 0x080006C6 for armv4t",
+            .next_blocker = "Unsupported opcode 0x00004718 at 0x08003078 for armv4t",
         },
     };
     for (fixtures) |fixture| {
