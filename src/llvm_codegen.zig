@@ -368,10 +368,6 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("}}\n\n", .{});
 }
 
-pub fn emitPreamble(writer: *Io.Writer, _: anytype) Io.Writer.Error!void {
-    try emitPrelude(writer);
-}
-
 fn emitPsrHelpers(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("define void @hmn_switch_mode(ptr %state, i32 %new_mode) {{\n", .{});
     try writer.print("entry:\n", .{});
@@ -4560,19 +4556,29 @@ test "llvm emission includes guest state and a lifted guest entry function" {
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "call void @guest_arm_08000000(ptr %state)") != null);
 }
 
-test "llvm emission includes gba soft reset shim" {
+test "llvm emission lowers gba soft reset swi to the soft reset shim call" {
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
 
-    try emitPreamble(&output.writer, .{
-        .machine_name = "gba",
-        .output_mode = .retired_count,
-        .instruction_limit = 8,
-        .functions = &.{},
-        .entry = 0x08000000,
-    });
+    const program = Program{
+        .entry = .{ .address = 0x08000000, .isa = .arm },
+        .rom_base_address = 0x08000000,
+        .rom_bytes = &.{},
+        .save_hardware = .none,
+        .functions = &.{
+            .{
+                .entry = .{ .address = 0x08000000, .isa = .arm },
+                .instructions = &.{
+                    .{ .address = 0x08000000, .condition = .al, .size_bytes = 4, .instruction = .{ .swi = .{ .imm24 = 0x000000 } } },
+                },
+            },
+        },
+        .output_mode = .register_r0_decimal,
+        .instruction_limit = null,
+    };
+    try emitModule(&output.writer, program);
 
-    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "@shim_gba_SoftReset") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "call i32 @shim_gba_SoftReset(ptr %state)") != null);
 }
 
 test "llvm emission prepays retired counts for straight-line blocks" {

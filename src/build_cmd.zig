@@ -1384,11 +1384,22 @@ fn buildFixtureExpectFailure(
     dir: std.Io.Dir,
     rom_path: []const u8,
 ) ![]u8 {
+    const fixture_bytes = try Io.Dir.cwd().readFileAlloc(
+        io,
+        rom_path,
+        allocator,
+        .limited(16 * 1024 * 1024),
+    );
+    defer allocator.free(fixture_bytes);
+
+    const rom_name = std.fs.path.basename(rom_path);
+    try dir.writeFile(io, .{ .sub_path = rom_name, .data = fixture_bytes });
+
     var output: Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
 
     run(io, allocator, dir, &output.writer, .{
-        .rom_path = rom_path,
+        .rom_path = rom_name,
         .machine_name = "gba",
         .target = "x86_64-linux",
         .output_mode = .frame_raw,
@@ -1456,6 +1467,7 @@ test "tonc sbb_reg no longer stops at startup soft reset swi" {
     defer std.testing.allocator.free(stderr);
 
     try std.testing.expect(std.mem.indexOf(u8, stderr, "Unsupported SWI 0x000000") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "Unsupported opcode 0x00004730 at 0x08000124 for armv4t") != null);
 }
 
 test "build reports a structured diagnostic for an unsupported opcode" {

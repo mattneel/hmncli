@@ -9,10 +9,11 @@
 
 ## First Homonculi Failure Surface
 
+- Re-measured after the startup soft-reset fix on 2026-04-22.
 - `sbb_reg`: `Unsupported opcode 0x00004730 at 0x08000124 for armv4t`
-- `obj_demo`: `Unsupported SWI 0x000000 at 0x08000186 for gba`
-- `key_demo`: `Unsupported SWI 0x000000 at 0x08000186 for gba`
-- `irq_demo`: `Unsupported SWI 0x000000 at 0x08000186 for gba`
+- `obj_demo`: `Unsupported opcode 0x00004730 at 0x08000124 for armv4t`
+- `key_demo`: `Unsupported opcode 0x00004730 at 0x08000124 for armv4t`
+- `irq_demo`: `Unsupported opcode 0x00004730 at 0x08000124 for armv4t`
 
 ## Scope Decisions
 
