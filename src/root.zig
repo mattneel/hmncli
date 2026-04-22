@@ -50,7 +50,7 @@ pub const catalog = @import("catalog.zig");
 pub const capstone_api = @import("capstone_api.zig");
 pub const gba_ppu = @import("gba_ppu.zig");
 pub const frame_test_support = @import("frame_test_support.zig");
-pub const tonc_fixture_support = @import("tonc_fixture_support.zig");
+const tonc_fixture_support = @import("tonc_fixture_support.zig");
 
 test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
