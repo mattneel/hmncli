@@ -2094,7 +2094,7 @@ test "build emits frame_raw llvm hooks when requested" {
         io,
         "ppu-hello-native.ll",
         std.testing.allocator,
-        .limited(512 * 1024),
+        .limited(2 * 1024 * 1024),
     );
     defer std.testing.allocator.free(llvm_bytes);
 
@@ -2301,4 +2301,48 @@ test "build retired counts accumulate across lifted function calls" {
 
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("retired=5\n", result.stdout);
+}
+
+test "build retired counts do not overcount when a block stops mid-execution" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = [_]u8{
+        0x00, 0x00, 0xA0, 0xE3, // mov r0, #0
+        0x01, 0x00, 0x80, 0xE2, // add r0, r0, #1
+        0x01, 0x00, 0x80, 0xE2, // add r0, r0, #1
+        0xFE, 0xFF, 0xFF, 0xEA, // b   .
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "mid-block-stop.gba", .data = &rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "mid-block-stop.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_mode = .retired_count,
+            .max_instructions = 2,
+            .output_path = "mid-block-stop-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./mid-block-stop-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("retired=2\n", result.stdout);
 }
