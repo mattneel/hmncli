@@ -771,27 +771,34 @@ fn resolveStartupBxTargetValue(
 
     return switch (previous.instruction) {
         .bl => try resolveStartupBxTargetValue(image, isa, previous.address, reg),
+        .store => try resolveStartupBxTargetValue(image, isa, previous.address, reg),
+        .ldr_word_imm => |load| if (load.rd != reg)
+            try resolveStartupBxTargetValue(image, isa, previous.address, reg)
+        else
+            return error.UnsupportedOpcode,
+        .subs_reg => |sub| if (sub.rd != reg)
+            try resolveStartupBxTargetValue(image, isa, previous.address, reg)
+        else
+            return error.UnsupportedOpcode,
         .add_imm => |add| blk: {
-            if (add.rd == reg and add.imm == 0) break :blk try resolveStartupBxTargetValue(image, isa, previous.address, add.rn);
-            break :blk try resolveStartupBxTargetValue(image, isa, previous.address, reg);
+            if (add.rd != reg or add.imm != 0) return error.UnsupportedOpcode;
+            break :blk try resolveStartupBxTargetValue(image, isa, previous.address, add.rn);
         },
         .adds_imm => |add| blk: {
-            if (add.rd == reg and add.imm == 0) break :blk try resolveStartupBxTargetValue(image, isa, previous.address, add.rn);
-            break :blk try resolveStartupBxTargetValue(image, isa, previous.address, reg);
+            if (add.rd != reg or add.imm != 0) return error.UnsupportedOpcode;
+            break :blk try resolveStartupBxTargetValue(image, isa, previous.address, add.rn);
         },
-        .mov_imm => |mov| if (mov.rd == reg)
-            mov.imm
-        else
-            try resolveStartupBxTargetValue(image, isa, previous.address, reg),
         .movs_imm => |mov| if (mov.rd == reg)
             mov.imm
         else
-            try resolveStartupBxTargetValue(image, isa, previous.address, reg),
-        .lsls_imm => |shift| if (shift.rd == reg)
+            return error.UnsupportedOpcode,
+        .lsls_imm => |shift| if (shift.rd != reg)
+            try resolveStartupBxTargetValue(image, isa, previous.address, reg)
+        else if (shift.rm == reg)
             try resolveStartupBxTargetValue(image, isa, previous.address, reg) << @as(u5, @intCast(shift.imm))
         else
-            try resolveStartupBxTargetValue(image, isa, previous.address, reg),
-        else => try resolveStartupBxTargetValue(image, isa, previous.address, reg),
+            return error.UnsupportedOpcode,
+        else => return error.UnsupportedOpcode,
     };
 }
 
