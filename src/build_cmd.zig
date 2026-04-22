@@ -500,6 +500,19 @@ fn enqueueSuccessors(
                 return;
             }
 
+            if (try resolveStartupConditionalBranch(image, isa, address, branch)) |take_branch| {
+                if (take_branch) {
+                    if (branch.target == address) {
+                        has_self_loop.* = true;
+                        return;
+                    }
+                    try enqueueBlockAddress(allocator, writer, pending_blocks, image, isa, branch.target);
+                } else {
+                    try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
+                }
+                return;
+            }
+
             try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
             if (branch.target == address) {
                 has_self_loop.* = true;
@@ -562,6 +575,58 @@ fn enqueueSuccessors(
             try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
         },
     }
+}
+
+fn resolveStartupConditionalBranch(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+    branch: @FieldType(armv4t_decode.DecodedInstruction, "branch"),
+) BuildError!?bool {
+    if (isa != .thumb) return null;
+    if (branch.cond != .hs and branch.cond != .lo) return null;
+
+    const previous = previousThumbInstruction(image, address) catch return null;
+    const shift = switch (previous.instruction) {
+        .lsls_imm => |shift| shift,
+        else => return null,
+    };
+
+    if (shift.rd != shift.rm or shift.imm == 0) return null;
+
+    const source = previousThumbInstruction(image, previous.address) catch return null;
+    const load = switch (source.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (load.rd != shift.rm or load.base != 15) return null;
+
+    const literal_address = pcValueForInstruction(.thumb, source.address) + load.offset;
+    const literal_offset = if (literal_address < image.base_address) return null else literal_address - image.base_address;
+    if (literal_offset + 4 > image.bytes.len) return null;
+
+    const source_value = armv4t_decode.readWord(image.bytes, literal_offset);
+    const carry_set = lslImmediateCarryOut(source_value, shift.imm) orelse return null;
+    return if (branch.cond == .hs) carry_set else !carry_set;
+}
+
+fn previousThumbInstruction(
+    image: gba_loader.RomImage,
+    address: u32,
+) BuildError!DecodedNode {
+    for ([_]u8{ 2, 4 }) |candidate_size| {
+        if (address < image.base_address + candidate_size) continue;
+        const candidate_address = address - candidate_size;
+        const decoded = decodeImageInstructionUnchecked(image, .thumb, candidate_address) catch continue;
+        if (candidate_address + decoded.size_bytes == address) return decoded;
+    }
+    return error.UnsupportedOpcode;
+}
+
+fn lslImmediateCarryOut(value: u32, amount: u32) ?bool {
+    if (amount == 0 or amount > 32) return null;
+    const carry_bit_index = 32 - amount;
+    return ((value >> @as(u5, @intCast(carry_bit_index))) & 1) != 0;
 }
 
 fn enqueueFallthrough(
@@ -711,16 +776,13 @@ fn resolveDecodedInstruction(
     decoded: armv4t_decode.DecodedInstruction,
 ) BuildError!armv4t_decode.DecodedInstruction {
     const resolved = switch (decoded) {
-        .subs_imm => |sub| if (sub.rd == 15 and sub.rn == 15)
-            blk: {
-                const target = normalizePcWriteTarget(pcValueForInstruction(isa, address) - sub.imm, isa);
-                if (offsetForAddress(image, target, isa) == null) return error.UnsupportedOpcode;
-                break :blk armv4t_decode.DecodedInstruction{ .exception_return = .{
-                    .target = target,
-                } };
-            }
-        else
-            decoded,
+        .subs_imm => |sub| if (sub.rd == 15 and sub.rn == 15) blk: {
+            const target = normalizePcWriteTarget(pcValueForInstruction(isa, address) - sub.imm, isa);
+            if (offsetForAddress(image, target, isa) == null) return error.UnsupportedOpcode;
+            break :blk armv4t_decode.DecodedInstruction{ .exception_return = .{
+                .target = target,
+            } };
+        } else decoded,
         .add_reg => |add| if (add.rd == 15)
             try resolveAddRegPcTarget(image, isa, address, add)
         else
@@ -1516,7 +1578,7 @@ test "build emits a native executable for the first gba mov-plus-div slice" {
     try std.testing.expectEqualStrings("5\n", result.stdout);
 }
 
-test "tonc fixtures get past the startup bx r6 trampoline" {
+test "tonc fixtures stop at the shared arm decode blocker after startup pruning" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1533,7 +1595,8 @@ test "tonc fixtures get past the startup bx r6 trampoline" {
 
         try std.testing.expect(result.failed);
         try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x00004730 at 0x08000124 for armv4t") == null);
-        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported control flow target 0x02000000 for gba") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported control flow target 0x02000000 for gba") == null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x0000C901 at 0x080001A6 for armv4t") != null);
     }
 }
 
