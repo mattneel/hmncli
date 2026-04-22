@@ -127,6 +127,7 @@ fn liftRom(
 fn detectSaveHardware(rom_bytes: []const u8) llvm_codegen.SaveHardware {
     if (std.mem.indexOf(u8, rom_bytes, "SRAM_V") != null) return .sram;
     if (std.mem.indexOf(u8, rom_bytes, "FLASH512_V") != null) return .flash64;
+    if (std.mem.indexOf(u8, rom_bytes, "FLASH1M_V") != null) return .flash128;
     return .none;
 }
 
@@ -1863,6 +1864,49 @@ test "build uses the real jsmolka save-flash64 rom and reports the rom verdict" 
 
     const result = try std.process.run(std.testing.allocator, io, .{
         .argv = &.{"./save-flash64-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("PASS\n", result.stdout);
+}
+
+test "build uses the real jsmolka save-flash128 rom and reports the rom verdict" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/real/jsmolka/save-flash128.gba",
+        std.testing.allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer std.testing.allocator.free(rom);
+    try tmp.dir.writeFile(io, .{ .sub_path = "save-flash128.gba", .data = rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "save-flash128.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "save-flash128-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./save-flash128-native"},
         .cwd = .{ .dir = tmp.dir },
         .stdout_limit = .limited(1024),
         .stderr_limit = .limited(1024),
