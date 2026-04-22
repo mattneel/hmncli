@@ -986,6 +986,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .id = .{
             .kind = .instruction,
             .namespace = "armv4t",
+            .name = "ldr_byte_post_imm",
+        },
+        .isa = .armv4t,
+        .mnemonic = "ldrb",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 ARM memory surface for post-index byte loads with base writeback."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
             .name = "ldr_byte_reg",
         },
         .isa = .armv4t,

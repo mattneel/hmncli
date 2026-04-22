@@ -417,6 +417,11 @@ pub const DecodedInstruction = union(enum) {
         base: u4,
         offset: u32,
     },
+    ldr_byte_post_imm: struct {
+        rd: u4,
+        base: u4,
+        offset: u32,
+    },
     ldr_byte_reg: struct {
         rd: u4,
         base: u4,
@@ -1537,6 +1542,15 @@ fn parseByteLoad(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstructi
     if (mem.disp < 0) return error.UnsupportedOpcode;
     if (mem.scale != 0 and mem.scale != 1) return error.UnsupportedOpcode;
 
+    if (insn.post_index) {
+        return .{ .ldr_byte_post_imm = .{
+            .rd = rd,
+            .base = try parseRegisterId(mem.base),
+            .offset = @intCast(mem.disp),
+        } };
+    }
+    if (insn.writeback) return error.UnsupportedOpcode;
+
     return .{ .ldr_byte_imm = .{
         .rd = rd,
         .base = try parseRegisterId(mem.base),
@@ -2498,6 +2512,18 @@ test "decode reads ldr byte immediate" {
             .rd = 1,
             .base = 11,
             .offset = 0,
+        } },
+        decoded,
+    );
+}
+
+test "decode reads ldr byte post-index immediate" {
+    const decoded = try decode(0xE4D02001, 0x080007F4);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .ldr_byte_post_imm = .{
+            .rd = 2,
+            .base = 0,
+            .offset = 1,
         } },
         decoded,
     );

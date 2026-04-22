@@ -126,6 +126,7 @@ fn liftRom(
 
 fn detectSaveHardware(rom_bytes: []const u8) llvm_codegen.SaveHardware {
     if (std.mem.indexOf(u8, rom_bytes, "SRAM_V") != null) return .sram;
+    if (std.mem.indexOf(u8, rom_bytes, "FLASH512_V") != null) return .flash64;
     return .none;
 }
 
@@ -342,6 +343,7 @@ fn ensureDeclared(
         .ldr_word_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_word_imm"),
         .ldr_word_imm_signed => _ = try catalog.lookupInstruction("armv4t", "ldr_word_imm_signed"),
         .ldr_byte_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_byte_imm"),
+        .ldr_byte_post_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_byte_post_imm"),
         .ldr_byte_reg => _ = try catalog.lookupInstruction("armv4t", "ldr_byte_reg"),
         .ldr_halfword_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_halfword_imm"),
         .ldr_halfword_pre_index_reg => _ = try catalog.lookupInstruction("armv4t", "ldr_halfword_pre_reg"),
@@ -1079,6 +1081,7 @@ fn writesUnsupportedPcDestination(decoded: armv4t_decode.DecodedInstruction) boo
         .ldr_word_imm => |load| load.rd == 15,
         .ldr_word_imm_signed => |load| load.rd == 15,
         .ldr_byte_imm => |load| load.rd == 15,
+        .ldr_byte_post_imm => |load| load.rd == 15,
         .ldr_byte_reg => |load| load.rd == 15,
         .ldr_halfword_imm => |load| load.rd == 15,
         .ldr_halfword_pre_index_reg => |load| load.rd == 15,
@@ -1817,6 +1820,49 @@ test "build uses the real jsmolka save-sram rom and reports the rom verdict" {
 
     const result = try std.process.run(std.testing.allocator, io, .{
         .argv = &.{"./save-sram-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("PASS\n", result.stdout);
+}
+
+test "build uses the real jsmolka save-flash64 rom and reports the rom verdict" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/real/jsmolka/save-flash64.gba",
+        std.testing.allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer std.testing.allocator.free(rom);
+    try tmp.dir.writeFile(io, .{ .sub_path = "save-flash64.gba", .data = rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "save-flash64.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "save-flash64-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./save-flash64-native"},
         .cwd = .{ .dir = tmp.dir },
         .stdout_limit = .limited(1024),
         .stderr_limit = .limited(1024),
