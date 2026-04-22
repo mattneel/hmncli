@@ -186,10 +186,7 @@ fn ensureDeclared(
             .halfword => _ = try catalog.lookupInstruction("armv4t", "str_halfword_imm"),
             .byte => _ = try catalog.lookupInstruction("armv4t", "str_byte_imm"),
         },
-        .branch => |branch| switch (branch.cond) {
-            .al => _ = try catalog.lookupInstruction("armv4t", "b"),
-            .ne => _ = try catalog.lookupInstruction("armv4t", "bne"),
-        },
+        .branch => |branch| _ = try catalog.lookupInstruction("armv4t", branchInstructionName(branch.cond)),
         .bl => _ = try catalog.lookupInstruction("armv4t", "bl"),
         .bx_lr => _ = try catalog.lookupInstruction("armv4t", "bx_lr"),
         .msr_cpsr_f_imm => _ = try catalog.lookupInstruction("armv4t", "msr_cpsr_f_imm"),
@@ -214,22 +211,22 @@ fn enqueueSuccessors(
     has_self_loop: *bool,
 ) BuildError!void {
     switch (decoded) {
-        .branch => |branch| switch (branch.cond) {
-            .al => {
+        .branch => |branch| {
+            if (branch.cond == .al) {
                 if (branch.target == address) {
                     has_self_loop.* = true;
                     return;
                 }
                 try enqueueAddress(allocator, writer, pending_blocks, image, branch.target);
-            },
-            .ne => {
-                try enqueueFallthrough(allocator, pending_blocks, image, address);
-                if (branch.target == address) {
-                    has_self_loop.* = true;
-                    return;
-                }
-                try enqueueAddress(allocator, writer, pending_blocks, image, branch.target);
-            },
+                return;
+            }
+
+            try enqueueFallthrough(allocator, pending_blocks, image, address);
+            if (branch.target == address) {
+                has_self_loop.* = true;
+                return;
+            }
+            try enqueueAddress(allocator, writer, pending_blocks, image, branch.target);
         },
         .bl => |bl| {
             try enqueueAddress(allocator, writer, pending_functions, image, bl.target);
@@ -312,6 +309,26 @@ fn sortFunctions(functions: []llvm_codegen.Function) void {
         }
         if (min_index != i) std.mem.swap(llvm_codegen.Function, &functions[i], &functions[min_index]);
     }
+}
+
+fn branchInstructionName(cond: armv4t_decode.Cond) []const u8 {
+    return switch (cond) {
+        .eq => "beq",
+        .ne => "bne",
+        .hs => "bhs",
+        .lo => "blo",
+        .mi => "bmi",
+        .pl => "bpl",
+        .vs => "bvs",
+        .vc => "bvc",
+        .hi => "bhi",
+        .ls => "bls",
+        .ge => "bge",
+        .lt => "blt",
+        .gt => "bgt",
+        .le => "ble",
+        .al => "b",
+    };
 }
 
 fn isStore(decoded: armv4t_decode.DecodedInstruction) bool {
@@ -558,6 +575,6 @@ test "build uses the real jsmolka arm rom and reports the next unsupported surfa
     );
     try std.testing.expectStringStartsWith(
         output.writer.buffered(),
-        "Unsupported opcode 0x0A000002 at 0x080000FC for armv4t\n",
+        "Unsupported opcode 0xE12FFF10 at 0x0800028C for armv4t\n",
     );
 }

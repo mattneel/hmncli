@@ -7,8 +7,21 @@ pub const DecodeError = error{
 } || capstone_api.DisassembleError;
 
 pub const Cond = enum {
-    al,
+    eq,
     ne,
+    hs,
+    lo,
+    mi,
+    pl,
+    vs,
+    vc,
+    hi,
+    ls,
+    ge,
+    lt,
+    gt,
+    le,
+    al,
 };
 
 pub const Offset = union(enum) {
@@ -145,8 +158,21 @@ fn parseStore(insn: capstone_api.ArmInstruction, size: StoreSize) DecodeError!De
 fn parseBranch(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
     if (insn.operand_count != 1) return error.UnsupportedOpcode;
     const cond: Cond = switch (insn.cc) {
-        c.ARMCC_AL => .al,
+        c.ARMCC_EQ => .eq,
         c.ARMCC_NE => .ne,
+        c.ARMCC_HS => .hs,
+        c.ARMCC_LO => .lo,
+        c.ARMCC_MI => .mi,
+        c.ARMCC_PL => .pl,
+        c.ARMCC_VS => .vs,
+        c.ARMCC_VC => .vc,
+        c.ARMCC_HI => .hi,
+        c.ARMCC_LS => .ls,
+        c.ARMCC_GE => .ge,
+        c.ARMCC_LT => .lt,
+        c.ARMCC_GT => .gt,
+        c.ARMCC_LE => .le,
+        c.ARMCC_AL => .al,
         else => return error.UnsupportedOpcode,
     };
     return .{ .branch = .{
@@ -270,6 +296,41 @@ test "decode reads unconditional branch target" {
         DecodedInstruction{ .branch = .{ .cond = .al, .target = 0x080000C0 } },
         decoded,
     );
+}
+
+test "decode reads ARM conditional branch targets across the flag-only family" {
+    const cases = [_]struct {
+        word: u32,
+        address: u32,
+        cond: Cond,
+        target: u32,
+    }{
+        .{ .word = 0x0A000002, .address = 0x080000FC, .cond = .eq, .target = 0x0800010C },
+        .{ .word = 0x1A000002, .address = 0x08000110, .cond = .ne, .target = 0x08000120 },
+        .{ .word = 0x2A000002, .address = 0x08000124, .cond = .hs, .target = 0x08000134 },
+        .{ .word = 0x3A000002, .address = 0x08000138, .cond = .lo, .target = 0x08000148 },
+        .{ .word = 0x4A000002, .address = 0x0800014C, .cond = .mi, .target = 0x0800015C },
+        .{ .word = 0x5A000002, .address = 0x08000160, .cond = .pl, .target = 0x08000170 },
+        .{ .word = 0x6A000002, .address = 0x08000174, .cond = .vs, .target = 0x08000184 },
+        .{ .word = 0x7A000002, .address = 0x08000188, .cond = .vc, .target = 0x08000198 },
+        .{ .word = 0x8A000002, .address = 0x0800019C, .cond = .hi, .target = 0x080001AC },
+        .{ .word = 0x9A000002, .address = 0x080001B0, .cond = .ls, .target = 0x080001C0 },
+        .{ .word = 0xAA000002, .address = 0x080001C4, .cond = .ge, .target = 0x080001D4 },
+        .{ .word = 0xBA000002, .address = 0x080001EC, .cond = .lt, .target = 0x080001FC },
+        .{ .word = 0xCA000002, .address = 0x08000214, .cond = .gt, .target = 0x08000224 },
+        .{ .word = 0xDA000002, .address = 0x0800023C, .cond = .le, .target = 0x0800024C },
+    };
+
+    for (cases) |case| {
+        const decoded = try decode(case.word, case.address);
+        try std.testing.expectEqualDeep(
+            DecodedInstruction{ .branch = .{
+                .cond = case.cond,
+                .target = case.target,
+            } },
+            decoded,
+        );
+    }
 }
 
 test "decode reads word store with register offset" {

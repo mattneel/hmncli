@@ -308,37 +308,38 @@ fn emitInstructionBlock(writer: *Io.Writer, function: Function, node: Instructio
             );
             try emitFallthrough(writer, function, node.address + 4);
         },
-        .branch => |branch| switch (branch.cond) {
-            .al => if (branch.target == node.address)
-                try emitFunctionReturn(writer, function.entry_address)
-            else if (hasAddress(function, branch.target))
-                try emitBranchTo(writer, branch.target)
-            else
-                try emitFunctionReturn(writer, function.entry_address),
-            .ne => {
-                try emitFlagZPtr(writer, "state", node.address);
-                try writer.print("  %z_branch_{x:0>8} = load i1, ptr %flag_z_ptr_{x:0>8}, align 1\n", .{ node.address, node.address });
-                const has_fallthrough = hasAddress(function, node.address + 4);
-                const has_target = hasAddress(function, branch.target);
-                if (has_fallthrough and has_target) {
-                    try writer.print(
-                        "  br i1 %z_branch_{x:0>8}, label %pc_{x:0>8}, label %pc_{x:0>8}\n",
-                        .{ node.address, node.address + 4, branch.target },
-                    );
-                } else if (has_fallthrough) {
-                    try writer.print(
-                        "  br i1 %z_branch_{x:0>8}, label %pc_{x:0>8}, label %guest_return_{x:0>8}\n",
-                        .{ node.address, node.address + 4, function.entry_address },
-                    );
-                } else if (has_target) {
-                    try writer.print(
-                        "  br i1 %z_branch_{x:0>8}, label %guest_return_{x:0>8}, label %pc_{x:0>8}\n",
-                        .{ node.address, function.entry_address, branch.target },
-                    );
-                } else {
+        .branch => |branch| {
+            if (branch.cond == .al) {
+                if (branch.target == node.address)
+                    try emitFunctionReturn(writer, function.entry_address)
+                else if (hasAddress(function, branch.target))
+                    try emitBranchTo(writer, branch.target)
+                else
                     try emitFunctionReturn(writer, function.entry_address);
-                }
-            },
+                return;
+            }
+
+            try emitBranchCondition(writer, "state", node.address, branch.cond);
+            const has_fallthrough = hasAddress(function, node.address + 4);
+            const has_target = hasAddress(function, branch.target);
+            if (has_fallthrough and has_target) {
+                try writer.print(
+                    "  br i1 %branch_cond_{x:0>8}, label %pc_{x:0>8}, label %pc_{x:0>8}\n",
+                    .{ node.address, branch.target, node.address + 4 },
+                );
+            } else if (has_fallthrough) {
+                try writer.print(
+                    "  br i1 %branch_cond_{x:0>8}, label %guest_return_{x:0>8}, label %pc_{x:0>8}\n",
+                    .{ node.address, function.entry_address, node.address + 4 },
+                );
+            } else if (has_target) {
+                try writer.print(
+                    "  br i1 %branch_cond_{x:0>8}, label %pc_{x:0>8}, label %guest_return_{x:0>8}\n",
+                    .{ node.address, branch.target, function.entry_address },
+                );
+            } else {
+                try emitFunctionReturn(writer, function.entry_address);
+            }
         },
         .bl => |bl| {
             try emitRegPtr(writer, "state", node.address, "lr", 14);
@@ -460,6 +461,99 @@ fn emitFlagPtr(
         "  %{s}_ptr_{x:0>8} = getelementptr inbounds %GuestState, ptr %{s}, i32 0, i32 {d}\n",
         .{ flagPtrPrefix(flag), address, state_name, flagFieldIndex(flag) },
     );
+}
+
+fn emitFlagLoad(
+    writer: *Io.Writer,
+    state_name: []const u8,
+    address: u32,
+    flag: Flag,
+) Io.Writer.Error!void {
+    try emitFlagPtr(writer, state_name, address, flag);
+    try writer.print(
+        "  %{s}_val_{x:0>8} = load i1, ptr %{s}_ptr_{x:0>8}, align 1\n",
+        .{ flagPtrPrefix(flag), address, flagPtrPrefix(flag), address },
+    );
+}
+
+fn emitBranchCondition(
+    writer: *Io.Writer,
+    state_name: []const u8,
+    address: u32,
+    cond: armv4t_decode.Cond,
+) Io.Writer.Error!void {
+    switch (cond) {
+        .eq => {
+            try emitFlagLoad(writer, state_name, address, .z);
+            try writer.print("  %branch_cond_{x:0>8} = or i1 %flag_z_val_{x:0>8}, false\n", .{ address, address });
+        },
+        .ne => {
+            try emitFlagLoad(writer, state_name, address, .z);
+            try writer.print("  %branch_cond_{x:0>8} = xor i1 %flag_z_val_{x:0>8}, true\n", .{ address, address });
+        },
+        .hs => {
+            try emitFlagLoad(writer, state_name, address, .c);
+            try writer.print("  %branch_cond_{x:0>8} = or i1 %flag_c_val_{x:0>8}, false\n", .{ address, address });
+        },
+        .lo => {
+            try emitFlagLoad(writer, state_name, address, .c);
+            try writer.print("  %branch_cond_{x:0>8} = xor i1 %flag_c_val_{x:0>8}, true\n", .{ address, address });
+        },
+        .mi => {
+            try emitFlagLoad(writer, state_name, address, .n);
+            try writer.print("  %branch_cond_{x:0>8} = or i1 %flag_n_val_{x:0>8}, false\n", .{ address, address });
+        },
+        .pl => {
+            try emitFlagLoad(writer, state_name, address, .n);
+            try writer.print("  %branch_cond_{x:0>8} = xor i1 %flag_n_val_{x:0>8}, true\n", .{ address, address });
+        },
+        .vs => {
+            try emitFlagLoad(writer, state_name, address, .v);
+            try writer.print("  %branch_cond_{x:0>8} = or i1 %flag_v_val_{x:0>8}, false\n", .{ address, address });
+        },
+        .vc => {
+            try emitFlagLoad(writer, state_name, address, .v);
+            try writer.print("  %branch_cond_{x:0>8} = xor i1 %flag_v_val_{x:0>8}, true\n", .{ address, address });
+        },
+        .hi => {
+            try emitFlagLoad(writer, state_name, address, .c);
+            try emitFlagLoad(writer, state_name, address, .z);
+            try writer.print("  %not_z_{x:0>8} = xor i1 %flag_z_val_{x:0>8}, true\n", .{ address, address });
+            try writer.print("  %branch_cond_{x:0>8} = and i1 %flag_c_val_{x:0>8}, %not_z_{x:0>8}\n", .{ address, address, address });
+        },
+        .ls => {
+            try emitFlagLoad(writer, state_name, address, .c);
+            try emitFlagLoad(writer, state_name, address, .z);
+            try writer.print("  %not_c_{x:0>8} = xor i1 %flag_c_val_{x:0>8}, true\n", .{ address, address });
+            try writer.print("  %branch_cond_{x:0>8} = or i1 %not_c_{x:0>8}, %flag_z_val_{x:0>8}\n", .{ address, address, address });
+        },
+        .ge => {
+            try emitFlagLoad(writer, state_name, address, .n);
+            try emitFlagLoad(writer, state_name, address, .v);
+            try writer.print("  %branch_cond_{x:0>8} = icmp eq i1 %flag_n_val_{x:0>8}, %flag_v_val_{x:0>8}\n", .{ address, address, address });
+        },
+        .lt => {
+            try emitFlagLoad(writer, state_name, address, .n);
+            try emitFlagLoad(writer, state_name, address, .v);
+            try writer.print("  %branch_cond_{x:0>8} = icmp ne i1 %flag_n_val_{x:0>8}, %flag_v_val_{x:0>8}\n", .{ address, address, address });
+        },
+        .gt => {
+            try emitFlagLoad(writer, state_name, address, .n);
+            try emitFlagLoad(writer, state_name, address, .v);
+            try emitFlagLoad(writer, state_name, address, .z);
+            try writer.print("  %eq_nv_{x:0>8} = icmp eq i1 %flag_n_val_{x:0>8}, %flag_v_val_{x:0>8}\n", .{ address, address, address });
+            try writer.print("  %not_z_{x:0>8} = xor i1 %flag_z_val_{x:0>8}, true\n", .{ address, address });
+            try writer.print("  %branch_cond_{x:0>8} = and i1 %eq_nv_{x:0>8}, %not_z_{x:0>8}\n", .{ address, address, address });
+        },
+        .le => {
+            try emitFlagLoad(writer, state_name, address, .n);
+            try emitFlagLoad(writer, state_name, address, .v);
+            try emitFlagLoad(writer, state_name, address, .z);
+            try writer.print("  %lt_nv_{x:0>8} = icmp ne i1 %flag_n_val_{x:0>8}, %flag_v_val_{x:0>8}\n", .{ address, address, address });
+            try writer.print("  %branch_cond_{x:0>8} = or i1 %lt_nv_{x:0>8}, %flag_z_val_{x:0>8}\n", .{ address, address, address });
+        },
+        .al => unreachable,
+    }
 }
 
 fn boolLiteral(value: bool) []const u8 {
