@@ -201,7 +201,7 @@ fn liftFunction(
         const raw_opcode = decoded_opcode.raw_opcode;
         const size_bytes = decoded_opcode.size_bytes;
         const decoded_initial = decoded_opcode.instruction;
-        const decoded = resolveDecodedInstruction(image, function_entry.isa, address, decoded_initial, nodes.items) catch {
+        const decoded = resolveDecodedInstruction(image, function_entry, address, decoded_initial) catch {
             try renderUnsupportedOpcode(writer, raw_opcode, address);
             return error.UnsupportedOpcode;
         };
@@ -770,11 +770,11 @@ fn sortFunctions(functions: []llvm_codegen.Function) void {
 
 fn resolveDecodedInstruction(
     image: gba_loader.RomImage,
-    isa: armv4t_decode.InstructionSet,
+    function_entry: armv4t_decode.CodeAddress,
     address: u32,
     decoded: armv4t_decode.DecodedInstruction,
-    prior_nodes: []const llvm_codegen.InstructionNode,
 ) BuildError!armv4t_decode.DecodedInstruction {
+    const isa = function_entry.isa;
     const resolved = switch (decoded) {
         .subs_imm => |sub| if (sub.rd == 15 and sub.rn == 15) blk: {
             const target = normalizePcWriteTarget(pcValueForInstruction(isa, address) - sub.imm, isa);
@@ -787,7 +787,7 @@ fn resolveDecodedInstruction(
             try resolveAddRegPcTarget(image, isa, address, add)
         else
             decoded,
-        .bx_reg => |bx| try resolveBxTarget(image, isa, address, bx.reg, prior_nodes),
+        .bx_reg => |bx| try resolveBxTarget(image, function_entry, address, bx.reg),
         .mov_reg => |mov| if (mov.rd == 15 and mov.rm != 14)
             try resolveMovPcTarget(image, isa, address, mov.rm)
         else
@@ -814,35 +814,34 @@ fn resolveDecodedInstruction(
 
 fn resolveBxTarget(
     image: gba_loader.RomImage,
-    isa: armv4t_decode.InstructionSet,
+    function_entry: armv4t_decode.CodeAddress,
     address: u32,
     reg: u4,
-    prior_nodes: []const llvm_codegen.InstructionNode,
 ) BuildError!armv4t_decode.DecodedInstruction {
-    if (isValidatedThumbSavedLrReturnEpilogue(image, isa, address, reg, prior_nodes)) {
+    if (isValidatedThumbSavedLrReturnEpilogue(image, function_entry, address, reg)) {
         // This is a validated Thumb epilogue: the function already saved `lr`
         // in its prologue, and the exact `pop {same_reg}; bx same_reg` tail is
         // returning that saved link value from the stack.
         return .{ .thumb_saved_lr_return = {} };
     }
-    if (isa == .thumb and reg == 6) {
-        const previous = try previousInstruction(image, isa, address);
+    if (function_entry.isa == .thumb and reg == 6) {
+        const previous = try previousInstruction(image, function_entry.isa, address);
         if (previous.instruction == .bl) {
-            return .{ .bx_target = normalizeCodeTarget(try resolveStartupThumbBxR6TargetValue(image, isa, address)) };
+            return .{ .bx_target = normalizeCodeTarget(try resolveStartupThumbBxR6TargetValue(image, function_entry.isa, address)) };
         }
     }
-    return .{ .bx_target = normalizeCodeTarget(try resolvePreviousRegisterValue(image, isa, address, reg)) };
+    return .{ .bx_target = normalizeCodeTarget(try resolvePreviousRegisterValue(image, function_entry.isa, address, reg)) };
 }
 
 fn isValidatedThumbSavedLrReturnEpilogue(
     image: gba_loader.RomImage,
-    isa: armv4t_decode.InstructionSet,
+    function_entry: armv4t_decode.CodeAddress,
     address: u32,
     reg: u4,
-    prior_nodes: []const llvm_codegen.InstructionNode,
 ) bool {
+    const isa = function_entry.isa;
     if (isa != .thumb) return false;
-    if (!functionHasSavedLrPrologue(prior_nodes)) return false;
+    if (!functionEntryHasSavedLrPush(image, function_entry)) return false;
     if (reg == 15) return false;
 
     const previous = previousInstruction(image, isa, address) catch return false;
@@ -852,19 +851,22 @@ fn isValidatedThumbSavedLrReturnEpilogue(
     };
 
     // Keep this self-limiting: only the exact `pop {same_reg}; bx same_reg`
-    // epilogue is recognized, and only when the function already proved it
-    // saved `lr` in its own prologue.
+    // epilogue is recognized, and only when the function entry itself proves
+    // this function saved `lr` in its own prologue.
     return pop_mask == (@as(u16, 1) << reg);
 }
 
-fn functionHasSavedLrPrologue(prior_nodes: []const llvm_codegen.InstructionNode) bool {
-    for (prior_nodes) |node| {
-        switch (node.instruction) {
-            .push => |mask| if ((mask & (@as(u16, 1) << 14)) != 0) return true,
-            else => {},
-        }
-    }
-    return false;
+fn functionEntryHasSavedLrPush(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+) bool {
+    if (function_entry.isa != .thumb) return false;
+    const entry = decodeImageInstructionUnchecked(image, .thumb, function_entry.address) catch return false;
+    const mask = switch (entry.instruction) {
+        .push => |mask| mask,
+        else => return false,
+    };
+    return (mask & (@as(u16, 1) << 14)) != 0;
 }
 
 fn resolveDevkitArmCrt0StartupThumbBlxR3Target(
@@ -1885,106 +1887,100 @@ test "thumb saved-lr return epilogue resolves as a distinct return surface" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var rom: [4]u8 = .{ 0x01, 0xBC, 0x00, 0x47 };
+    var rom: [8]u8 = .{ 0x00, 0xB5, 0x01, 0xBC, 0x00, 0x47, 0x00, 0xBF };
     try tmp.dir.writeFile(io, .{ .sub_path = "thumb-pop-bx-return.gba", .data = &rom });
 
     const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-bx-return.gba");
     defer image.deinit(std.testing.allocator);
 
-    const prior_nodes = [_]llvm_codegen.InstructionNode{
-        .{
-            .address = 0x0800_0000,
-            .condition = .al,
-            .size_bytes = 2,
-            .instruction = .{ .push = 0x4000 },
-        },
-    };
+    try std.testing.expect(functionEntryHasSavedLrPush(image, .{ .address = 0x0800_0000, .isa = .thumb }));
 
-    const resolved = try resolveBxTarget(image, .thumb, 0x0800_0002, 0, &prior_nodes);
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0004, 0);
     try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
 }
 
-test "thumb saved-lr return epilogue rejects near-miss shapes" {
+test "thumb saved-lr return witness is anchored at function entry" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const empty_prior_nodes = [_]llvm_codegen.InstructionNode{};
-    const prior_with_saved_lr = [_]llvm_codegen.InstructionNode{
-        .{
-            .address = 0x0800_0000,
-            .condition = .al,
-            .size_bytes = 2,
-            .instruction = .{ .push = 0x4000 },
-        },
-    };
-
     const cases = [_]struct {
         rom_bytes: []const u8,
-        isa: armv4t_decode.InstructionSet,
-        address: u32,
-        reg: u4,
-        prior_nodes: []const llvm_codegen.InstructionNode,
-        want_ok: bool,
+        function_entry: armv4t_decode.CodeAddress,
+        want_entry_saved_lr: bool,
     }{
         .{
-            .rom_bytes = &.{ 0x01, 0xBC, 0x00, 0x47 },
-            .isa = .thumb,
-            .address = 0x0800_0002,
-            .reg = 0,
-            .prior_nodes = prior_with_saved_lr[0..],
-            .want_ok = true,
+            .rom_bytes = &.{ 0x00, 0xB5, 0x00, 0xBF, 0x00, 0xBC, 0x00, 0x47 },
+            .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
+            .want_entry_saved_lr = true,
         },
         .{
-            .rom_bytes = &.{ 0x02, 0xBC, 0x00, 0x47 },
-            .isa = .thumb,
-            .address = 0x0800_0002,
-            .reg = 0,
-            .prior_nodes = prior_with_saved_lr[0..],
-            .want_ok = false,
+            .rom_bytes = &.{ 0x10, 0xB4, 0x00, 0xB5, 0x01, 0xBC, 0x00, 0x47 },
+            .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
+            .want_entry_saved_lr = false,
         },
         .{
-            .rom_bytes = &.{ 0x03, 0xBC, 0x00, 0x47 },
-            .isa = .thumb,
-            .address = 0x0800_0002,
-            .reg = 0,
-            .prior_nodes = prior_with_saved_lr[0..],
-            .want_ok = false,
-        },
-        .{
-            .rom_bytes = &.{ 0x01, 0xBC, 0x00, 0x47 },
-            .isa = .thumb,
-            .address = 0x0800_0002,
-            .reg = 0,
-            .prior_nodes = empty_prior_nodes[0..],
-            .want_ok = false,
-        },
-        .{
-            .rom_bytes = &.{ 0x01, 0xBC, 0x00, 0x47 },
-            .isa = .arm,
-            .address = 0x0800_0002,
-            .reg = 0,
-            .prior_nodes = prior_with_saved_lr[0..],
-            .want_ok = false,
+            .rom_bytes = &.{ 0x00, 0xB4, 0x00, 0xB5, 0x01, 0xBC, 0x00, 0x47 },
+            .function_entry = .{ .address = 0x0800_0000, .isa = .arm },
+            .want_entry_saved_lr = false,
         },
     };
 
     for (cases, 0..) |case, index| {
-        const path = try std.fmt.allocPrint(std.testing.allocator, "thumb-saved-lr-return-{d}.gba", .{index});
+        const path = try std.fmt.allocPrint(std.testing.allocator, "thumb-saved-lr-entry-{d}.gba", .{index});
         defer std.testing.allocator.free(path);
 
         try tmp.dir.writeFile(io, .{ .sub_path = path, .data = case.rom_bytes });
         const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", path);
         defer image.deinit(std.testing.allocator);
 
-        const result = resolveBxTarget(image, case.isa, case.address, case.reg, case.prior_nodes);
-        if (case.want_ok) {
+        try std.testing.expectEqual(case.want_entry_saved_lr, functionEntryHasSavedLrPush(image, case.function_entry));
+    }
+}
+
+test "thumb saved-lr return epilogue rejects local tail near-misses" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cases = [_]struct {
+        rom_bytes: []const u8,
+        bx_address: u32,
+        expect_error: bool,
+    }{
+        .{
+            .rom_bytes = &.{ 0x00, 0xB5, 0x01, 0xBC, 0x00, 0x47, 0x00, 0xBF },
+            .bx_address = 0x0800_0004,
+            .expect_error = false,
+        },
+        .{
+            .rom_bytes = &.{ 0x00, 0xB5, 0x02, 0xBC, 0x00, 0x47, 0x00, 0xBF },
+            .bx_address = 0x0800_0004,
+            .expect_error = true,
+        },
+        .{
+            .rom_bytes = &.{ 0x00, 0xB5, 0x03, 0xBC, 0x00, 0x47, 0x00, 0xBF },
+            .bx_address = 0x0800_0004,
+            .expect_error = true,
+        },
+    };
+
+    for (cases, 0..) |case, index| {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "thumb-saved-lr-tail-{d}.gba", .{index});
+        defer std.testing.allocator.free(path);
+
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = case.rom_bytes });
+        const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", path);
+        defer image.deinit(std.testing.allocator);
+
+        const result = resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, case.bx_address, 0);
+        if (case.expect_error) {
+            try std.testing.expectError(error.UnsupportedOpcode, result);
+        } else {
             try std.testing.expectEqualDeep(
                 armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} },
                 try result,
             );
-        } else {
-            try std.testing.expectError(error.UnsupportedOpcode, result);
         }
     }
 }
