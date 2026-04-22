@@ -176,6 +176,7 @@ fn liftFunction(
 
         try nodes.append(allocator, .{
             .address = address,
+            .condition = try decodeCondition(raw_opcode, function_entry.isa),
             .size_bytes = size_bytes,
             .instruction = decoded,
         });
@@ -211,26 +212,45 @@ fn ensureDeclared(
         .mov_imm => _ = try catalog.lookupInstruction("armv4t", "mov_imm"),
         .mov_reg => _ = try catalog.lookupInstruction("armv4t", "mov_reg"),
         .movs_imm => _ = try catalog.lookupInstruction("armv4t", "movs_imm"),
+        .mvn_imm => _ = try catalog.lookupInstruction("armv4t", "mvn_imm"),
         .movs_reg => _ = try catalog.lookupInstruction("armv4t", "movs_reg"),
         .orr_imm => _ = try catalog.lookupInstruction("armv4t", "orr_imm"),
+        .orr_shift_reg => _ = try catalog.lookupInstruction("armv4t", "orr_reg_shift"),
+        .and_imm => _ = try catalog.lookupInstruction("armv4t", "and_imm"),
         .add_imm => _ = try catalog.lookupInstruction("armv4t", "add_imm"),
+        .adds_imm => _ = try catalog.lookupInstruction("armv4t", "adds_imm"),
+        .adcs_imm => _ = try catalog.lookupInstruction("armv4t", "adcs_imm"),
+        .sbcs_imm => _ = try catalog.lookupInstruction("armv4t", "sbcs_imm"),
         .add_reg => _ = try catalog.lookupInstruction("armv4t", "add_reg"),
         .sub_imm => _ = try catalog.lookupInstruction("armv4t", "sub_imm"),
         .subs_imm => _ = try catalog.lookupInstruction("armv4t", "subs_imm"),
         .lsl_imm => _ = try catalog.lookupInstruction("armv4t", "lsl_imm"),
+        .lsls_imm => _ = try catalog.lookupInstruction("armv4t", "lsls_imm"),
+        .lsls_reg => _ = try catalog.lookupInstruction("armv4t", "lsls_reg"),
+        .lsr_imm => _ = try catalog.lookupInstruction("armv4t", "lsr_imm"),
         .mla => _ = try catalog.lookupInstruction("armv4t", "mla"),
         .ldr_word_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_word_imm"),
         .push => _ = try catalog.lookupInstruction("armv4t", "push_regs"),
         .pop => _ = try catalog.lookupInstruction("armv4t", "pop_regs"),
         .ldm => _ = try catalog.lookupInstruction("armv4t", "ldm_regs"),
         .tst_imm => _ = try catalog.lookupInstruction("armv4t", "tst_imm"),
+        .cmp_imm => _ = try catalog.lookupInstruction("armv4t", "cmp_imm"),
         .store => |store| switch (store.size) {
-            .word => switch (store.offset) {
-                .imm => _ = try catalog.lookupInstruction("armv4t", "str_word_imm"),
-                .reg => _ = try catalog.lookupInstruction("armv4t", "str_word_reg"),
+            .word => switch (store.addressing) {
+                .post_index => _ = try catalog.lookupInstruction("armv4t", "str_word_post"),
+                .offset => |offset| switch (offset) {
+                    .imm => _ = try catalog.lookupInstruction("armv4t", "str_word_imm"),
+                    .reg => _ = try catalog.lookupInstruction("armv4t", "str_word_reg"),
+                },
             },
-            .halfword => _ = try catalog.lookupInstruction("armv4t", "str_halfword_imm"),
-            .byte => _ = try catalog.lookupInstruction("armv4t", "str_byte_imm"),
+            .halfword => switch (store.addressing) {
+                .post_index => _ = try catalog.lookupInstruction("armv4t", "str_halfword_post"),
+                .offset => _ = try catalog.lookupInstruction("armv4t", "str_halfword_imm"),
+            },
+            .byte => switch (store.addressing) {
+                .post_index => _ = try catalog.lookupInstruction("armv4t", "str_byte_post"),
+                .offset => _ = try catalog.lookupInstruction("armv4t", "str_byte_imm"),
+            },
         },
         .branch => |branch| _ = try catalog.lookupInstruction("armv4t", branchInstructionName(branch.cond)),
         .bl => _ = try catalog.lookupInstruction("armv4t", "bl"),
@@ -460,6 +480,28 @@ fn instructionSizeBytes(isa: armv4t_decode.InstructionSet) u8 {
     return switch (isa) {
         .arm => 4,
         .thumb => 2,
+    };
+}
+
+fn decodeCondition(raw_opcode: u32, isa: armv4t_decode.InstructionSet) BuildError!armv4t_decode.Cond {
+    if (isa == .thumb) return .al;
+    return switch (raw_opcode >> 28) {
+        0x0 => .eq,
+        0x1 => .ne,
+        0x2 => .hs,
+        0x3 => .lo,
+        0x4 => .mi,
+        0x5 => .pl,
+        0x6 => .vs,
+        0x7 => .vc,
+        0x8 => .hi,
+        0x9 => .ls,
+        0xA => .ge,
+        0xB => .lt,
+        0xC => .gt,
+        0xD => .le,
+        0xE => .al,
+        else => error.UnsupportedOpcode,
     };
 }
 
@@ -740,6 +782,6 @@ test "build uses the real jsmolka arm rom and reports the next unsupported surfa
     );
     try std.testing.expectStringStartsWith(
         output.writer.buffered(),
-        "Unsupported opcode 0xE2003001 at 0x08001EFC for armv4t\n",
+        "Unsupported opcode 0xE1A00340 at 0x080005E4 for armv4t\n",
     );
 }

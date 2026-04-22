@@ -18,6 +18,8 @@ pub const ArmMemoryOperand = struct {
 pub const ArmOperand = struct {
     subtracted: bool,
     access: u8,
+    shift_type: u32,
+    shift_value: u32,
     value: Value,
 
     pub const Value = union(enum) {
@@ -31,6 +33,8 @@ pub const ArmOperand = struct {
         return .{
             .subtracted = false,
             .access = 0,
+            .shift_type = c.ARM_SFT_INVALID,
+            .shift_value = 0,
             .value = .{ .unsupported = 0 },
         };
     }
@@ -125,6 +129,8 @@ fn disassembleOne(bytes: []const u8, address: u64, mode: u32) DisassembleError!A
         result.operands[index] = .{
             .subtracted = operand.subtracted,
             .access = operand.access,
+            .shift_type = @intCast(operand.shift.type),
+            .shift_value = operand.shift.value,
             .value = switch (operand.type) {
                 c.ARM_OP_REG => .{ .reg = @intCast(operand.unnamed_0.reg) },
                 c.ARM_OP_IMM => .{ .imm = operand.unnamed_0.imm },

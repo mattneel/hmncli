@@ -505,3 +505,481 @@ test "build executes a synthetic mla slice" {
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("14\n", result.stdout);
 }
+
+test "build executes a synthetic conditional store helper slice" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const helper = struct {
+        fn assemble(dir: std.testing.TmpDir, io_handle: std.Io) !void {
+            const source =
+                \\.syntax unified
+                \\.arm
+                \\_start:
+                \\  mov r0, #3
+                \\  mov r1, #0x05000000
+                \\  and r3, r0, #1
+                \\  lsr r0, r0, #1
+                \\  and r4, r0, #1
+                \\  orr r3, r3, r4, ror #24
+                \\  strh r3, [r1], #2
+                \\  cmp r0, #1
+                \\  addeq r1, r1, #2
+                \\  strh r3, [r1], #2
+                \\1:
+                \\  b 1b
+                \\
+            ;
+            try dir.dir.writeFile(io_handle, .{
+                .sub_path = "cond-store.s",
+                .data = source,
+            });
+
+            const assemble_result = try std.process.run(std.testing.allocator, io_handle, .{
+                .argv = &.{
+                    "arm-none-eabi-as",
+                    "-mcpu=arm7tdmi",
+                    "-o",
+                    "cond-store.o",
+                    "cond-store.s",
+                },
+                .cwd = .{ .dir = dir.dir },
+                .stdout_limit = .limited(1024),
+                .stderr_limit = .limited(1024),
+            });
+            defer std.testing.allocator.free(assemble_result.stdout);
+            defer std.testing.allocator.free(assemble_result.stderr);
+            try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, assemble_result.term);
+
+            const objcopy_result = try std.process.run(std.testing.allocator, io_handle, .{
+                .argv = &.{
+                    "arm-none-eabi-objcopy",
+                    "-O",
+                    "binary",
+                    "cond-store.o",
+                    "cond-store.gba",
+                },
+                .cwd = .{ .dir = dir.dir },
+                .stdout_limit = .limited(1024),
+                .stderr_limit = .limited(1024),
+            });
+            defer std.testing.allocator.free(objcopy_result.stdout);
+            defer std.testing.allocator.free(objcopy_result.stderr);
+            try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, objcopy_result.term);
+        }
+    };
+
+    try helper.assemble(tmp, io);
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try cli.build_cmd.run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "cond-store.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "gba-cond-store-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./gba-cond-store-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings(
+        "IO0=00000000 IO8=00000000 PAL0=00000101 PAL2=00000000 VRAM4000=00000000 MAP0800=00000000 MAP0804=00000000\n",
+        result.stdout,
+    );
+}
+
+test "build executes a synthetic flag transition slice" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const helper = struct {
+        fn assemble(dir: std.testing.TmpDir, io_handle: std.Io) !void {
+            const source =
+                \\.syntax unified
+                \\.arm
+                \\_start:
+                \\  movs r0, #0x80000000
+                \\  bpl fail
+                \\  mvn r0, #0
+                \\  adds r0, r0, #1
+                \\  bcc fail
+                \\  bcs pass
+                \\fail:
+                \\  mov r0, #1
+                \\1:
+                \\  b 1b
+                \\pass:
+                \\  mov r0, #7
+                \\2:
+                \\  b 2b
+                \\
+            ;
+            try dir.dir.writeFile(io_handle, .{
+                .sub_path = "flag-transition.s",
+                .data = source,
+            });
+
+            const assemble_result = try std.process.run(std.testing.allocator, io_handle, .{
+                .argv = &.{
+                    "arm-none-eabi-as",
+                    "-mcpu=arm7tdmi",
+                    "-o",
+                    "flag-transition.o",
+                    "flag-transition.s",
+                },
+                .cwd = .{ .dir = dir.dir },
+                .stdout_limit = .limited(1024),
+                .stderr_limit = .limited(1024),
+            });
+            defer std.testing.allocator.free(assemble_result.stdout);
+            defer std.testing.allocator.free(assemble_result.stderr);
+            try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, assemble_result.term);
+
+            const objcopy_result = try std.process.run(std.testing.allocator, io_handle, .{
+                .argv = &.{
+                    "arm-none-eabi-objcopy",
+                    "-O",
+                    "binary",
+                    "flag-transition.o",
+                    "flag-transition.gba",
+                },
+                .cwd = .{ .dir = dir.dir },
+                .stdout_limit = .limited(1024),
+                .stderr_limit = .limited(1024),
+            });
+            defer std.testing.allocator.free(objcopy_result.stdout);
+            defer std.testing.allocator.free(objcopy_result.stderr);
+            try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, objcopy_result.term);
+        }
+    };
+
+    try helper.assemble(tmp, io);
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try cli.build_cmd.run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "flag-transition.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "gba-flag-transition-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./gba-flag-transition-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("7\n", result.stdout);
+}
+
+test "build executes a synthetic adc carry slice" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const helper = struct {
+        fn assemble(dir: std.testing.TmpDir, io_handle: std.Io) !void {
+            const source =
+                \\.syntax unified
+                \\.arm
+                \\_start:
+                \\  mvn r0, #0
+                \\  msr cpsr_f, #0x20000000
+                \\  adcs r0, r0, #1
+                \\  bcc fail
+                \\  mov r0, #7
+                \\1:
+                \\  b 1b
+                \\fail:
+                \\  mov r0, #1
+                \\2:
+                \\  b 2b
+                \\
+            ;
+            try dir.dir.writeFile(io_handle, .{
+                .sub_path = "adc-carry.s",
+                .data = source,
+            });
+
+            const assemble_result = try std.process.run(std.testing.allocator, io_handle, .{
+                .argv = &.{
+                    "arm-none-eabi-as",
+                    "-mcpu=arm7tdmi",
+                    "-o",
+                    "adc-carry.o",
+                    "adc-carry.s",
+                },
+                .cwd = .{ .dir = dir.dir },
+                .stdout_limit = .limited(1024),
+                .stderr_limit = .limited(1024),
+            });
+            defer std.testing.allocator.free(assemble_result.stdout);
+            defer std.testing.allocator.free(assemble_result.stderr);
+            try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, assemble_result.term);
+
+            const objcopy_result = try std.process.run(std.testing.allocator, io_handle, .{
+                .argv = &.{
+                    "arm-none-eabi-objcopy",
+                    "-O",
+                    "binary",
+                    "adc-carry.o",
+                    "adc-carry.gba",
+                },
+                .cwd = .{ .dir = dir.dir },
+                .stdout_limit = .limited(1024),
+                .stderr_limit = .limited(1024),
+            });
+            defer std.testing.allocator.free(objcopy_result.stdout);
+            defer std.testing.allocator.free(objcopy_result.stderr);
+            try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, objcopy_result.term);
+        }
+    };
+
+    try helper.assemble(tmp, io);
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try cli.build_cmd.run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "adc-carry.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "gba-adc-carry-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./gba-adc-carry-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("7\n", result.stdout);
+}
+
+test "build executes a synthetic sbc borrow slice" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const helper = struct {
+        fn assemble(dir: std.testing.TmpDir, io_handle: std.Io) !void {
+            const source =
+                \\.syntax unified
+                \\.arm
+                \\_start:
+                \\  mov r0, #2
+                \\  msr cpsr_f, #0
+                \\  sbcs r0, r0, #1
+                \\  bcc fail
+                \\  mov r0, #7
+                \\1:
+                \\  b 1b
+                \\fail:
+                \\  mov r0, #1
+                \\2:
+                \\  b 2b
+                \\
+            ;
+            try dir.dir.writeFile(io_handle, .{
+                .sub_path = "sbc-borrow.s",
+                .data = source,
+            });
+
+            const assemble_result = try std.process.run(std.testing.allocator, io_handle, .{
+                .argv = &.{
+                    "arm-none-eabi-as",
+                    "-mcpu=arm7tdmi",
+                    "-o",
+                    "sbc-borrow.o",
+                    "sbc-borrow.s",
+                },
+                .cwd = .{ .dir = dir.dir },
+                .stdout_limit = .limited(1024),
+                .stderr_limit = .limited(1024),
+            });
+            defer std.testing.allocator.free(assemble_result.stdout);
+            defer std.testing.allocator.free(assemble_result.stderr);
+            try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, assemble_result.term);
+
+            const objcopy_result = try std.process.run(std.testing.allocator, io_handle, .{
+                .argv = &.{
+                    "arm-none-eabi-objcopy",
+                    "-O",
+                    "binary",
+                    "sbc-borrow.o",
+                    "sbc-borrow.gba",
+                },
+                .cwd = .{ .dir = dir.dir },
+                .stdout_limit = .limited(1024),
+                .stderr_limit = .limited(1024),
+            });
+            defer std.testing.allocator.free(objcopy_result.stdout);
+            defer std.testing.allocator.free(objcopy_result.stderr);
+            try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, objcopy_result.term);
+        }
+    };
+
+    try helper.assemble(tmp, io);
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try cli.build_cmd.run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "sbc-borrow.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "gba-sbc-borrow-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./gba-sbc-borrow-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("7\n", result.stdout);
+}
+
+test "build executes a synthetic lsls carry edge slice" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const helper = struct {
+        fn assemble(dir: std.testing.TmpDir, io_handle: std.Io) !void {
+            const source =
+                \\.syntax unified
+                \\.arm
+                \\_start:
+                \\  mov r0, #1
+                \\  mov r1, #32
+                \\  lsls r0, r0, r1
+                \\  bne fail
+                \\  bcc fail
+                \\  mov r0, #7
+                \\1:
+                \\  b 1b
+                \\fail:
+                \\  mov r0, #1
+                \\2:
+                \\  b 2b
+                \\
+            ;
+            try dir.dir.writeFile(io_handle, .{
+                .sub_path = "lsls-carry.s",
+                .data = source,
+            });
+
+            const assemble_result = try std.process.run(std.testing.allocator, io_handle, .{
+                .argv = &.{
+                    "arm-none-eabi-as",
+                    "-mcpu=arm7tdmi",
+                    "-o",
+                    "lsls-carry.o",
+                    "lsls-carry.s",
+                },
+                .cwd = .{ .dir = dir.dir },
+                .stdout_limit = .limited(1024),
+                .stderr_limit = .limited(1024),
+            });
+            defer std.testing.allocator.free(assemble_result.stdout);
+            defer std.testing.allocator.free(assemble_result.stderr);
+            try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, assemble_result.term);
+
+            const objcopy_result = try std.process.run(std.testing.allocator, io_handle, .{
+                .argv = &.{
+                    "arm-none-eabi-objcopy",
+                    "-O",
+                    "binary",
+                    "lsls-carry.o",
+                    "lsls-carry.gba",
+                },
+                .cwd = .{ .dir = dir.dir },
+                .stdout_limit = .limited(1024),
+                .stderr_limit = .limited(1024),
+            });
+            defer std.testing.allocator.free(objcopy_result.stdout);
+            defer std.testing.allocator.free(objcopy_result.stderr);
+            try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, objcopy_result.term);
+        }
+    };
+
+    try helper.assemble(tmp, io);
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try cli.build_cmd.run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "lsls-carry.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "gba-lsls-carry-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./gba-lsls-carry-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("7\n", result.stdout);
+}
