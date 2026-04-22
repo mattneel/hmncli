@@ -9,7 +9,7 @@
 
 ## First Homonculi Failure Surface
 
-- Re-measured after the Thumb `movs` alias fix on 2026-04-22.
+- Re-measured after the validated Thumb saved-`lr` return-surface slice on 2026-04-22.
 - The shared Thumb zero-shift `movs` alias blocker is gone.
 - The fixtures now diverge on their next blockers:
   - `sbb_reg`: `Unsupported SWI 0x000005 at 0x08000820 for gba`

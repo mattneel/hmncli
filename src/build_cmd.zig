@@ -201,7 +201,7 @@ fn liftFunction(
         const raw_opcode = decoded_opcode.raw_opcode;
         const size_bytes = decoded_opcode.size_bytes;
         const decoded_initial = decoded_opcode.instruction;
-        const decoded = resolveDecodedInstruction(image, function_entry.isa, address, decoded_initial) catch {
+        const decoded = resolveDecodedInstruction(image, function_entry.isa, address, decoded_initial, nodes.items) catch {
             try renderUnsupportedOpcode(writer, raw_opcode, address);
             return error.UnsupportedOpcode;
         };
@@ -461,6 +461,7 @@ fn ensureDeclared(
         .bx_target => _ = try catalog.lookupInstruction("armv4t", "bx_reg"),
         .bx_reg => return error.UnsupportedOpcode,
         .bx_lr => _ = try catalog.lookupInstruction("armv4t", "bx_lr"),
+        .thumb_saved_lr_return => _ = try catalog.lookupInstruction("armv4t", "thumb_saved_lr_return"),
         .mrs_psr => _ = try catalog.lookupInstruction("armv4t", "mrs_psr"),
         .msr_psr_imm => _ = try catalog.lookupInstruction("armv4t", "msr_psr_imm"),
         .msr_psr_reg => _ = try catalog.lookupInstruction("armv4t", "msr_psr_reg"),
@@ -545,6 +546,7 @@ fn enqueueSuccessors(
             try enqueueFunctionAddress(allocator, writer, pending_functions, image, target);
         },
         .bx_lr => return,
+        .thumb_saved_lr_return => return,
         .bx_reg => return error.UnsupportedOpcode,
         .exception_return => |ret| {
             if (ret.target == address) {
@@ -771,6 +773,7 @@ fn resolveDecodedInstruction(
     isa: armv4t_decode.InstructionSet,
     address: u32,
     decoded: armv4t_decode.DecodedInstruction,
+    prior_nodes: []const llvm_codegen.InstructionNode,
 ) BuildError!armv4t_decode.DecodedInstruction {
     const resolved = switch (decoded) {
         .subs_imm => |sub| if (sub.rd == 15 and sub.rn == 15) blk: {
@@ -784,7 +787,7 @@ fn resolveDecodedInstruction(
             try resolveAddRegPcTarget(image, isa, address, add)
         else
             decoded,
-        .bx_reg => |bx| try resolveBxTarget(image, isa, address, bx.reg),
+        .bx_reg => |bx| try resolveBxTarget(image, isa, address, bx.reg, prior_nodes),
         .mov_reg => |mov| if (mov.rd == 15 and mov.rm != 14)
             try resolveMovPcTarget(image, isa, address, mov.rm)
         else
@@ -814,12 +817,13 @@ fn resolveBxTarget(
     isa: armv4t_decode.InstructionSet,
     address: u32,
     reg: u4,
+    prior_nodes: []const llvm_codegen.InstructionNode,
 ) BuildError!armv4t_decode.DecodedInstruction {
-    if (isThumbPopRestoreBxReturnEpilogue(image, isa, address, reg)) {
-        // This is the narrow Thumb epilogue shape we already executed through
-        // the restoring `pop`: treat the trailing `bx` as a plain function
-        // return surface instead of trying to recover the restored target.
-        return .{ .bx_lr = {} };
+    if (isValidatedThumbSavedLrReturnEpilogue(image, isa, address, reg, prior_nodes)) {
+        // This is a validated Thumb epilogue: the function already saved `lr`
+        // in its prologue, and the exact `pop {same_reg}; bx same_reg` tail is
+        // returning that saved link value from the stack.
+        return .{ .thumb_saved_lr_return = {} };
     }
     if (isa == .thumb and reg == 6) {
         const previous = try previousInstruction(image, isa, address);
@@ -830,13 +834,15 @@ fn resolveBxTarget(
     return .{ .bx_target = normalizeCodeTarget(try resolvePreviousRegisterValue(image, isa, address, reg)) };
 }
 
-fn isThumbPopRestoreBxReturnEpilogue(
+fn isValidatedThumbSavedLrReturnEpilogue(
     image: gba_loader.RomImage,
     isa: armv4t_decode.InstructionSet,
     address: u32,
     reg: u4,
+    prior_nodes: []const llvm_codegen.InstructionNode,
 ) bool {
     if (isa != .thumb) return false;
+    if (!functionHasSavedLrPrologue(prior_nodes)) return false;
     if (reg == 15) return false;
 
     const previous = previousInstruction(image, isa, address) catch return false;
@@ -846,8 +852,19 @@ fn isThumbPopRestoreBxReturnEpilogue(
     };
 
     // Keep this self-limiting: only the exact `pop {same_reg}; bx same_reg`
-    // epilogue is recognized as a return surface.
+    // epilogue is recognized, and only when the function already proved it
+    // saved `lr` in its own prologue.
     return pop_mask == (@as(u16, 1) << reg);
+}
+
+fn functionHasSavedLrPrologue(prior_nodes: []const llvm_codegen.InstructionNode) bool {
+    for (prior_nodes) |node| {
+        switch (node.instruction) {
+            .push => |mask| if ((mask & (@as(u16, 1) << 14)) != 0) return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn resolveDevkitArmCrt0StartupThumbBlxR3Target(
@@ -1863,7 +1880,7 @@ test "devkitARM crt0 startup blx r3 veneer rejects invalid literal targets" {
     }
 }
 
-test "thumb pop restore bx return epilogue resolves as a return surface" {
+test "thumb saved-lr return epilogue resolves as a distinct return surface" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1874,11 +1891,105 @@ test "thumb pop restore bx return epilogue resolves as a return surface" {
     const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-bx-return.gba");
     defer image.deinit(std.testing.allocator);
 
-    const resolved = try resolveBxTarget(image, .thumb, 0x0800_0002, 0);
-    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .bx_lr = {} }, resolved);
+    const prior_nodes = [_]llvm_codegen.InstructionNode{
+        .{
+            .address = 0x0800_0000,
+            .condition = .al,
+            .size_bytes = 2,
+            .instruction = .{ .push = 0x4000 },
+        },
+    };
+
+    const resolved = try resolveBxTarget(image, .thumb, 0x0800_0002, 0, &prior_nodes);
+    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
 }
 
-test "tonc fixtures advance past the Thumb return epilogue surface" {
+test "thumb saved-lr return epilogue rejects near-miss shapes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const empty_prior_nodes = [_]llvm_codegen.InstructionNode{};
+    const prior_with_saved_lr = [_]llvm_codegen.InstructionNode{
+        .{
+            .address = 0x0800_0000,
+            .condition = .al,
+            .size_bytes = 2,
+            .instruction = .{ .push = 0x4000 },
+        },
+    };
+
+    const cases = [_]struct {
+        rom_bytes: []const u8,
+        isa: armv4t_decode.InstructionSet,
+        address: u32,
+        reg: u4,
+        prior_nodes: []const llvm_codegen.InstructionNode,
+        want_ok: bool,
+    }{
+        .{
+            .rom_bytes = &.{ 0x01, 0xBC, 0x00, 0x47 },
+            .isa = .thumb,
+            .address = 0x0800_0002,
+            .reg = 0,
+            .prior_nodes = prior_with_saved_lr[0..],
+            .want_ok = true,
+        },
+        .{
+            .rom_bytes = &.{ 0x02, 0xBC, 0x00, 0x47 },
+            .isa = .thumb,
+            .address = 0x0800_0002,
+            .reg = 0,
+            .prior_nodes = prior_with_saved_lr[0..],
+            .want_ok = false,
+        },
+        .{
+            .rom_bytes = &.{ 0x03, 0xBC, 0x00, 0x47 },
+            .isa = .thumb,
+            .address = 0x0800_0002,
+            .reg = 0,
+            .prior_nodes = prior_with_saved_lr[0..],
+            .want_ok = false,
+        },
+        .{
+            .rom_bytes = &.{ 0x01, 0xBC, 0x00, 0x47 },
+            .isa = .thumb,
+            .address = 0x0800_0002,
+            .reg = 0,
+            .prior_nodes = empty_prior_nodes[0..],
+            .want_ok = false,
+        },
+        .{
+            .rom_bytes = &.{ 0x01, 0xBC, 0x00, 0x47 },
+            .isa = .arm,
+            .address = 0x0800_0002,
+            .reg = 0,
+            .prior_nodes = prior_with_saved_lr[0..],
+            .want_ok = false,
+        },
+    };
+
+    for (cases, 0..) |case, index| {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "thumb-saved-lr-return-{d}.gba", .{index});
+        defer std.testing.allocator.free(path);
+
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = case.rom_bytes });
+        const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", path);
+        defer image.deinit(std.testing.allocator);
+
+        const result = resolveBxTarget(image, case.isa, case.address, case.reg, case.prior_nodes);
+        if (case.want_ok) {
+            try std.testing.expectEqualDeep(
+                armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} },
+                try result,
+            );
+        } else {
+            try std.testing.expectError(error.UnsupportedOpcode, result);
+        }
+    }
+}
+
+test "tonc fixtures advance past the validated Thumb saved-lr return surface" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -1812,6 +1812,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .id = .{
             .kind = .instruction,
             .namespace = "armv4t",
+            .name = "thumb_saved_lr_return",
+        },
+        .isa = .armv4t,
+        .mnemonic = "bx",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 return surface for validated Thumb `pop {reg}; bx reg` epilogues after a saved-lr prologue."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
             .name = "nop",
         },
         .isa = .armv4t,

@@ -576,6 +576,7 @@ pub const DecodedInstruction = union(enum) {
     },
     bx_target: CodeAddress,
     bx_lr,
+    thumb_saved_lr_return,
     mrs_psr: struct {
         rd: u4,
         target: PsrTarget,

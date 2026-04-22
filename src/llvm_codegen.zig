@@ -1858,6 +1858,7 @@ fn instructionEndsRetiredBlock(node: InstructionNode) bool {
         .bl,
         .bx_target,
         .bx_lr,
+        .thumb_saved_lr_return,
         .ldm_pc_target,
         .ldm_empty_pc_target,
         .exception_return,
@@ -2779,6 +2780,7 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             try emitFunctionReturn(writer, function.entry);
         },
         .bx_lr => try emitFunctionReturn(writer, function.entry),
+        .thumb_saved_lr_return => try emitFunctionReturn(writer, function.entry),
         .mrs_psr => |mrs| {
             const helper_name = switch (mrs.target) {
                 .cpsr => "hmn_read_cpsr",
