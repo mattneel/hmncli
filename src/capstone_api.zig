@@ -1,36 +1,5 @@
 const std = @import("std");
-
-extern fn cs_version(major: ?*c_int, minor: ?*c_int) c_uint;
-extern fn cs_open(arch: c_int, mode: c_int, handle: *usize) c_int;
-extern fn cs_option(handle: usize, option_type: c_int, value: usize) c_int;
-extern fn cs_disasm(
-    handle: usize,
-    code: [*]const u8,
-    code_size: usize,
-    address: u64,
-    count: usize,
-    insn: *?[*]const CsInsn,
-) usize;
-extern fn cs_free(insn: [*]const CsInsn, count: usize) void;
-extern fn cs_close(handle: *usize) c_int;
-
-const cs_arch_arm = 0;
-const cs_mode_arm = 0;
-const cs_opt_detail = 2;
-const cs_opt_off = 0;
-
-const CsInsn = extern struct {
-    id: c_uint,
-    alias_id: u64,
-    address: u64,
-    size: u16,
-    bytes: [24]u8,
-    mnemonic: [32]c_char,
-    op_str: [160]c_char,
-    is_alias: bool,
-    uses_alias_details: bool,
-    detail: ?*anyopaque,
-};
+const c = @import("capstone_c");
 
 pub const CapstoneVersion = struct {
     major: u16,
@@ -63,7 +32,7 @@ pub const DisassembleError = error{
 pub fn version() CapstoneVersion {
     var major: c_int = 0;
     var minor: c_int = 0;
-    _ = cs_version(&major, &minor);
+    _ = c.cs_version(&major, &minor);
     return .{
         .major = @intCast(major),
         .minor = @intCast(minor),
@@ -72,40 +41,40 @@ pub fn version() CapstoneVersion {
 
 pub fn disassembleOneArm32(word: u32, address: u64) DisassembleError!InstructionText {
     var handle: usize = 0;
-    if (cs_open(cs_arch_arm, cs_mode_arm, &handle) != 0) return error.OpenFailed;
-    defer _ = cs_close(&handle);
+    if (c.cs_open(c.CS_ARCH_ARM, c.CS_MODE_ARM, &handle) != c.CS_ERR_OK) return error.OpenFailed;
+    defer _ = c.cs_close(&handle);
 
-    if (cs_option(handle, cs_opt_detail, cs_opt_off) != 0) return error.OptionFailed;
+    if (c.cs_option(handle, c.CS_OPT_DETAIL, c.CS_OPT_OFF) != c.CS_ERR_OK) return error.OptionFailed;
 
     var word_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &word_bytes, word, .little);
 
-    var insn_ptr: ?[*]const CsInsn = null;
-    const decoded_count = cs_disasm(handle, &word_bytes, word_bytes.len, address, 1, &insn_ptr);
+    var insn_ptr: [*c]c.cs_insn = null;
+    const decoded_count = c.cs_disasm(handle, &word_bytes, word_bytes.len, address, 1, &insn_ptr);
     if (decoded_count != 1 or insn_ptr == null) return error.DisassembleFailed;
-    defer cs_free(insn_ptr.?, decoded_count);
+    defer c.cs_free(insn_ptr, decoded_count);
 
-    const decoded = insn_ptr.?[0];
+    const decoded = insn_ptr[0];
     return .{
         .address = decoded.address,
         .size = decoded.size,
         .mnemonic = copyCString(32, decoded.mnemonic),
-        .mnemonic_len = cStringLen(&decoded.mnemonic),
+        .mnemonic_len = cStringLen(decoded.mnemonic[0..]),
         .operands = copyCString(160, decoded.op_str),
-        .operands_len = cStringLen(&decoded.op_str),
+        .operands_len = cStringLen(decoded.op_str[0..]),
     };
 }
 
-fn cStringLen(buffer: []const c_char) u8 {
+fn cStringLen(buffer: []const u8) u8 {
     var index: usize = 0;
     while (index < buffer.len and buffer[index] != 0) : (index += 1) {}
     return @intCast(index);
 }
 
-fn copyCString(comptime N: usize, source: [N]c_char) [N]u8 {
+fn copyCString(comptime N: usize, source: [N]u8) [N]u8 {
     var output: [N]u8 = [_]u8{0} ** N;
     for (source, 0..) |value, index| {
-        output[index] = @bitCast(value);
+        output[index] = value;
     }
     return output;
 }
@@ -113,6 +82,11 @@ fn copyCString(comptime N: usize, source: [N]c_char) [N]u8 {
 test "capstone library reports a usable major version" {
     const actual = version();
     try std.testing.expect(actual.major >= 5);
+}
+
+test "translated capstone module exposes ARM constants" {
+    try std.testing.expectEqual(c.CS_ARCH_ARM, 0);
+    try std.testing.expectEqual(c.CS_MODE_ARM, 0);
 }
 
 test "capstone disassembles an ARM branch mnemonic" {
