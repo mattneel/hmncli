@@ -1820,7 +1820,7 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .state = .implemented,
         .tests = &.{},
         .doc_refs = &.{},
-        .notes = &.{"Phase 1 return surface for validated Thumb `pop {reg}; bx reg` epilogues after a saved-lr prologue."},
+        .notes = &.{"Phase 1 return surface for the exact Thumb `push {saved_reg, lr}` / `pop {saved_reg}` / `pop {return_reg}` / `bx return_reg` interworking epilogue shape."},
     },
     .{
         .id = .{
