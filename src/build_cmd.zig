@@ -961,7 +961,8 @@ fn isMeasuredLocalThumbBlxR3VeneerNop(image: gba_loader.RomImage, address: u32) 
 
     const raw_halfword = armv4t_decode.readHalfword(image.bytes, offset);
     // Keep this family exact and measured: the current local veneers end in
-    // either `mov r8, r8` or `movs r0, r0` after `bx r3`.
+    // either `mov r8, r8` or the Thumb zero-shift alias `movs r0, r0`,
+    // which is a nop at these veneer sites.
     return raw_halfword == 0x46C0 or raw_halfword == 0x0000;
 }
 
@@ -2287,6 +2288,55 @@ test "local thumb blx r3 veneer rejects near misses" {
             ),
         );
     }
+}
+
+test "local thumb blx r3 veneer matcher only resolves the measured tonc occurrences" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const fixtures = [_]struct {
+        rom_path: []const u8,
+        local_occurrence: ?[]const u8 = null,
+        expect_cleared: bool,
+    }{
+        .{
+            .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
+            .local_occurrence = "Unsupported opcode 0x00004718 at 0x080003B8 for armv4t",
+            .expect_cleared = true,
+        },
+        .{
+            .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
+            .local_occurrence = "Unsupported opcode 0x00004718 at 0x0800081C for armv4t",
+            .expect_cleared = true,
+        },
+        .{
+            .rom_path = "tests/fixtures/real/tonc/irq_demo.gba",
+            .local_occurrence = "Unsupported opcode 0x00004718 at 0x08003078 for armv4t",
+            .expect_cleared = false,
+        },
+        .{
+            .rom_path = "tests/fixtures/real/tonc/sbb_reg.gba",
+            .expect_cleared = true,
+        },
+    };
+
+    var total_matches: usize = 0;
+    for (fixtures) |fixture| {
+        const result = try buildFixtureCaptureOutput(std.testing.allocator, io, tmp.dir, fixture.rom_path);
+        defer std.testing.allocator.free(result.stderr);
+
+        try std.testing.expect(result.failed);
+        if (fixture.local_occurrence) |local_occurrence| {
+            const found = std.mem.indexOf(u8, result.stderr, local_occurrence) != null;
+            try std.testing.expectEqual(!fixture.expect_cleared, found);
+            if (fixture.expect_cleared) total_matches += 1;
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x00004718") == null);
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), total_matches);
 }
 
 test "thumb saved-lr return epilogue resolves as a distinct return surface" {
