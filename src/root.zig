@@ -150,3 +150,47 @@ test "build emits guest-state llvm with a separate guest entry function" {
     try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "define void @guest_08000000(ptr %state)") != null);
     try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "call void @guest_08000000(ptr %state)") != null);
 }
+
+test "build executes a synthetic direct bl plus bx lr slice" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = [_]u8{
+        0x0A, 0x00, 0xA0, 0xE3, // mov r0, #10
+        0x01, 0x00, 0x00, 0xEB, // bl  0x08000010
+        0x02, 0x10, 0xA0, 0xE3, // mov r1, #2
+        0xFE, 0xFF, 0xFF, 0xEA, // b   .
+        0x07, 0x00, 0xA0, 0xE3, // mov r0, #7
+        0x1E, 0xFF, 0x2F, 0xE1, // bx  lr
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "bl.gba", .data = &rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try cli.build_cmd.run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "bl.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "gba-bl-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./gba-bl-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("7\n", result.stdout);
+}

@@ -243,6 +243,34 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .doc_refs = &.{},
         .notes = &.{"Phase 1 real-ROM surface for Z-flag-driven loop branches."},
     },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "bl",
+        },
+        .isa = .armv4t,
+        .mnemonic = "bl",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 call surface for direct branch-and-link targets."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "bx_lr",
+        },
+        .isa = .armv4t,
+        .mnemonic = "bx",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 return surface for direct bx lr leaves."},
+    },
 };
 
 test "gba machine validates against the shared schema" {

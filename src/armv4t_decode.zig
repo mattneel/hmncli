@@ -52,6 +52,10 @@ pub const DecodedInstruction = union(enum) {
         cond: Cond,
         target: u32,
     },
+    bl: struct {
+        target: u32,
+    },
+    bx_lr,
     swi: struct {
         imm24: u24,
     },
@@ -72,6 +76,8 @@ pub fn decode(word: u32, address: u32) DecodeError!DecodedInstruction {
         c.ARM_INS_STRB => parseStore(insn, .byte),
         c.ARM_INS_STRH => parseStore(insn, .halfword),
         c.ARM_INS_B => parseBranch(insn),
+        c.ARM_INS_BL => parseBl(word, insn),
+        c.ARM_INS_BX => parseBx(insn),
         c.ARM_INS_SVC => parseSwi(insn),
         else => error.UnsupportedOpcode,
     };
@@ -147,6 +153,21 @@ fn parseSwi(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
     return .{ .swi = .{
         .imm24 = @truncate(imm),
     } };
+}
+
+fn parseBl(word: u32, insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+    if (insn.operand_count != 1) return error.UnsupportedOpcode;
+    if ((word >> 28) != 0xE) return error.UnsupportedOpcode;
+    return .{ .bl = .{
+        .target = try operandImmediateU32(insn, 0),
+    } };
+}
+
+fn parseBx(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+    if (insn.operand_count != 1) return error.UnsupportedOpcode;
+    const reg = try operandRegister(insn, 0);
+    if (reg != 14) return error.UnsupportedOpcode;
+    return .bx_lr;
 }
 
 fn operandAt(insn: capstone_api.ArmInstruction, index: usize) capstone_api.ArmOperand {
@@ -227,6 +248,19 @@ test "decode reads word store with register offset" {
         } },
         decoded,
     );
+}
+
+test "decode reads direct bl target" {
+    const decoded = try decode(0xEB000001, 0x08000004);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .bl = .{ .target = 0x08000010 } },
+        decoded,
+    );
+}
+
+test "decode reads bx lr" {
+    const decoded = try decode(0xE12FFF1E, 0x08000014);
+    try std.testing.expectEqualDeep(DecodedInstruction.bx_lr, decoded);
 }
 
 test "decode reads halfword store with immediate offset" {

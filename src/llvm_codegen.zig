@@ -322,6 +322,15 @@ fn emitInstructionBlock(writer: *Io.Writer, function: Function, node: Instructio
                 }
             },
         },
+        .bl => |bl| {
+            try emitRegPtr(writer, "state", node.address, "lr", 14);
+            try writer.print("  store i32 {d}, ptr %lr_ptr_{x:0>8}, align 4\n", .{ node.address + 4, node.address });
+            try writer.print("  call void @guest_{x:0>8}(ptr %state)\n", .{bl.target});
+            try emitFallthrough(writer, function, node.address + 4);
+        },
+        .bx_lr => {
+            try emitFunctionReturn(writer, function.entry_address);
+        },
         .swi => |swi| {
             _ = swi;
             try writer.print("  call i32 @shim_gba_Div(ptr %state)\n", .{});

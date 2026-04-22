@@ -92,6 +92,7 @@ fn liftRom(
             writer,
             image,
             function_entry,
+            &pending_functions,
             &has_store,
             &has_self_loop,
         ));
@@ -111,6 +112,7 @@ fn liftFunction(
     writer: *Io.Writer,
     image: gba_loader.RomImage,
     function_entry: u32,
+    pending_functions: *std.ArrayList(u32),
     has_store: *bool,
     has_self_loop: *bool,
 ) BuildError!llvm_codegen.Function {
@@ -146,7 +148,16 @@ fn liftFunction(
             .instruction = decoded,
         });
 
-        try enqueueSuccessors(allocator, writer, &pending_blocks, image, address, decoded, has_self_loop);
+        try enqueueSuccessors(
+            allocator,
+            writer,
+            &pending_blocks,
+            pending_functions,
+            image,
+            address,
+            decoded,
+            has_self_loop,
+        );
     }
 
     sortNodes(nodes.items);
@@ -179,6 +190,8 @@ fn ensureDeclared(
             .al => _ = try catalog.lookupInstruction("armv4t", "b"),
             .ne => _ = try catalog.lookupInstruction("armv4t", "bne"),
         },
+        .bl => _ = try catalog.lookupInstruction("armv4t", "bl"),
+        .bx_lr => _ = try catalog.lookupInstruction("armv4t", "bx_lr"),
         .swi => |swi| {
             if (swi.imm24 != 0x000006) {
                 try renderUnsupportedShim(writer, address, swi.imm24);
@@ -192,7 +205,8 @@ fn ensureDeclared(
 fn enqueueSuccessors(
     allocator: std.mem.Allocator,
     writer: *Io.Writer,
-    pending: *std.ArrayList(u32),
+    pending_blocks: *std.ArrayList(u32),
+    pending_functions: *std.ArrayList(u32),
     image: gba_loader.RomImage,
     address: u32,
     decoded: armv4t_decode.DecodedInstruction,
@@ -205,19 +219,24 @@ fn enqueueSuccessors(
                     has_self_loop.* = true;
                     return;
                 }
-                try enqueueAddress(allocator, writer, pending, image, branch.target);
+                try enqueueAddress(allocator, writer, pending_blocks, image, branch.target);
             },
             .ne => {
-                try enqueueFallthrough(allocator, pending, image, address);
+                try enqueueFallthrough(allocator, pending_blocks, image, address);
                 if (branch.target == address) {
                     has_self_loop.* = true;
                     return;
                 }
-                try enqueueAddress(allocator, writer, pending, image, branch.target);
+                try enqueueAddress(allocator, writer, pending_blocks, image, branch.target);
             },
         },
+        .bl => |bl| {
+            try enqueueAddress(allocator, writer, pending_functions, image, bl.target);
+            try enqueueFallthrough(allocator, pending_blocks, image, address);
+        },
+        .bx_lr => return,
         else => {
-            try enqueueFallthrough(allocator, pending, image, address);
+            try enqueueFallthrough(allocator, pending_blocks, image, address);
         },
     }
 }
@@ -538,6 +557,6 @@ test "build uses the real jsmolka arm rom and reports the next unsupported surfa
     );
     try std.testing.expectStringStartsWith(
         output.writer.buffered(),
-        "Unsupported opcode 0xEB000780 at 0x080000C0 for armv4t\n",
+        "Unsupported opcode 0xE328F101 at 0x080000F8 for armv4t\n",
     );
 }
