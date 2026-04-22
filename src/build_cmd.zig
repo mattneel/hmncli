@@ -318,6 +318,17 @@ fn previousInstruction(
     }
 }
 
+fn nextInstruction(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+) BuildError!DecodedNode {
+    return switch (isa) {
+        .arm => decodeImageInstructionUnchecked(image, isa, address + 4),
+        .thumb => decodeImageInstructionUnchecked(image, isa, address + 2),
+    };
+}
+
 fn ensureDeclared(
     writer: *Io.Writer,
     decoded: armv4t_decode.DecodedInstruction,
@@ -831,6 +842,16 @@ fn resolveDevkitArmCrt0StartupThumbBlxR3Target(
         else => return null,
     };
     if (bx.reg != 3) return null;
+
+    const previous_target = previousInstruction(image, isa, target_address) catch return null;
+    if (previous_target.instruction != .bx_lr) return null;
+
+    const next_target = nextInstruction(image, isa, target_address) catch return null;
+    const subs = switch (next_target.instruction) {
+        .subs_reg => |subs| subs,
+        else => return null,
+    };
+    if (subs.rd != 3 or subs.rn != 4 or subs.rm != 2) return null;
 
     const previous = try previousInstruction(image, isa, bl_address);
     const load = switch (previous.instruction) {
