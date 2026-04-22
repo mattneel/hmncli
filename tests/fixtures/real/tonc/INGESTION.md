@@ -9,11 +9,12 @@
 
 ## First Homonculi Failure Surface
 
-- Re-measured after the startup soft-reset fix on 2026-04-22.
-- `sbb_reg`: `Unsupported opcode 0x00004730 at 0x08000124 for armv4t`
-- `obj_demo`: `Unsupported opcode 0x00004730 at 0x08000124 for armv4t`
-- `key_demo`: `Unsupported opcode 0x00004730 at 0x08000124 for armv4t`
-- `irq_demo`: `Unsupported opcode 0x00004730 at 0x08000124 for armv4t`
+- Re-measured after the startup trampoline fix on 2026-04-22.
+- All four tonc demos now share the same next blocker:
+  - `sbb_reg`: `Unsupported control flow target 0x02000000 for gba`
+  - `obj_demo`: `Unsupported control flow target 0x02000000 for gba`
+  - `key_demo`: `Unsupported control flow target 0x02000000 for gba`
+  - `irq_demo`: `Unsupported control flow target 0x02000000 for gba`
 
 ## Scope Decisions
 

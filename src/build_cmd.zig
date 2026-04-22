@@ -914,14 +914,24 @@ fn resolvePreviousRegisterValue(
         .add_imm => |add| blk: {
             if (add.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
             if (add.rn == 15) break :blk pcValueForInstruction(isa, previous.address) + add.imm;
+            if (add.imm == 0 and add.rn != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, add.rn);
             if (add.rn != reg) return error.UnsupportedOpcode;
             break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg) + add.imm;
         },
         .adds_imm => |add| blk: {
             if (add.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
             if (add.rn == 15) break :blk pcValueForInstruction(isa, previous.address) + add.imm;
+            if (add.imm == 0 and add.rn != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, add.rn);
             if (add.rn != reg) return error.UnsupportedOpcode;
             break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg) + add.imm;
+        },
+        .subs_reg => |sub| blk: {
+            if (sub.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
+            return error.UnsupportedOpcode;
+        },
+        .ldr_word_imm => |load| blk: {
+            if (load.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
+            return error.UnsupportedOpcode;
         },
         .mov_imm => |mov| blk: {
             if (mov.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
@@ -935,6 +945,17 @@ fn resolvePreviousRegisterValue(
             if (mov.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
             if (mov.rm == 15) return error.UnsupportedOpcode;
             break :blk try resolvePreviousRegisterValue(image, isa, previous.address, mov.rm);
+        },
+        .bl => try resolvePreviousRegisterValue(image, isa, previous.address, reg),
+        .lsl_imm => |shift| blk: {
+            if (shift.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
+            if (shift.rm != reg) return error.UnsupportedOpcode;
+            break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg) << @as(u5, @intCast(shift.imm));
+        },
+        .lsls_imm => |shift| blk: {
+            if (shift.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
+            if (shift.rm != reg) return error.UnsupportedOpcode;
+            break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg) << @as(u5, @intCast(shift.imm));
         },
         .orr_imm => |orr| blk: {
             if (orr.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
@@ -1378,7 +1399,7 @@ fn compileRuntimeHelper(
     return helper_object_path;
 }
 
-fn buildFixtureExpectFailure(
+fn buildFixtureCaptureOutput(
     allocator: std.mem.Allocator,
     io: std.Io,
     dir: std.Io.Dir,
@@ -1409,7 +1430,7 @@ fn buildFixtureExpectFailure(
     }) catch {
         return output.toOwnedSlice();
     };
-    return error.ExpectedBuildFailure;
+    return output.toOwnedSlice();
 }
 
 test "build emits a native executable for the first gba mov-plus-div slice" {
@@ -1453,12 +1474,12 @@ test "build emits a native executable for the first gba mov-plus-div slice" {
     try std.testing.expectEqualStrings("5\n", result.stdout);
 }
 
-test "tonc sbb_reg no longer stops at startup soft reset swi" {
+test "tonc sbb_reg gets past the startup bx r6 trampoline" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const stderr = try buildFixtureExpectFailure(
+    const stderr = try buildFixtureCaptureOutput(
         std.testing.allocator,
         io,
         tmp.dir,
@@ -1467,7 +1488,7 @@ test "tonc sbb_reg no longer stops at startup soft reset swi" {
     defer std.testing.allocator.free(stderr);
 
     try std.testing.expect(std.mem.indexOf(u8, stderr, "Unsupported SWI 0x000000") == null);
-    try std.testing.expect(std.mem.indexOf(u8, stderr, "Unsupported opcode 0x00004730 at 0x08000124 for armv4t") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "Unsupported opcode 0x00004730 at 0x08000124 for armv4t") == null);
 }
 
 test "build reports a structured diagnostic for an unsupported opcode" {
