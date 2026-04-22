@@ -798,7 +798,9 @@ fn resolveDecodedInstruction(
             try resolveLdrPcPostImmTarget(image, isa, address, load)
         else
             decoded,
-        .bl => |bl| if (try resolveDevkitArmCrt0StartupThumbBlxR3Target(image, isa, address, bl.target)) |resolved_target|
+        .bl => |bl| if (try resolveExactLocalThumbBlxR3VeneerTarget(image, isa, address, bl.target)) |resolved_target|
+            armv4t_decode.DecodedInstruction{ .bl = .{ .target = resolved_target } }
+        else if (try resolveDevkitArmCrt0StartupThumbBlxR3Target(image, isa, address, bl.target)) |resolved_target|
             armv4t_decode.DecodedInstruction{ .bl = .{ .target = resolved_target } }
         else
             decoded,
@@ -930,7 +932,75 @@ fn resolveDevkitArmCrt0StartupThumbBlxR3Target(
     };
     if (load.rd != 3 or load.base != 15) return null;
 
-    const literal_address = pcValueForInstruction(.thumb, previous.address) + load.offset;
+    return try resolveThumbPcRelativeLiteralCodeTarget(image, previous.address, load);
+}
+
+fn resolveExactLocalThumbBlxR3VeneerTarget(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    bl_address: u32,
+    target_address: u32,
+) BuildError!?u32 {
+    if (isa != .thumb) return null;
+
+    const target = decodeImageInstructionUnchecked(image, .thumb, target_address) catch return null;
+    const bx = switch (target.instruction) {
+        .bx_reg => |bx| bx,
+        else => return null,
+    };
+    if (bx.reg != 3) return null;
+
+    if (!isMeasuredLocalThumbBlxR3VeneerNop(image, target_address + 2)) return null;
+    return try resolveMeasuredLocalThumbBlxR3CallerTarget(image, isa, bl_address);
+}
+
+fn isMeasuredLocalThumbBlxR3VeneerNop(image: gba_loader.RomImage, address: u32) bool {
+    const offset = offsetForAddress(image, address, .thumb) orelse return false;
+    if (offset + 2 > image.bytes.len) return false;
+
+    const raw_halfword = armv4t_decode.readHalfword(image.bytes, offset);
+    // Keep this family exact and measured: the current local veneers end in
+    // either `mov r8, r8` or `movs r0, r0` after `bx r3`.
+    return raw_halfword == 0x46C0 or raw_halfword == 0x0000;
+}
+
+fn resolveMeasuredLocalThumbBlxR3CallerTarget(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    bl_address: u32,
+) BuildError!?u32 {
+    if (isa != .thumb) return null;
+
+    var address = bl_address;
+    var steps: u3 = 0;
+    while (steps < 4) : (steps += 1) {
+        const previous = previousInstruction(image, isa, address) catch return null;
+        address = previous.address;
+
+        switch (previous.instruction) {
+            .ldr_word_imm => |load| {
+                if (load.rd == 3 and load.base == 15) return try resolveThumbPcRelativeLiteralCodeTarget(image, previous.address, load);
+                if (load.base != 15 or load.rd == 3) return null;
+            },
+            .lsls_imm => |shift| {
+                if (shift.rd == 3 or shift.rm == 3) return null;
+            },
+            .lsrs_imm => |shift| {
+                if (shift.rd == 3 or shift.rm == 3) return null;
+            },
+            else => return null,
+        }
+    }
+
+    return null;
+}
+
+fn resolveThumbPcRelativeLiteralCodeTarget(
+    image: gba_loader.RomImage,
+    load_address: u32,
+    load: @FieldType(armv4t_decode.DecodedInstruction, "ldr_word_imm"),
+) BuildError!u32 {
+    const literal_address = pcValueForInstruction(.thumb, load_address) + load.offset;
     if (literal_address < image.base_address) return error.UnsupportedOpcode;
     const literal_offset = literal_address - image.base_address;
     if (literal_offset + 4 > image.bytes.len) return error.UnsupportedOpcode;
@@ -958,6 +1028,44 @@ fn writeStartupThumbBlxR3VeneerRom(
     std.mem.writeInt(u16, rom[8..10], stub, .little);
     std.mem.writeInt(u16, rom[10..12], after_stub, .little);
     std.mem.writeInt(u32, rom[16..20], literal, .little);
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
+fn writeLocalThumbBlxR3VeneerRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+    caller_load: u16,
+    stub: u16,
+    after_stub: u16,
+    literal: u32,
+) !void {
+    var rom: [24]u8 = std.mem.zeroes([24]u8);
+    std.mem.writeInt(u16, rom[2..4], caller_load, .little);
+    std.mem.writeInt(u16, rom[8..10], stub, .little);
+    std.mem.writeInt(u16, rom[10..12], after_stub, .little);
+    std.mem.writeInt(u32, rom[16..20], literal, .little);
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
+fn writeSeparatedLocalThumbBlxR3VeneerRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+    caller_load: u16,
+    between: [3]u16,
+    stub: u16,
+    after_stub: u16,
+    literal: u32,
+) !void {
+    var rom: [28]u8 = std.mem.zeroes([28]u8);
+    std.mem.writeInt(u16, rom[2..4], caller_load, .little);
+    std.mem.writeInt(u16, rom[4..6], between[0], .little);
+    std.mem.writeInt(u16, rom[6..8], between[1], .little);
+    std.mem.writeInt(u16, rom[8..10], between[2], .little);
+    std.mem.writeInt(u16, rom[12..14], stub, .little);
+    std.mem.writeInt(u16, rom[14..16], after_stub, .little);
+    std.mem.writeInt(u32, rom[20..24], literal, .little);
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
@@ -1987,6 +2095,129 @@ test "devkitARM crt0 startup blx r3 veneer rejects invalid literal targets" {
     }
 }
 
+test "local thumb blx r3 veneer resolves the measured caller literal targets" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeLocalThumbBlxR3VeneerRom(
+        tmp.dir,
+        io,
+        "local-blx-r3-key.gba",
+        0x4B03,
+        0x4718,
+        0x0000,
+        0x0800_0011,
+    );
+
+    try writeSeparatedLocalThumbBlxR3VeneerRom(
+        tmp.dir,
+        io,
+        "local-blx-r3-obj.gba",
+        0x4B04,
+        .{ 0x4903, 0x4803, 0x0092 },
+        0x4718,
+        0x46C0,
+        0x0800_0015,
+    );
+
+    const cases = [_]struct {
+        path: []const u8,
+        bl_address: u32,
+        veneer_address: u32,
+        expected_target: u32,
+    }{
+        .{
+            .path = "local-blx-r3-key.gba",
+            .bl_address = 0x0800_0004,
+            .veneer_address = 0x0800_0008,
+            .expected_target = 0x0800_0010,
+        },
+        .{
+            .path = "local-blx-r3-obj.gba",
+            .bl_address = 0x0800_000A,
+            .veneer_address = 0x0800_000C,
+            .expected_target = 0x0800_0014,
+        },
+    };
+
+    for (cases) |case| {
+        const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", case.path);
+        defer image.deinit(std.testing.allocator);
+
+        try std.testing.expectEqualDeep(
+            armv4t_decode.DecodedInstruction{ .bl = .{ .target = case.expected_target } },
+            try resolveDecodedInstruction(
+                image,
+                .{ .address = 0x0800_0000, .isa = .thumb },
+                case.bl_address,
+                .{ .bl = .{ .target = case.veneer_address } },
+            ),
+        );
+    }
+}
+
+test "local thumb blx r3 veneer rejects near misses" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cases = [_]struct {
+        caller_load: u16,
+        stub: u16,
+        after_stub: u16,
+    }{
+        .{
+            .caller_load = 0x4A03,
+            .stub = 0x4718,
+            .after_stub = 0x46C0,
+        },
+        .{
+            .caller_load = 0x4B03,
+            .stub = 0x4710,
+            .after_stub = 0x46C0,
+        },
+        .{
+            .caller_load = 0x4B03,
+            .stub = 0x4718,
+            .after_stub = 0x1C00,
+        },
+        .{
+            .caller_load = 0x6803,
+            .stub = 0x4718,
+            .after_stub = 0x46C0,
+        },
+    };
+
+    for (cases, 0..) |case, index| {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "local-blx-r3-near-miss-{d}.gba", .{index});
+        defer std.testing.allocator.free(path);
+
+        try writeLocalThumbBlxR3VeneerRom(
+            tmp.dir,
+            io,
+            path,
+            case.caller_load,
+            case.stub,
+            case.after_stub,
+            0x0800_0011,
+        );
+
+        const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", path);
+        defer image.deinit(std.testing.allocator);
+
+        try std.testing.expectEqualDeep(
+            armv4t_decode.DecodedInstruction{ .bl = .{ .target = 0x0800_0008 } },
+            try resolveDecodedInstruction(
+                image,
+                .{ .address = 0x0800_0000, .isa = .thumb },
+                0x0800_0004,
+                .{ .bl = .{ .target = 0x0800_0008 } },
+            ),
+        );
+    }
+}
+
 test "thumb saved-lr return epilogue resolves as a distinct return surface" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2208,7 +2439,7 @@ test "thumb saved-lr return epilogue rejects local tail near-misses" {
     }
 }
 
-test "tonc fixture frontiers reflect the expanded saved-lr return slice" {
+test "tonc fixture frontiers reflect the exact local thumb blx r3 veneer slice" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2216,6 +2447,7 @@ test "tonc fixture frontiers reflect the expanded saved-lr return slice" {
     const fixtures = [_]struct {
         rom_path: []const u8,
         old_blocker: []const u8,
+        cleared_blocker: ?[]const u8 = null,
         next_blocker: []const u8,
         still_blocked_here: bool,
     }{
@@ -2228,13 +2460,15 @@ test "tonc fixture frontiers reflect the expanded saved-lr return slice" {
         .{
             .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
             .old_blocker = "Unsupported opcode 0x00000000 at 0x080003A8 for armv4t",
-            .next_blocker = "Unsupported opcode 0x00004718 at 0x080003B8 for armv4t",
+            .cleared_blocker = "Unsupported opcode 0x00004718 at 0x080003B8 for armv4t",
+            .next_blocker = "Unsupported opcode 0xF81DF000 at 0x0800037A for armv4t",
             .still_blocked_here = false,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
             .old_blocker = "Unsupported opcode 0x00000021 at 0x080002F6 for armv4t",
-            .next_blocker = "Unsupported opcode 0x00004718 at 0x0800081C for armv4t",
+            .cleared_blocker = "Unsupported opcode 0x00004718 at 0x0800081C for armv4t",
+            .next_blocker = "Unsupported opcode 0xF860F000 at 0x08000294 for armv4t",
             .still_blocked_here = false,
         },
         .{
@@ -2253,6 +2487,9 @@ test "tonc fixture frontiers reflect the expanded saved-lr return slice" {
             try std.testing.expect(std.mem.indexOf(u8, result.stderr, fixture.old_blocker) != null);
         } else {
             try std.testing.expect(std.mem.indexOf(u8, result.stderr, fixture.old_blocker) == null);
+        }
+        if (fixture.cleared_blocker) |cleared_blocker| {
+            try std.testing.expect(std.mem.indexOf(u8, result.stderr, cleared_blocker) == null);
         }
         try std.testing.expect(std.mem.indexOf(u8, result.stderr, fixture.next_blocker) != null);
     }
