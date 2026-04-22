@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the first GBA graphics output path: deterministic raw Mode 4 frame dumps from final guest memory state, with sparse smoke tests for `ppu-stripes.gba`, `ppu-shades.gba`, and `ppu-hello.gba`.
+**Goal:** Build the first GBA graphics output path: deterministic raw Mode 4 frame dumps from final guest memory state, with a sparse smoke test for the real Mode 4 ROM `ppu-hello.gba`.
 
 **Architecture:** Keep rendering semantics inside a GBA runtime helper module and keep `hmncli` responsible for output-policy selection. The generated binary gets a small environment-variable contract for `frame_raw` and instruction-budget execution, then calls into a host-side Mode 4 rasterizer over emulated `IO`, BG palette RAM, and `VRAM`.
 
@@ -33,6 +33,7 @@
 
 - In scope: Background Mode 4 only, BG palette only, final-state snapshot dump, explicit instruction cap for `frame_raw`, sparse exact-pixel smoke assertions.
 - Out of scope: eggvance goldens, tile modes, sprites, scanline timing, frame-`N`, PNG fixtures in git, declaration-schema changes.
+- Fixture note: `ppu-stripes.gba` and `ppu-shades.gba` remain real graphics fixtures, but they set BG0 in mode 0 rather than Mode 4. Slice 1 uses `ppu-hello.gba`, which goes through the shared Mode 4 text helper path.
 - Stop after Slice 1 is green. Do not start golden generation or eggvance integration.
 
 ### Task 1: Extend Build Parsing For `frame_raw`
@@ -367,7 +368,7 @@ git add src/build_cmd.zig src/llvm_codegen.zig src/gba_ppu.zig
 git commit -m "feat(gba): emit frame_raw runtime hooks"
 ```
 
-### Task 4: Add Real-ROM Smoke Tests For Mode 4 Dumps
+### Task 4: Add A Real-ROM Smoke Test For Mode 4 Dumps
 
 **Files:**
 - Modify: `src/build_cmd.zig`
@@ -377,25 +378,26 @@ git commit -m "feat(gba): emit frame_raw runtime hooks"
 - [ ] **Step 1: Write the failing real-ROM smoke tests**
 
 ```zig
-test "build executes ppu-stripes with frame_raw and writes exact sampled pixels" {
+test "build executes ppu-hello with frame_raw and writes exact sampled pixels" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try stageRom(std.testing.allocator, io, tmp.dir, "tests/fixtures/real/jsmolka/ppu-stripes.gba", "ppu-stripes.gba");
-    try buildFrameRawRom(std.testing.allocator, io, tmp.dir, "ppu-stripes.gba", "ppu-stripes-native", 1_000_000);
-    try runFrameRawBinary(std.testing.allocator, io, tmp.dir, "ppu-stripes-native", "stripes.rgba", 1_000_000);
+    try stageRom(std.testing.allocator, io, tmp.dir, "tests/fixtures/real/jsmolka/ppu-hello.gba", "ppu-hello.gba");
+    try buildFrameRawRom(std.testing.allocator, io, tmp.dir, "ppu-hello.gba", "ppu-hello-native", 5_000);
+    try runFrameRawBinary(std.testing.allocator, io, tmp.dir, "ppu-hello-native", "hello.rgba", 5_000);
 
-    const frame = try frame_test_support.readExactFrame(std.testing.allocator, io, tmp.dir, "stripes.rgba");
+    const frame = try frame_test_support.readExactFrame(std.testing.allocator, io, tmp.dir, "hello.rgba");
     defer std.testing.allocator.free(frame);
 
-    try frame_test_support.expectPixel(frame, 0, 0, .{ 255, 0, 0, 255 });
-    try frame_test_support.expectPixel(frame, 40, 0, .{ 255, 255, 0, 255 });
-    try frame_test_support.expectPixel(frame, 80, 0, .{ 0, 255, 0, 255 });
+    try frame_test_support.expectPixel(frame, 0, 0, .{ 0, 0, 0, 255 });
+    try frame_test_support.expectPixel(frame, 73, 76, .{ 255, 255, 255, 255 });
+    try frame_test_support.expectPixel(frame, 75, 76, .{ 0, 0, 0, 255 });
+    try frame_test_support.expectPixel(frame, 82, 78, .{ 255, 255, 255, 255 });
+    try frame_test_support.expectPixel(frame, 80, 78, .{ 0, 0, 0, 255 });
+    try frame_test_support.expectPixel(frame, 120, 79, .{ 255, 255, 255, 255 });
 }
 ```
-
-Add corresponding tests for `ppu-shades.gba` and `ppu-hello.gba` with explicit coordinates and exact RGBA tuples determined from a manual first-run inspection.
 
 - [ ] **Step 2: Run the smoke tests to verify they fail**
 
@@ -436,8 +438,8 @@ git commit -m "feat(gba): add mode4 frame dump smoke tests"
 
 ## Self-Review
 
-- Spec coverage: this plan covers slice-1-only output mode, env contract, Mode 4 renderer, instruction-cap trigger, scratch test helpers, and three real-ROM smoke tests. It intentionally does not include eggvance goldens.
-- Placeholder scan: no `TODO`/`TBD` markers remain; later pixel tuples for `shades` and `hello` are resolved during Task 4 from actual first-run output before that task is committed.
+- Spec coverage: this plan covers slice-1-only output mode, env contract, Mode 4 renderer, instruction-cap trigger, scratch test helpers, and one real-ROM smoke test through the shared Mode 4 text helper path. It intentionally does not include eggvance goldens.
+- Placeholder scan: no `TODO`/`TBD` markers remain; the `ppu-hello.gba` pixel tuples are resolved during Task 4 from actual first-run output before that task is committed.
 - Type consistency: `frame_raw`, `max_instructions`, `gba_ppu.dumpMode4Rgba`, and `frame_test_support.readExactFrame` are named consistently across tasks.
 
 ## Execution Handoff

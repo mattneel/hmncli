@@ -2,9 +2,11 @@ const std = @import("std");
 const Io = std.Io;
 const armv4t_decode = @import("armv4t_decode.zig");
 const catalog = @import("catalog.zig");
+const frame_test_support = @import("frame_test_support.zig");
 const gba_loader = @import("gba_loader.zig");
 const llvm_codegen = @import("llvm_codegen.zig");
 const parse = @import("cli/parse.zig");
+const gba_ppu_source = @embedFile("gba_ppu.zig");
 
 pub const BuildOptions = parse.BuildCommand;
 
@@ -52,7 +54,7 @@ pub fn run(
     };
     defer image.deinit(allocator);
 
-    const program = try liftRom(allocator, writer, image);
+    const program = try liftRomWithOptions(allocator, writer, image, options.output_mode, options.max_instructions);
     defer program.deinit(allocator);
 
     try ensureParentDir(io, cwd, options.output_path);
@@ -60,7 +62,12 @@ pub fn run(
     defer allocator.free(llvm_path);
     try ensureParentDir(io, cwd, llvm_path);
     try writeLlvmFile(io, allocator, cwd, llvm_path, program);
-    try compileLlvm(io, allocator, cwd, writer, llvm_path, options);
+    const runtime_helper_obj = if (options.output_mode == .frame_raw)
+        try compileRuntimeHelper(io, allocator, cwd, writer, options)
+    else
+        null;
+    defer if (runtime_helper_obj) |helper_path| allocator.free(helper_path);
+    try compileLlvm(io, allocator, cwd, writer, llvm_path, runtime_helper_obj, options);
     try writer.print("Built {s}\n", .{options.output_path});
 }
 
@@ -68,6 +75,16 @@ fn liftRom(
     allocator: std.mem.Allocator,
     writer: *Io.Writer,
     image: gba_loader.RomImage,
+) BuildError!llvm_codegen.Program {
+    return liftRomWithOptions(allocator, writer, image, .auto, null);
+}
+
+fn liftRomWithOptions(
+    allocator: std.mem.Allocator,
+    writer: *Io.Writer,
+    image: gba_loader.RomImage,
+    requested_output_mode: parse.OutputMode,
+    max_instructions: ?u64,
 ) BuildError!llvm_codegen.Program {
     var pending_functions: std.ArrayList(armv4t_decode.CodeAddress) = .empty;
     defer pending_functions.deinit(allocator);
@@ -103,12 +120,15 @@ fn liftRom(
     }
 
     sortFunctions(functions.items);
-    const output_mode: llvm_codegen.OutputMode = if (hasArmReportRoutine(functions.items))
-        .arm_report
-    else if (has_store and has_self_loop)
-        .memory_summary
-    else
-        .register_r0_decimal;
+    const output_mode: llvm_codegen.OutputMode = switch (requested_output_mode) {
+        .auto => if (hasArmReportRoutine(functions.items))
+            .arm_report
+        else if (has_store and has_self_loop)
+            .memory_summary
+        else
+            .register_r0_decimal,
+        .frame_raw => .frame_raw,
+    };
     const owned_functions = try functions.toOwnedSlice(allocator);
 
     return .{
@@ -121,6 +141,7 @@ fn liftRom(
         .save_hardware = detectSaveHardware(image.bytes),
         .functions = owned_functions,
         .output_mode = output_mode,
+        .instruction_limit = if (requested_output_mode == .frame_raw) max_instructions else null,
     };
 }
 
@@ -1242,6 +1263,7 @@ fn compileLlvm(
     cwd: Io.Dir,
     writer: *Io.Writer,
     llvm_path: []const u8,
+    runtime_helper_obj: ?[]const u8,
     options: BuildOptions,
 ) BuildError!void {
     var argv: std.ArrayList([]const u8) = .empty;
@@ -1257,6 +1279,11 @@ fn compileLlvm(
     try argv.append(allocator, "-x");
     try argv.append(allocator, "ir");
     try argv.append(allocator, llvm_path);
+    if (runtime_helper_obj) |helper_obj| {
+        try argv.append(allocator, "-x");
+        try argv.append(allocator, "none");
+        try argv.append(allocator, helper_obj);
+    }
     if (maybe_target_flag) |target_flag| {
         try argv.append(allocator, target_flag);
     }
@@ -1278,6 +1305,56 @@ fn compileLlvm(
         }
         return error.ToolFailed;
     }
+}
+
+fn compileRuntimeHelper(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cwd: Io.Dir,
+    writer: *Io.Writer,
+    options: BuildOptions,
+) BuildError!?[]u8 {
+    const helper_dir = ".zig-cache";
+    const helper_source_path = ".zig-cache/hm_gba_ppu_runtime.zig";
+    const helper_object_path = try allocator.dupe(u8, ".zig-cache/hm_gba_ppu_runtime.o");
+    errdefer allocator.free(helper_object_path);
+
+    try cwd.createDirPath(io, helper_dir);
+    try cwd.writeFile(io, .{ .sub_path = helper_source_path, .data = gba_ppu_source });
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    const emit_bin_flag = try std.fmt.allocPrint(allocator, "-femit-bin={s}", .{helper_object_path});
+    defer allocator.free(emit_bin_flag);
+
+    try argv.append(allocator, "zig");
+    try argv.append(allocator, "build-obj");
+    try argv.append(allocator, helper_source_path);
+    try argv.append(allocator, "-O");
+    try argv.append(allocator, "ReleaseSmall");
+    try argv.append(allocator, "-fPIC");
+    if (options.target) |target| {
+        try argv.append(allocator, "-target");
+        try argv.append(allocator, target);
+    }
+    try argv.append(allocator, emit_bin_flag);
+
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv.items,
+        .cwd = .{ .dir = cwd },
+        .stdout_limit = .limited(16 * 1024),
+        .stderr_limit = .limited(16 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    if (!std.meta.eql(result.term, std.process.Child.Term{ .exited = 0 })) {
+        if (result.stderr.len != 0) {
+            try writer.print("{s}", .{result.stderr});
+        }
+        return error.ToolFailed;
+    }
+    return helper_object_path;
 }
 
 test "build emits a native executable for the first gba mov-plus-div slice" {
@@ -1959,4 +2036,148 @@ test "build uses the real jsmolka unsafe rom and reports the rom verdict" {
 
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("PASS\n", result.stdout);
+}
+
+test "build emits frame_raw llvm hooks when requested" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/real/jsmolka/ppu-hello.gba",
+        std.testing.allocator,
+        .limited(1024 * 1024),
+    );
+    defer std.testing.allocator.free(rom);
+    try tmp.dir.writeFile(io, .{ .sub_path = "ppu-hello.gba", .data = rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "ppu-hello.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_mode = .frame_raw,
+            .max_instructions = 1_000_000,
+            .output_path = "ppu-hello-native",
+        },
+    );
+
+    const llvm_bytes = try tmp.dir.readFileAlloc(
+        io,
+        "ppu-hello-native.ll",
+        std.testing.allocator,
+        .limited(512 * 1024),
+    );
+    defer std.testing.allocator.free(llvm_bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "@hmgba_dump_frame_raw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "@hm_runtime_max_instructions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "call i32 @hmgba_dump_frame_raw") != null);
+}
+
+test "build keeps frame_raw runtime helper artifacts under .zig-cache" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = [_]u8{
+        0x0A, 0x00, 0xA0, 0xE3,
+        0x02, 0x10, 0xA0, 0xE3,
+        0x06, 0x00, 0x00, 0xEF,
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "div.gba", .data = &rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "div.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_mode = .frame_raw,
+            .max_instructions = 5_000,
+            .output_path = "div-frame-native",
+        },
+    );
+
+    _ = try tmp.dir.statFile(io, ".zig-cache/hm_gba_ppu_runtime.o", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "hm_gba_ppu_runtime.o", .{}));
+    _ = try tmp.dir.statFile(io, ".zig-cache/hm_gba_ppu_runtime.zig", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "hm_gba_ppu_runtime.zig", .{}));
+}
+
+test "build executes the real jsmolka hello rom and dumps the expected mode4 frame" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/real/jsmolka/ppu-hello.gba",
+        std.testing.allocator,
+        .limited(1024 * 1024),
+    );
+    defer std.testing.allocator.free(rom);
+    try tmp.dir.writeFile(io, .{ .sub_path = "ppu-hello.gba", .data = rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "ppu-hello.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_mode = .frame_raw,
+            .max_instructions = 5_000,
+            .output_path = "ppu-hello-frame-native",
+        },
+    );
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put("HOMONCULI_OUTPUT_MODE", "frame_raw");
+    try environ_map.put("HOMONCULI_OUTPUT_PATH", "ppu-hello.rgba");
+    try environ_map.put("HOMONCULI_MAX_INSTRUCTIONS", "5000");
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./ppu-hello-frame-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .environ_map = &environ_map,
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    const frame = try frame_test_support.readExactFrame(std.testing.allocator, io, tmp.dir, "ppu-hello.rgba");
+    defer std.testing.allocator.free(frame);
+
+    try frame_test_support.expectPixel(frame, 0, 0, .{ 0, 0, 0, 255 });
+    try frame_test_support.expectPixel(frame, 73, 76, .{ 255, 255, 255, 255 });
+    try frame_test_support.expectPixel(frame, 75, 76, .{ 0, 0, 0, 255 });
+    try frame_test_support.expectPixel(frame, 82, 78, .{ 255, 255, 255, 255 });
+    try frame_test_support.expectPixel(frame, 80, 78, .{ 0, 0, 0, 255 });
+    try frame_test_support.expectPixel(frame, 120, 79, .{ 255, 255, 255, 255 });
 }

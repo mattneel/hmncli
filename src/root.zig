@@ -48,6 +48,8 @@ pub const machines = struct {
 
 pub const catalog = @import("catalog.zig");
 pub const capstone_api = @import("capstone_api.zig");
+pub const gba_ppu = @import("gba_ppu.zig");
+pub const frame_test_support = @import("frame_test_support.zig");
 
 test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
@@ -142,7 +144,7 @@ test "build emits guest-state llvm with a separate guest entry function" {
         io,
         "gba-div-native.ll",
         std.testing.allocator,
-        .limited(64 * 1024),
+        .limited(256 * 1024),
     );
     defer std.testing.allocator.free(llvm_bytes);
 

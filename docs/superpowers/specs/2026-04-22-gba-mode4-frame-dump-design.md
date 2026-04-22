@@ -106,13 +106,13 @@ General non-renderer execution can remain uncapped. `frame_raw` specifically sho
 
 Slice 1 lands the renderer without any external oracle dependency.
 
-Real-ROM acceptance targets:
+Real-ROM acceptance target:
 
-- `ppu-stripes.gba`
-- `ppu-shades.gba`
 - `ppu-hello.gba`
 
-For each ROM:
+This ROM goes through the shared Mode 4 text helper path in `jsmolka/gba-tests`. The visually simple `ppu-stripes.gba` and `ppu-shades.gba` demos remain useful graphics fixtures, but they configure BG0 in mode 0 rather than Mode 4 and therefore are not valid Slice 1 renderer smoke targets.
+
+For the target ROM:
 
 - run with `frame_raw`
 - pass an explicit instruction cap
@@ -121,9 +121,7 @@ For each ROM:
 
 The smoke assertions are intentionally sparse and hand-picked:
 
-- `stripes`: representative band samples
-- `shades`: representative palette/gradient samples
-- `hello`: representative foreground/background samples
+- `hello`: representative foreground/background samples through the shared Mode 4 text path
 
 On failure, tests may write scratch artifacts under `.zig-cache/test-artifacts/`:
 
@@ -139,9 +137,9 @@ Slice 2 adds eggvance-backed goldens without changing the comparison harness sha
 
 Committed fixture format:
 
-- `tests/fixtures/real/jsmolka/ppu-stripes.golden.rgba`
-- `tests/fixtures/real/jsmolka/ppu-shades.golden.rgba`
 - `tests/fixtures/real/jsmolka/ppu-hello.golden.rgba`
+
+Later slices can add verdict-screen goldens from real suite ROMs such as `arm.gba` and `thumb.gba`, which use the same shared Mode 4 result-display path.
 
 Pass criterion:
 
@@ -230,14 +228,14 @@ The purpose is to keep framebuffer-specific test logic out of `root.zig`.
 
 ### Slice 1 green criteria
 
-- `hmncli` emits deterministic Mode 4 raw frame dumps for the three `ppu` ROMs
-- real-ROM smoke tests pass
+- `hmncli` emits deterministic Mode 4 raw frame dumps for `ppu-hello.gba`
+- the real-ROM smoke test passes
 - failure mode for unsupported display modes is explicit
 - human spot-check via derived PNG is possible
 
 ### Slice 2 green criteria
 
-- committed `.golden.rgba` fixtures exist for the same ROM set
+- committed `.golden.rgba` fixtures exist for the same Mode 4 path
 - tests compare actual output against goldens byte-for-byte
 - smoke tests are replaced or reduced to helper-level unit tests
 

@@ -5,11 +5,18 @@ pub const ParseError = error{
     DeferredToPhase1,
 };
 
+pub const OutputMode = enum {
+    auto,
+    frame_raw,
+};
+
 pub const BuildCommand = struct {
     rom_path: []const u8,
     machine_name: []const u8,
     output_path: []const u8,
     target: ?[]const u8 = null,
+    output_mode: OutputMode = .auto,
+    max_instructions: ?u64 = null,
 };
 
 pub const Command = union(enum) {
@@ -60,6 +67,17 @@ fn parseBuild(args: []const []const u8) ParseError!Command {
             build.target = value;
             continue;
         }
+        if (std.mem.eql(u8, flag, "--output")) {
+            if (std.mem.eql(u8, value, "frame_raw")) {
+                build.output_mode = .frame_raw;
+                continue;
+            }
+            return error.InvalidCommand;
+        }
+        if (std.mem.eql(u8, flag, "--max-instructions")) {
+            build.max_instructions = std.fmt.parseUnsigned(u64, value, 10) catch return error.InvalidCommand;
+            continue;
+        }
         if (std.mem.eql(u8, flag, "-o")) {
             build.output_path = value;
             continue;
@@ -68,6 +86,7 @@ fn parseBuild(args: []const []const u8) ParseError!Command {
     }
 
     if (build.machine_name.len == 0 or build.output_path.len == 0) return error.InvalidCommand;
+    if (build.output_mode == .frame_raw and build.max_instructions == null) return error.InvalidCommand;
     return .{ .build = build };
 }
 
@@ -104,6 +123,53 @@ test "parse accepts the first phase 1 build command shape" {
             "x86_64-linux",
             "-o",
             "zig-out/bin/gba-div",
+        }),
+    );
+}
+
+test "parse accepts frame_raw build output and instruction cap" {
+    try std.testing.expectEqualDeep(
+        Command{ .build = .{
+            .rom_path = "tests/fixtures/real/jsmolka/ppu-stripes.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "zig-out/bin/ppu-stripes",
+            .output_mode = .frame_raw,
+            .max_instructions = 1_000_000,
+        } },
+        try parse(&.{
+            "hmncli",
+            "build",
+            "tests/fixtures/real/jsmolka/ppu-stripes.gba",
+            "--machine",
+            "gba",
+            "--target",
+            "x86_64-linux",
+            "--output",
+            "frame_raw",
+            "--max-instructions",
+            "1000000",
+            "-o",
+            "zig-out/bin/ppu-stripes",
+        }),
+    );
+}
+
+test "parse rejects frame_raw build without an instruction cap" {
+    try std.testing.expectError(
+        error.InvalidCommand,
+        parse(&.{
+            "hmncli",
+            "build",
+            "tests/fixtures/real/jsmolka/ppu-stripes.gba",
+            "--machine",
+            "gba",
+            "--target",
+            "x86_64-linux",
+            "--output",
+            "frame_raw",
+            "-o",
+            "zig-out/bin/ppu-stripes",
         }),
     );
 }
