@@ -486,12 +486,19 @@ fn emitLoadHelper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
         .{guest_state_dispstat_toggle_field},
     );
     try writer.print("  %bios_hit = icmp ult i32 %addr, 16384\n", .{});
+    try writer.print("  %save_none_ge = icmp uge i32 %addr, 234881024\n", .{});
+    try writer.print("  %save_none_lt = icmp ult i32 %addr, 268435456\n", .{});
+    try writer.print("  %save_none_hit = and i1 %save_none_ge, %save_none_lt\n", .{});
     try writer.print("  %dispstat_hit = icmp eq i32 %addr, 67108868\n", .{});
     try writer.print("  br i1 %bios_hit, label %load_bios, label %check_rom\n", .{});
     try writer.print("load_bios:\n", .{});
     try writer.print("  %bios_value = load i32, ptr %bios_latch_ptr, align 4\n", .{});
     try writer.print("  ret i32 %bios_value\n", .{});
     try writer.print("check_rom:\n", .{});
+    try writer.print("  br i1 %save_none_hit, label %load_save_none, label %check_real_rom\n", .{});
+    try writer.print("load_save_none:\n", .{});
+    try writer.print("  ret i32 -1\n", .{});
+    try writer.print("check_real_rom:\n", .{});
     if (program.rom_bytes.len >= 4) {
         const rom_window_end = program.rom_base_address + 0x0600_0000;
         const rom_span = @as(u32, @intCast(program.rom_bytes.len)) - 3;
@@ -566,7 +573,14 @@ fn emitLoad8Helper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
             .{ region.field_name, region.field_index },
         );
     }
+    try writer.print("  %save_none8_ge = icmp uge i32 %addr, 234881024\n", .{});
+    try writer.print("  %save_none8_lt = icmp ult i32 %addr, 268435456\n", .{});
+    try writer.print("  %save_none8_hit = and i1 %save_none8_ge, %save_none8_lt\n", .{});
     if (program.rom_bytes.len != 0) {
+        try writer.print("  br i1 %save_none8_hit, label %load8_save_none, label %check_load8_rom\n", .{});
+        try writer.print("load8_save_none:\n", .{});
+        try writer.print("  ret i32 255\n", .{});
+        try writer.print("check_load8_rom:\n", .{});
         const rom_window_end = program.rom_base_address + 0x0600_0000;
         const rom_span = @as(u32, @intCast(program.rom_bytes.len));
         try writer.print("  %rom8_ge = icmp uge i32 %addr, {d}\n", .{program.rom_base_address});
@@ -586,7 +600,9 @@ fn emitLoad8Helper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
         try writer.print("  %rom8_i32 = zext i8 %rom8_value to i32\n", .{});
         try writer.print("  ret i32 %rom8_i32\n", .{});
     } else {
-        try writer.print("  br label %check_load8_region_0\n", .{});
+        try writer.print("  br i1 %save_none8_hit, label %load8_save_none, label %check_load8_region_0\n", .{});
+        try writer.print("load8_save_none:\n", .{});
+        try writer.print("  ret i32 255\n", .{});
     }
 
     for (memory_regions, 0..) |region, index| {
@@ -668,7 +684,21 @@ fn emitSizedLoadHelper(
             .{ region.field_name, load_name, region.field_index },
         );
     }
+    try writer.print("  %{s}_save_none_ge = icmp uge i32 %addr, 234881024\n", .{load_name});
+    try writer.print("  %{s}_save_none_lt = icmp ult i32 %addr, 268435456\n", .{load_name});
+    try writer.print("  %{s}_save_none_hit = and i1 %{s}_save_none_ge, %{s}_save_none_lt\n", .{ load_name, load_name, load_name });
     if (program.rom_bytes.len >= byte_width) {
+        try writer.print("  br i1 %{s}_save_none_hit, label %{s}_save_none, label %check_{s}_rom\n", .{ load_name, load_name, load_name });
+        try writer.print("{s}_save_none:\n", .{load_name});
+        if (signed and bits == 8)
+            try writer.print("  ret i32 -1\n", .{})
+        else if (signed and bits == 16)
+            try writer.print("  ret i32 -1\n", .{})
+        else if (!signed and bits == 8)
+            try writer.print("  ret i32 255\n", .{})
+        else
+            try writer.print("  ret i32 65535\n", .{});
+        try writer.print("check_{s}_rom:\n", .{load_name});
         const rom_window_end = program.rom_base_address + 0x0600_0000;
         const rom_span = @as(u32, @intCast(program.rom_bytes.len)) - byte_width + 1;
         try writer.print("  %{s}_rom_ge = icmp uge i32 %addr, {d}\n", .{ load_name, program.rom_base_address });
@@ -688,7 +718,16 @@ fn emitSizedLoadHelper(
         try writer.print("  %{s}_rom_i32 = {s} {s} %{s}_rom_value to i32\n", .{ load_name, cast_op, llvm_ty, load_name });
         try writer.print("  ret i32 %{s}_rom_i32\n", .{load_name});
     } else {
-        try writer.print("  br label %check_{s}_region_0\n", .{load_name});
+        try writer.print("  br i1 %{s}_save_none_hit, label %{s}_save_none, label %check_{s}_region_0\n", .{ load_name, load_name, load_name });
+        try writer.print("{s}_save_none:\n", .{load_name});
+        if (signed and bits == 8)
+            try writer.print("  ret i32 -1\n", .{})
+        else if (signed and bits == 16)
+            try writer.print("  ret i32 -1\n", .{})
+        else if (!signed and bits == 8)
+            try writer.print("  ret i32 255\n", .{})
+        else
+            try writer.print("  ret i32 65535\n", .{});
     }
 
     for (memory_regions, 0..) |region, index| {

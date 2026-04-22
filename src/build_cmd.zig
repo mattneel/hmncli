@@ -1735,3 +1735,46 @@ test "build uses the real jsmolka bios rom and reports the rom verdict" {
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("PASS\n", result.stdout);
 }
+
+test "build uses the real jsmolka save-none rom and reports the rom verdict" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/real/jsmolka/save-none.gba",
+        std.testing.allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer std.testing.allocator.free(rom);
+    try tmp.dir.writeFile(io, .{ .sub_path = "save-none.gba", .data = rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "save-none.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "save-none-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./save-none-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("PASS\n", result.stdout);
+}
