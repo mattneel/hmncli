@@ -500,7 +500,7 @@ fn enqueueSuccessors(
                 return;
             }
 
-            if (try resolveStartupConditionalBranch(image, isa, address, branch)) |take_branch| {
+            if (try resolveDevkitArmCrt0HeaderCheckBranch(image, isa, address, branch)) |take_branch| {
                 if (take_branch) {
                     if (branch.target == address) {
                         has_self_loop.* = true;
@@ -577,7 +577,7 @@ fn enqueueSuccessors(
     }
 }
 
-fn resolveStartupConditionalBranch(
+fn resolveDevkitArmCrt0HeaderCheckBranch(
     image: gba_loader.RomImage,
     isa: armv4t_decode.InstructionSet,
     address: u32,
@@ -586,7 +586,7 @@ fn resolveStartupConditionalBranch(
     if (isa != .thumb) return null;
     if (branch.cond != .hs and branch.cond != .lo) return null;
 
-    const previous = previousThumbInstruction(image, address) catch return null;
+    const previous = previousInstruction(image, isa, address) catch return null;
     const shift = switch (previous.instruction) {
         .lsls_imm => |shift| shift,
         else => return null,
@@ -594,7 +594,7 @@ fn resolveStartupConditionalBranch(
 
     if (shift.rd != shift.rm or shift.imm == 0) return null;
 
-    const source = previousThumbInstruction(image, previous.address) catch return null;
+    const source = previousInstruction(image, isa, previous.address) catch return null;
     const load = switch (source.instruction) {
         .ldr_word_imm => |load| load,
         else => return null,
@@ -605,22 +605,12 @@ fn resolveStartupConditionalBranch(
     const literal_offset = if (literal_address < image.base_address) return null else literal_address - image.base_address;
     if (literal_offset + 4 > image.bytes.len) return null;
 
+    // Narrowly recognize the devkitARM crt0 header check: the literal must be
+    // the ROM base itself before the carry-setting shift proves this branch.
     const source_value = armv4t_decode.readWord(image.bytes, literal_offset);
+    if (source_value != image.base_address) return null;
     const carry_set = lslImmediateCarryOut(source_value, shift.imm) orelse return null;
     return if (branch.cond == .hs) carry_set else !carry_set;
-}
-
-fn previousThumbInstruction(
-    image: gba_loader.RomImage,
-    address: u32,
-) BuildError!DecodedNode {
-    for ([_]u8{ 4, 2 }) |candidate_size| {
-        if (address < image.base_address + candidate_size) continue;
-        const candidate_address = address - candidate_size;
-        const decoded = decodeImageInstructionUnchecked(image, .thumb, candidate_address) catch continue;
-        if (candidate_address + decoded.size_bytes == address) return decoded;
-    }
-    return error.UnsupportedOpcode;
 }
 
 fn lslImmediateCarryOut(value: u32, amount: u32) ?bool {
@@ -1537,6 +1527,23 @@ fn buildFixtureCaptureOutput(
     };
 }
 
+fn writeThumbStartupBranchRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+    literal: u32,
+) !void {
+    var rom: [180]u8 = std.mem.zeroes([180]u8);
+    rom[0] = 0x2B;
+    rom[1] = 0x48;
+    rom[2] = 0x40;
+    rom[3] = 0x01;
+    rom[4] = 0x0B;
+    rom[5] = 0xD2;
+    std.mem.writeInt(u32, rom[176..180], literal, .little);
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
 test "build emits a native executable for the first gba mov-plus-div slice" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1576,6 +1583,48 @@ test "build emits a native executable for the first gba mov-plus-div slice" {
 
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("5\n", result.stdout);
+}
+
+test "devkitARM crt0 header-check pruning accepts the startup pattern" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeThumbStartupBranchRom(tmp.dir, io, "startup.gba", 0x0800_0000);
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "startup.gba");
+    defer image.deinit(std.testing.allocator);
+
+    const branch = @FieldType(armv4t_decode.DecodedInstruction, "branch"){
+        .cond = .hs,
+        .target = 0x0800_0100,
+    };
+
+    try std.testing.expectEqual(
+        @as(?bool, true),
+        try resolveDevkitArmCrt0HeaderCheckBranch(image, .thumb, 0x0800_0004, branch),
+    );
+}
+
+test "devkitARM crt0 header-check pruning ignores near-miss literals" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeThumbStartupBranchRom(tmp.dir, io, "startup-near-miss.gba", 0x0400_0000);
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "startup-near-miss.gba");
+    defer image.deinit(std.testing.allocator);
+
+    const branch = @FieldType(armv4t_decode.DecodedInstruction, "branch"){
+        .cond = .hs,
+        .target = 0x0800_0100,
+    };
+
+    try std.testing.expectEqual(
+        @as(?bool, null),
+        try resolveDevkitArmCrt0HeaderCheckBranch(image, .thumb, 0x0800_0004, branch),
+    );
 }
 
 test "tonc fixtures stop at the shared arm decode blocker after startup pruning" {
