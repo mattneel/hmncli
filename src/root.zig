@@ -109,3 +109,44 @@ test "fixture-backed status report renders deterministic counts" {
         output.writer.buffered(),
     );
 }
+
+test "build emits guest-state llvm with a separate guest entry function" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = [_]u8{
+        0x0A, 0x00, 0xA0, 0xE3,
+        0x02, 0x10, 0xA0, 0xE3,
+        0x06, 0x00, 0x00, 0xEF,
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "div.gba", .data = &rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try cli.build_cmd.run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "div.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "gba-div-native",
+        },
+    );
+
+    const llvm_bytes = try tmp.dir.readFileAlloc(
+        io,
+        "gba-div-native.ll",
+        std.testing.allocator,
+        .limited(64 * 1024),
+    );
+    defer std.testing.allocator.free(llvm_bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "%GuestState = type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "define void @guest_08000000(ptr %state)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "call void @guest_08000000(ptr %state)") != null);
+}

@@ -52,7 +52,7 @@ pub fn run(
     defer image.deinit(allocator);
 
     const program = try liftRom(allocator, writer, image);
-    defer allocator.free(program.instructions);
+    defer program.deinit(allocator);
 
     try ensureParentDir(io, cwd, options.output_path);
     const llvm_path = try llvmPath(allocator, options.output_path);
@@ -68,20 +68,63 @@ fn liftRom(
     writer: *Io.Writer,
     image: gba_loader.RomImage,
 ) BuildError!llvm_codegen.Program {
-    var pending: std.ArrayList(u32) = .empty;
-    defer pending.deinit(allocator);
+    var pending_functions: std.ArrayList(u32) = .empty;
+    defer pending_functions.deinit(allocator);
 
-    var nodes: std.ArrayList(llvm_codegen.InstructionNode) = .empty;
-    defer nodes.deinit(allocator);
+    var functions: std.ArrayList(llvm_codegen.Function) = .empty;
+    errdefer {
+        for (functions.items) |function| allocator.free(function.instructions);
+        functions.deinit(allocator);
+    }
 
     var has_store = false;
     var has_self_loop = false;
 
-    try pending.append(allocator, image.base_address);
+    try pending_functions.append(allocator, image.base_address);
 
-    while (pending.items.len != 0) {
-        const address = pending.items[pending.items.len - 1];
-        pending.items.len -= 1;
+    while (pending_functions.items.len != 0) {
+        const function_entry = pending_functions.items[pending_functions.items.len - 1];
+        pending_functions.items.len -= 1;
+
+        if (containsFunction(functions.items, function_entry)) continue;
+        try functions.append(allocator, try liftFunction(
+            allocator,
+            writer,
+            image,
+            function_entry,
+            &has_store,
+            &has_self_loop,
+        ));
+    }
+
+    sortFunctions(functions.items);
+
+    return .{
+        .entry_address = image.base_address,
+        .functions = try functions.toOwnedSlice(allocator),
+        .output_mode = if (has_store and has_self_loop) .memory_summary else .register_r0_decimal,
+    };
+}
+
+fn liftFunction(
+    allocator: std.mem.Allocator,
+    writer: *Io.Writer,
+    image: gba_loader.RomImage,
+    function_entry: u32,
+    has_store: *bool,
+    has_self_loop: *bool,
+) BuildError!llvm_codegen.Function {
+    var pending_blocks: std.ArrayList(u32) = .empty;
+    defer pending_blocks.deinit(allocator);
+
+    var nodes: std.ArrayList(llvm_codegen.InstructionNode) = .empty;
+    defer nodes.deinit(allocator);
+
+    try pending_blocks.append(allocator, function_entry);
+
+    while (pending_blocks.items.len != 0) {
+        const address = pending_blocks.items[pending_blocks.items.len - 1];
+        pending_blocks.items.len -= 1;
 
         if (containsAddress(nodes.items, address)) continue;
         const offset = offsetForAddress(image, address) orelse {
@@ -96,22 +139,21 @@ fn liftRom(
         };
 
         try ensureDeclared(writer, decoded, address);
-        if (isStore(decoded)) has_store = true;
+        if (isStore(decoded)) has_store.* = true;
 
         try nodes.append(allocator, .{
             .address = address,
             .instruction = decoded,
         });
 
-        try enqueueSuccessors(allocator, writer, &pending, image, address, decoded, &has_self_loop);
+        try enqueueSuccessors(allocator, writer, &pending_blocks, image, address, decoded, has_self_loop);
     }
 
     sortNodes(nodes.items);
 
     return .{
-        .entry_address = image.base_address,
+        .entry_address = function_entry,
         .instructions = try nodes.toOwnedSlice(allocator),
-        .output_mode = if (has_store and has_self_loop) .memory_summary else .register_r0_decimal,
     };
 }
 
@@ -221,6 +263,13 @@ fn containsAddress(nodes: []const llvm_codegen.InstructionNode, address: u32) bo
     return false;
 }
 
+fn containsFunction(functions: []const llvm_codegen.Function, entry_address: u32) bool {
+    for (functions) |function| {
+        if (function.entry_address == entry_address) return true;
+    }
+    return false;
+}
+
 fn sortNodes(nodes: []llvm_codegen.InstructionNode) void {
     var i: usize = 0;
     while (i < nodes.len) : (i += 1) {
@@ -230,6 +279,18 @@ fn sortNodes(nodes: []llvm_codegen.InstructionNode) void {
             if (nodes[j].address < nodes[min_index].address) min_index = j;
         }
         if (min_index != i) std.mem.swap(llvm_codegen.InstructionNode, &nodes[i], &nodes[min_index]);
+    }
+}
+
+fn sortFunctions(functions: []llvm_codegen.Function) void {
+    var i: usize = 0;
+    while (i < functions.len) : (i += 1) {
+        var min_index = i;
+        var j: usize = i + 1;
+        while (j < functions.len) : (j += 1) {
+            if (functions[j].entry_address < functions[min_index].entry_address) min_index = j;
+        }
+        if (min_index != i) std.mem.swap(llvm_codegen.Function, &functions[i], &functions[min_index]);
     }
 }
 
