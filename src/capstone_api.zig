@@ -6,20 +6,61 @@ pub const CapstoneVersion = struct {
     minor: u16,
 };
 
-pub const InstructionText = struct {
+pub const max_arm_operands = 36;
+
+pub const ArmMemoryOperand = struct {
+    base: u32,
+    index: u32,
+    scale: i32,
+    disp: i32,
+};
+
+pub const ArmOperand = struct {
+    subtracted: bool,
+    access: u8,
+    value: Value,
+
+    pub const Value = union(enum) {
+        reg: u32,
+        imm: i64,
+        mem: ArmMemoryOperand,
+        unsupported: u32,
+    };
+
+    fn empty() ArmOperand {
+        return .{
+            .subtracted = false,
+            .access = 0,
+            .value = .{ .unsupported = 0 },
+        };
+    }
+};
+
+pub const ArmInstruction = struct {
+    id: u32,
     address: u64,
     size: u16,
-    mnemonic: [32]u8,
-    mnemonic_len: u8,
-    operands: [160]u8,
-    operands_len: u8,
+    cc: u32,
+    update_flags: bool,
+    post_index: bool,
+    writeback: bool,
+    operand_count: u8,
+    operands: [max_arm_operands]ArmOperand,
 
-    pub fn mnemonicSlice(self: *const InstructionText) []const u8 {
-        return self.mnemonic[0..self.mnemonic_len];
-    }
-
-    pub fn operandsSlice(self: *const InstructionText) []const u8 {
-        return self.operands[0..self.operands_len];
+    fn empty() ArmInstruction {
+        var operands: [max_arm_operands]ArmOperand = undefined;
+        for (&operands) |*operand| operand.* = ArmOperand.empty();
+        return .{
+            .id = 0,
+            .address = 0,
+            .size = 0,
+            .cc = 0,
+            .update_flags = false,
+            .post_index = false,
+            .writeback = false,
+            .operand_count = 0,
+            .operands = operands,
+        };
     }
 };
 
@@ -27,6 +68,7 @@ pub const DisassembleError = error{
     OpenFailed,
     OptionFailed,
     DisassembleFailed,
+    MissingDetail,
 };
 
 pub fn version() CapstoneVersion {
@@ -39,12 +81,12 @@ pub fn version() CapstoneVersion {
     };
 }
 
-pub fn disassembleOneArm32(word: u32, address: u64) DisassembleError!InstructionText {
+pub fn disassembleOneArm32(word: u32, address: u64) DisassembleError!ArmInstruction {
     var handle: usize = 0;
     if (c.cs_open(c.CS_ARCH_ARM, c.CS_MODE_ARM, &handle) != c.CS_ERR_OK) return error.OpenFailed;
     defer _ = c.cs_close(&handle);
 
-    if (c.cs_option(handle, c.CS_OPT_DETAIL, c.CS_OPT_OFF) != c.CS_ERR_OK) return error.OptionFailed;
+    if (c.cs_option(handle, c.CS_OPT_DETAIL, c.CS_OPT_ON) != c.CS_ERR_OK) return error.OptionFailed;
 
     var word_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &word_bytes, word, .little);
@@ -55,28 +97,40 @@ pub fn disassembleOneArm32(word: u32, address: u64) DisassembleError!Instruction
     defer c.cs_free(insn_ptr, decoded_count);
 
     const decoded = insn_ptr[0];
-    return .{
-        .address = decoded.address,
-        .size = decoded.size,
-        .mnemonic = copyCString(32, decoded.mnemonic),
-        .mnemonic_len = cStringLen(decoded.mnemonic[0..]),
-        .operands = copyCString(160, decoded.op_str),
-        .operands_len = cStringLen(decoded.op_str[0..]),
-    };
-}
+    if (decoded.detail == null) return error.MissingDetail;
 
-fn cStringLen(buffer: []const u8) u8 {
-    var index: usize = 0;
-    while (index < buffer.len and buffer[index] != 0) : (index += 1) {}
-    return @intCast(index);
-}
+    const detail = decoded.detail[0];
+    const arm = detail.unnamed_0.arm;
+    var result = ArmInstruction.empty();
+    result.id = decoded.id;
+    result.address = decoded.address;
+    result.size = decoded.size;
+    result.cc = @intCast(arm.cc);
+    result.update_flags = arm.update_flags;
+    result.post_index = arm.post_index;
+    result.writeback = detail.writeback;
+    result.operand_count = arm.op_count;
 
-fn copyCString(comptime N: usize, source: [N]u8) [N]u8 {
-    var output: [N]u8 = [_]u8{0} ** N;
-    for (source, 0..) |value, index| {
-        output[index] = value;
+    for (0..arm.op_count) |index| {
+        const operand = arm.operands[index];
+        result.operands[index] = .{
+            .subtracted = operand.subtracted,
+            .access = operand.access,
+            .value = switch (operand.type) {
+                c.ARM_OP_REG => .{ .reg = @intCast(operand.unnamed_0.reg) },
+                c.ARM_OP_IMM => .{ .imm = operand.unnamed_0.imm },
+                c.ARM_OP_MEM => .{ .mem = .{
+                    .base = @intCast(operand.unnamed_0.mem.base),
+                    .index = @intCast(operand.unnamed_0.mem.index),
+                    .scale = operand.unnamed_0.mem.scale,
+                    .disp = operand.unnamed_0.mem.disp,
+                } },
+                else => .{ .unsupported = @intCast(operand.type) },
+            },
+        };
     }
-    return output;
+
+    return result;
 }
 
 test "capstone library reports a usable major version" {
@@ -89,10 +143,33 @@ test "translated capstone module exposes ARM constants" {
     try std.testing.expectEqual(c.CS_MODE_ARM, 0);
 }
 
-test "capstone disassembles an ARM branch mnemonic" {
+test "capstone exposes structured branch detail" {
     const actual = try disassembleOneArm32(0xEA00002E, 0x08000000);
+    try std.testing.expectEqual(@as(u32, c.ARM_INS_B), actual.id);
     try std.testing.expectEqual(@as(u64, 0x08000000), actual.address);
     try std.testing.expectEqual(@as(u16, 4), actual.size);
-    try std.testing.expectEqualStrings("b", actual.mnemonicSlice());
-    try std.testing.expect(actual.operandsSlice().len != 0);
+    try std.testing.expectEqual(@as(u32, c.ARMCC_AL), actual.cc);
+    try std.testing.expectEqual(@as(u8, 1), actual.operand_count);
+    switch (actual.operands[0].value) {
+        .imm => |imm| try std.testing.expectEqual(@as(i64, 0x080000C0), imm),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "capstone exposes structured store detail" {
+    const actual = try disassembleOneArm32(0xE7810002, 0x08000118);
+    try std.testing.expectEqual(@as(u32, c.ARM_INS_STR), actual.id);
+    try std.testing.expectEqual(@as(u8, 2), actual.operand_count);
+    switch (actual.operands[0].value) {
+        .reg => |reg| try std.testing.expectEqual(@as(u32, c.ARM_REG_R0), reg),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (actual.operands[1].value) {
+        .mem => |mem| {
+            try std.testing.expectEqual(@as(u32, c.ARM_REG_R1), mem.base);
+            try std.testing.expectEqual(@as(u32, c.ARM_REG_R2), mem.index);
+            try std.testing.expectEqual(@as(i32, 0), mem.disp);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }

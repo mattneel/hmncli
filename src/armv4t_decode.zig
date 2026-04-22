@@ -1,4 +1,5 @@
 const std = @import("std");
+const c = @import("capstone_c");
 const capstone_api = @import("capstone_api.zig");
 
 pub const DecodeError = error{
@@ -57,43 +58,45 @@ pub const DecodedInstruction = union(enum) {
 };
 
 pub fn decode(word: u32, address: u32) DecodeError!DecodedInstruction {
-    const text = try capstone_api.disassembleOneArm32(word, address);
-    const mnemonic = text.mnemonicSlice();
-    const operands = text.operandsSlice();
+    const insn = try capstone_api.disassembleOneArm32(word, address);
 
-    if (std.mem.eql(u8, mnemonic, "mov")) return parseMov(operands);
-    if (std.mem.eql(u8, mnemonic, "orr")) return parseAlu3(.orr_imm, operands);
-    if (std.mem.eql(u8, mnemonic, "add")) return parseAlu3(.add_imm, operands);
-    if (std.mem.eql(u8, mnemonic, "subs")) return parseAlu3(.subs_imm, operands);
-    if (std.mem.eql(u8, mnemonic, "str")) return parseStore(operands, .word);
-    if (std.mem.eql(u8, mnemonic, "strb")) return parseStore(operands, .byte);
-    if (std.mem.eql(u8, mnemonic, "strh")) return parseStore(operands, .halfword);
-    if (std.mem.eql(u8, mnemonic, "b")) return parseBranch(operands, .al);
-    if (std.mem.eql(u8, mnemonic, "bne")) return parseBranch(operands, .ne);
-    if (std.mem.eql(u8, mnemonic, "swi") or std.mem.eql(u8, mnemonic, "svc")) return parseSwi(operands);
-    return error.UnsupportedOpcode;
+    return switch (insn.id) {
+        c.ARM_INS_MOV => parseMov(insn),
+        c.ARM_INS_ORR => parseAlu3(.orr_imm, insn),
+        c.ARM_INS_ADD => parseAlu3(.add_imm, insn),
+        c.ARM_INS_SUB, c.ARM_INS_SUBS => if (insn.update_flags)
+            parseAlu3(.subs_imm, insn)
+        else
+            error.UnsupportedOpcode,
+        c.ARM_INS_STR => parseStore(insn, .word),
+        c.ARM_INS_STRB => parseStore(insn, .byte),
+        c.ARM_INS_STRH => parseStore(insn, .halfword),
+        c.ARM_INS_B => parseBranch(insn),
+        c.ARM_INS_SVC => parseSwi(insn),
+        else => error.UnsupportedOpcode,
+    };
 }
 
 pub fn readWord(bytes: []const u8, offset: usize) u32 {
     return std.mem.readInt(u32, bytes[offset..][0..4], .little);
 }
 
-fn parseMov(operands: []const u8) DecodeError!DecodedInstruction {
-    const split = try split3Operands(operands, 2);
+fn parseMov(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+    if (insn.operand_count != 2) return error.UnsupportedOpcode;
     return .{ .mov_imm = .{
-        .rd = try parseRegister(split.first),
-        .imm = try parseImmediate(split.second),
+        .rd = try operandRegister(insn, 0),
+        .imm = try operandImmediateU32(insn, 1),
     } };
 }
 
 fn parseAlu3(
     comptime tag: enum { orr_imm, add_imm, subs_imm },
-    operands: []const u8,
+    insn: capstone_api.ArmInstruction,
 ) DecodeError!DecodedInstruction {
-    const split = try split3Operands(operands, 3);
-    const rd = try parseRegister(split.first);
-    const rn = try parseRegister(split.second);
-    const imm = try parseImmediate(split.third.?);
+    if (insn.operand_count != 3) return error.UnsupportedOpcode;
+    const rd = try operandRegister(insn, 0);
+    const rn = try operandRegister(insn, 1);
+    const imm = try operandImmediateU32(insn, 2);
 
     return switch (tag) {
         .orr_imm => .{ .orr_imm = .{ .rd = rd, .rn = rn, .imm = imm } },
@@ -102,111 +105,99 @@ fn parseAlu3(
     };
 }
 
-fn parseStore(operands: []const u8, size: StoreSize) DecodeError!DecodedInstruction {
-    const comma_index = std.mem.indexOfScalar(u8, operands, ',') orelse return error.UnsupportedOpcode;
-    const src_text = trim(operands[0..comma_index]);
-    const memory_text = trim(operands[comma_index + 1 ..]);
-    const src = try parseRegister(src_text);
+fn parseStore(insn: capstone_api.ArmInstruction, size: StoreSize) DecodeError!DecodedInstruction {
+    if (insn.operand_count != 2) return error.UnsupportedOpcode;
 
-    const memory = try parseMemoryOperand(memory_text);
+    const src = try operandRegister(insn, 0);
+    const mem_op = operandAt(insn, 1);
+    if (mem_op.subtracted) return error.UnsupportedOpcode;
+
+    const mem = switch (mem_op.value) {
+        .mem => |value| value,
+        else => return error.UnsupportedOpcode,
+    };
+
+    const base = try parseRegisterId(mem.base);
+    const offset = try parseMemoryOffset(mem);
     return .{ .store = .{
         .src = src,
-        .base = memory.base,
-        .offset = memory.offset,
+        .base = base,
+        .offset = offset,
         .size = size,
     } };
 }
 
-fn parseBranch(operands: []const u8, cond: Cond) DecodeError!DecodedInstruction {
+fn parseBranch(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+    if (insn.operand_count != 1) return error.UnsupportedOpcode;
+    const cond: Cond = switch (insn.cc) {
+        c.ARMCC_AL => .al,
+        c.ARMCC_NE => .ne,
+        else => return error.UnsupportedOpcode,
+    };
     return .{ .branch = .{
         .cond = cond,
-        .target = try parseImmediate(operands),
+        .target = try operandImmediateU32(insn, 0),
     } };
 }
 
-fn parseSwi(operands: []const u8) DecodeError!DecodedInstruction {
-    const imm = try parseImmediate(operands);
+fn parseSwi(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+    if (insn.operand_count != 1) return error.UnsupportedOpcode;
+    const imm = try operandImmediateU32(insn, 0);
     if (imm > 0x00FF_FFFF) return error.UnsupportedOpcode;
     return .{ .swi = .{
         .imm24 = @truncate(imm),
     } };
 }
 
-const MemoryOperand = struct {
-    base: u4,
-    offset: Offset,
-};
+fn operandAt(insn: capstone_api.ArmInstruction, index: usize) capstone_api.ArmOperand {
+    return insn.operands[index];
+}
 
-fn parseMemoryOperand(text: []const u8) DecodeError!MemoryOperand {
-    const trimmed = trim(text);
-    if (trimmed.len < 2 or trimmed[0] != '[' or trimmed[trimmed.len - 1] != ']') return error.UnsupportedOpcode;
-    const inner = trim(trimmed[1 .. trimmed.len - 1]);
-    const comma_index = std.mem.indexOfScalar(u8, inner, ',');
-    if (comma_index == null) {
-        return .{
-            .base = try parseRegister(inner),
-            .offset = .{ .imm = 0 },
-        };
-    }
-
-    const base_text = trim(inner[0..comma_index.?]);
-    const offset_text = trim(inner[comma_index.? + 1 ..]);
-    return .{
-        .base = try parseRegister(base_text),
-        .offset = try parseOffset(offset_text),
+fn operandRegister(insn: capstone_api.ArmInstruction, index: usize) DecodeError!u4 {
+    const operand = operandAt(insn, index);
+    if (operand.subtracted) return error.UnsupportedOpcode;
+    return switch (operand.value) {
+        .reg => |reg| parseRegisterId(reg),
+        else => error.UnsupportedOpcode,
     };
 }
 
-fn parseOffset(text: []const u8) DecodeError!Offset {
-    const trimmed = trim(text);
-    if (trimmed.len == 0) return error.UnsupportedOpcode;
-    if (trimmed[0] == '#') return .{ .imm = try parseImmediate(trimmed) };
-    if (trimmed[0] == 'r') return .{ .reg = try parseRegister(trimmed) };
-    return error.UnsupportedOpcode;
-}
-
-const SplitOperands = struct {
-    first: []const u8,
-    second: []const u8,
-    third: ?[]const u8,
-};
-
-fn split3Operands(text: []const u8, comptime expected_parts: comptime_int) DecodeError!SplitOperands {
-    const first_comma = std.mem.indexOfScalar(u8, text, ',') orelse return error.UnsupportedOpcode;
-    const first = trim(text[0..first_comma]);
-    const tail = trim(text[first_comma + 1 ..]);
-    if (expected_parts == 2) {
-        return .{
-            .first = first,
-            .second = tail,
-            .third = null,
-        };
-    }
-
-    const second_comma = std.mem.indexOfScalar(u8, tail, ',') orelse return error.UnsupportedOpcode;
-    return .{
-        .first = first,
-        .second = trim(tail[0..second_comma]),
-        .third = trim(tail[second_comma + 1 ..]),
+fn operandImmediateU32(insn: capstone_api.ArmInstruction, index: usize) DecodeError!u32 {
+    const operand = operandAt(insn, index);
+    if (operand.subtracted) return error.UnsupportedOpcode;
+    return switch (operand.value) {
+        .imm => |imm| parseU32Immediate(imm),
+        else => error.UnsupportedOpcode,
     };
 }
 
-fn parseRegister(text: []const u8) DecodeError!u4 {
-    const trimmed = trim(text);
-    if (trimmed.len < 2 or trimmed[0] != 'r') return error.UnsupportedOpcode;
-    const index = std.fmt.parseInt(u8, trimmed[1..], 10) catch return error.UnsupportedOpcode;
-    if (index > 15) return error.UnsupportedOpcode;
-    return @intCast(index);
+fn parseMemoryOffset(mem: capstone_api.ArmMemoryOperand) DecodeError!Offset {
+    if (mem.disp < 0) return error.UnsupportedOpcode;
+    if (mem.index == c.ARM_REG_INVALID) {
+        return .{ .imm = @intCast(mem.disp) };
+    }
+
+    if (mem.disp != 0) return error.UnsupportedOpcode;
+    if (mem.scale != 0 and mem.scale != 1) return error.UnsupportedOpcode;
+    return .{ .reg = try parseRegisterId(mem.index) };
 }
 
-fn parseImmediate(text: []const u8) DecodeError!u32 {
-    const trimmed = trim(text);
-    const bare = if (trimmed.len != 0 and trimmed[0] == '#') trimmed[1..] else trimmed;
-    return std.fmt.parseInt(u32, bare, 0) catch return error.UnsupportedOpcode;
+fn parseRegisterId(reg: u32) DecodeError!u4 {
+    if (reg >= c.ARM_REG_R0 and reg <= c.ARM_REG_R12) {
+        return @intCast(reg - c.ARM_REG_R0);
+    }
+
+    return switch (reg) {
+        c.ARM_REG_SP => 13,
+        c.ARM_REG_LR => 14,
+        c.ARM_REG_PC => 15,
+        else => error.UnsupportedOpcode,
+    };
 }
 
-fn trim(text: []const u8) []const u8 {
-    return std.mem.trim(u8, text, &std.ascii.whitespace);
+fn parseU32Immediate(imm: i64) DecodeError!u32 {
+    if (imm < 0 or imm > std.math.maxInt(u32)) return error.UnsupportedOpcode;
+    return @intCast(imm);
 }
 
 test "decode reads mov immediate" {
@@ -246,6 +237,18 @@ test "decode reads halfword store with immediate offset" {
             .base = 1,
             .offset = .{ .imm = 2 },
             .size = .halfword,
+        } },
+        decoded,
+    );
+}
+
+test "decode reads subs immediate" {
+    const decoded = try decode(0xE2522004, 0x08000114);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .subs_imm = .{
+            .rd = 2,
+            .rn = 2,
+            .imm = 4,
         } },
         decoded,
     );
