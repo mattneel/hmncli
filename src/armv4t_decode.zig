@@ -656,6 +656,7 @@ fn decodeInstruction(raw_word: u32, insn: capstone_api.ArmInstruction) DecodeErr
     if (raw_word == 0xE320F000) return .nop;
     return switch (insn.id) {
         c.ARM_INS_MOV => parseMov(raw_word, insn),
+        c.ARM_INS_MOVS => parseMov(raw_word, insn),
         c.ARM_INS_MVN => parseMvn(insn),
         c.ARM_INS_ADR => parseAdr(insn),
         c.ARM_INS_AND => parseAlu3(.and_imm, insn),
@@ -3226,6 +3227,14 @@ test "decode reads thumb mov register" {
     const decoded = try decodeThumb(0x4684, 0x0800000A);
     try std.testing.expectEqualDeep(
         DecodedInstruction{ .mov_reg = .{ .rd = 12, .rm = 0 } },
+        decoded,
+    );
+}
+
+test "decode reads thumb movs alias as lsls zero shift" {
+    const decoded = try decodeThumb(0x001E, 0x080003FA);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .movs_reg = .{ .rd = 6, .rm = 3 } },
         decoded,
     );
 }

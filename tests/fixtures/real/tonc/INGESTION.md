@@ -10,12 +10,12 @@
 ## First Homonculi Failure Surface
 
 - Re-measured after the startup trampoline veneer fix on 2026-04-22.
-- The shared `0x0800019A / 0x4718` blocker is gone.
+- The shared Thumb zero-shift `movs` alias blocker is gone.
 - The fixtures now diverge on their next blockers:
-  - `sbb_reg`: `Unsupported opcode 0x0000001E at 0x080003FA for armv4t`
-  - `obj_demo`: `Unsupported opcode 0x00000000 at 0x080003A8 for armv4t`
-  - `key_demo`: `Unsupported opcode 0x00000021 at 0x080002F6 for armv4t`
-  - `irq_demo`: `Unsupported opcode 0x00000017 at 0x08000374 for armv4t`
+  - `sbb_reg`: `Unsupported opcode 0x00004700 at 0x08000456 for armv4t`
+  - `obj_demo`: `Unsupported opcode 0x00004718 at 0x080003B8 for armv4t`
+  - `key_demo`: `Unsupported SWI 0x000005 at 0x08000768 for gba`
+  - `irq_demo`: `Unsupported opcode 0x00004708 at 0x080006C6 for armv4t`
 
 ## Scope Decisions
 

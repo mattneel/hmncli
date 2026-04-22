@@ -1844,23 +1844,28 @@ test "tonc fixtures diverge after the startup veneer is resolved exactly" {
 
     const fixtures = [_]struct {
         rom_path: []const u8,
-        blocker: []const u8,
+        old_blocker: []const u8,
+        next_blocker: []const u8,
     }{
         .{
             .rom_path = "tests/fixtures/real/tonc/sbb_reg.gba",
-            .blocker = "Unsupported opcode 0x0000001E at 0x080003FA for armv4t",
+            .old_blocker = "Unsupported opcode 0x0000001E at 0x080003FA for armv4t",
+            .next_blocker = "Unsupported opcode 0x00004700 at 0x08000456 for armv4t",
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
-            .blocker = "Unsupported opcode 0x00000000 at 0x080003A8 for armv4t",
+            .old_blocker = "Unsupported opcode 0x00000000 at 0x080003A8 for armv4t",
+            .next_blocker = "Unsupported opcode 0x00004718 at 0x080003B8 for armv4t",
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
-            .blocker = "Unsupported opcode 0x00000021 at 0x080002F6 for armv4t",
+            .old_blocker = "Unsupported opcode 0x00000021 at 0x080002F6 for armv4t",
+            .next_blocker = "Unsupported SWI 0x000005 at 0x08000768 for gba",
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/irq_demo.gba",
-            .blocker = "Unsupported opcode 0x00000017 at 0x08000374 for armv4t",
+            .old_blocker = "Unsupported opcode 0x00000017 at 0x08000374 for armv4t",
+            .next_blocker = "Unsupported opcode 0x00004708 at 0x080006C6 for armv4t",
         },
     };
     for (fixtures) |fixture| {
@@ -1868,10 +1873,8 @@ test "tonc fixtures diverge after the startup veneer is resolved exactly" {
         defer std.testing.allocator.free(result.stderr);
 
         try std.testing.expect(result.failed);
-        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x00004730 at 0x08000124 for armv4t") == null);
-        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported control flow target 0x02000000 for gba") == null);
-        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x00004718 at 0x0800019A for armv4t") == null);
-        try std.testing.expect(std.mem.indexOf(u8, result.stderr, fixture.blocker) != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, fixture.old_blocker) == null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, fixture.next_blocker) != null);
     }
 }
 
