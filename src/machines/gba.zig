@@ -191,6 +191,34 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .id = .{
             .kind = .instruction,
             .namespace = "armv4t",
+            .name = "add_reg",
+        },
+        .isa = .armv4t,
+        .mnemonic = "add",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 helper surface for register-register address arithmetic."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "sub_imm",
+        },
+        .isa = .armv4t,
+        .mnemonic = "sub",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 helper surface for non-flag subtract-immediate arithmetic."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
             .name = "subs_imm",
         },
         .isa = .armv4t,
@@ -200,6 +228,34 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .tests = &.{},
         .doc_refs = &.{},
         .notes = &.{"Phase 1 real-ROM surface for loop counters and Z-flag updates."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "lsl_imm",
+        },
+        .isa = .armv4t,
+        .mnemonic = "lsl",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 helper surface for immediate left shifts used in table indexing."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "mla",
+        },
+        .isa = .armv4t,
+        .mnemonic = "mla",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 helper surface for multiply-accumulate address math in glyph plotting."},
     },
     .{
         .id = .{
@@ -312,6 +368,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .tests = &.{},
         .doc_refs = &.{},
         .notes = &.{"Phase 1 stack surface for restoring register lists from the ascending stack."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "ldm_regs",
+        },
+        .isa = .armv4t,
+        .mnemonic = "ldm",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 literal-table surface for loading register pairs from memory-backed tables."},
     },
     .{
         .id = .{

@@ -20,6 +20,8 @@ pub const Function = struct {
 
 pub const Program = struct {
     entry: armv4t_decode.CodeAddress,
+    rom_base_address: u32,
+    rom_bytes: []const u8,
     functions: []const Function,
     output_mode: OutputMode,
 
@@ -80,8 +82,9 @@ const memory_regions = [_]Region{ iwram_region, io_region, palette_region, vram_
 
 pub fn emitModule(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
     try emitPrelude(writer);
+    try emitRomConstant(writer, program);
     try emitStoreHelpers(writer);
-    try emitLoadHelper(writer);
+    try emitLoadHelper(writer, program);
     for (program.functions) |function| {
         try emitGuestFunction(writer, function);
     }
@@ -115,13 +118,27 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("}}\n\n", .{});
 }
 
+fn emitRomConstant(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
+    if (program.rom_bytes.len == 0) {
+        try writer.print("@rom_data = private constant [0 x i8] zeroinitializer, align 1\n\n", .{});
+        return;
+    }
+
+    try writer.print("@rom_data = private constant [{d} x i8] [", .{program.rom_bytes.len});
+    for (program.rom_bytes, 0..) |byte, index| {
+        if (index != 0) try writer.print(", ", .{});
+        try writer.print("i8 {d}", .{byte});
+    }
+    try writer.print("], align 1\n\n", .{});
+}
+
 fn emitStoreHelpers(writer: *Io.Writer) Io.Writer.Error!void {
     try emitStoreHelper(writer, 32);
     try emitStoreHelper(writer, 16);
     try emitStoreHelper(writer, 8);
 }
 
-fn emitLoadHelper(writer: *Io.Writer) Io.Writer.Error!void {
+fn emitLoadHelper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
     try writer.print("define i32 @hmn_load32(ptr %state, i32 %addr) {{\n", .{});
     try writer.print("entry:\n", .{});
     for (memory_regions) |region| {
@@ -135,6 +152,22 @@ fn emitLoadHelper(writer: *Io.Writer) Io.Writer.Error!void {
         .{guest_state_dispstat_toggle_field},
     );
     try writer.print("  %dispstat_hit = icmp eq i32 %addr, 67108868\n", .{});
+    if (program.rom_bytes.len >= 4) {
+        const rom_limit = program.rom_base_address + @as(u32, @intCast(program.rom_bytes.len)) - 3;
+        try writer.print("  %rom_ge = icmp uge i32 %addr, {d}\n", .{program.rom_base_address});
+        try writer.print("  %rom_lt = icmp ult i32 %addr, {d}\n", .{rom_limit});
+        try writer.print("  %rom_hit = and i1 %rom_ge, %rom_lt\n", .{});
+        try writer.print("  br i1 %rom_hit, label %load_rom, label %check_dispstat\n", .{});
+        try writer.print("load_rom:\n", .{});
+        try writer.print("  %rom_offset = sub i32 %addr, {d}\n", .{program.rom_base_address});
+        try writer.print(
+            "  %rom_ptr = getelementptr inbounds [{d} x i8], ptr @rom_data, i32 0, i32 %rom_offset\n",
+            .{program.rom_bytes.len},
+        );
+        try writer.print("  %rom_value = load i32, ptr %rom_ptr, align 1\n", .{});
+        try writer.print("  ret i32 %rom_value\n", .{});
+        try writer.print("check_dispstat:\n", .{});
+    }
     try writer.print("  br i1 %dispstat_hit, label %load_dispstat, label %check_load_region_0\n", .{});
     try writer.print("load_dispstat:\n", .{});
     try writer.print("  %dispstat_toggle = load i1, ptr %dispstat_toggle_ptr, align 1\n", .{});
@@ -392,6 +425,24 @@ fn emitInstructionBlock(writer: *Io.Writer, function: Function, node: Instructio
             try writer.print("  store i32 %add_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
+        .add_reg => |add| {
+            try emitRegPtr(writer, "state", node.address, "rn", add.rn);
+            try writer.print("  %rn_val_{x:0>8} = load i32, ptr %rn_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rm", add.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try writer.print("  %add_val_{x:0>8} = add i32 %rn_val_{x:0>8}, %rm_val_{x:0>8}\n", .{ node.address, node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rd", add.rd);
+            try writer.print("  store i32 %add_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .sub_imm => |sub| {
+            try emitRegPtr(writer, "state", node.address, "rn", sub.rn);
+            try writer.print("  %rn_val_{x:0>8} = load i32, ptr %rn_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try writer.print("  %sub_plain_val_{x:0>8} = sub i32 %rn_val_{x:0>8}, {d}\n", .{ node.address, node.address, sub.imm });
+            try emitRegPtr(writer, "state", node.address, "rd", sub.rd);
+            try writer.print("  store i32 %sub_plain_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
         .subs_imm => |sub| {
             try emitRegPtr(writer, "state", node.address, "rn", sub.rn);
             try writer.print("  %rn_val_{x:0>8} = load i32, ptr %rn_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
@@ -401,6 +452,27 @@ fn emitInstructionBlock(writer: *Io.Writer, function: Function, node: Instructio
             try writer.print("  %z_val_{x:0>8} = icmp eq i32 %sub_val_{x:0>8}, 0\n", .{ node.address, node.address });
             try emitFlagZPtr(writer, "state", node.address);
             try writer.print("  store i1 %z_val_{x:0>8}, ptr %flag_z_ptr_{x:0>8}, align 1\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .lsl_imm => |lsl| {
+            try emitRegPtr(writer, "state", node.address, "rm", lsl.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try writer.print("  %lsl_val_{x:0>8} = shl i32 %rm_val_{x:0>8}, {d}\n", .{ node.address, node.address, lsl.imm });
+            try emitRegPtr(writer, "state", node.address, "rd", lsl.rd);
+            try writer.print("  store i32 %lsl_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .mla => |mla| {
+            try emitRegPtr(writer, "state", node.address, "rm", mla.rm);
+            try writer.print("  %mla_rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rs", mla.rs);
+            try writer.print("  %mla_rs_val_{x:0>8} = load i32, ptr %rs_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "ra", mla.ra);
+            try writer.print("  %mla_ra_val_{x:0>8} = load i32, ptr %ra_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try writer.print("  %mla_mul_{x:0>8} = mul i32 %mla_rm_val_{x:0>8}, %mla_rs_val_{x:0>8}\n", .{ node.address, node.address, node.address });
+            try writer.print("  %mla_val_{x:0>8} = add i32 %mla_mul_{x:0>8}, %mla_ra_val_{x:0>8}\n", .{ node.address, node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rd", mla.rd);
+            try writer.print("  store i32 %mla_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .ldr_word_imm => |load| {
@@ -418,6 +490,13 @@ fn emitInstructionBlock(writer: *Io.Writer, function: Function, node: Instructio
         },
         .pop => |mask| {
             try emitPopRegs(writer, node.address, mask);
+            if (registerMaskIncludesPc(mask))
+                try emitFunctionReturn(writer, function.entry)
+            else
+                try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .ldm => |ldm| {
+            try emitLoadMultiple(writer, node.address, ldm.base, ldm.mask, ldm.writeback);
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .tst_imm => |tst| {
@@ -700,11 +779,21 @@ fn emitPushRegs(writer: *Io.Writer, address: u32, mask: u16) Io.Writer.Error!voi
 }
 
 fn emitPopRegs(writer: *Io.Writer, address: u32, mask: u16) Io.Writer.Error!void {
+    try emitLoadMultiple(writer, address, 13, mask, true);
+}
+
+fn emitLoadMultiple(
+    writer: *Io.Writer,
+    address: u32,
+    base_reg: u4,
+    mask: u16,
+    writeback: bool,
+) Io.Writer.Error!void {
     const reg_count = registerMaskCount(mask);
-    try emitRegPtr(writer, "state", address, "sp", 13);
-    try writer.print("  %sp_val_{x:0>8} = load i32, ptr %sp_ptr_{x:0>8}, align 4\n", .{ address, address });
+    try emitRegPtr(writer, "state", address, "ldm_base", base_reg);
+    try writer.print("  %ldm_base_val_{x:0>8} = load i32, ptr %ldm_base_ptr_{x:0>8}, align 4\n", .{ address, address });
     try writer.print(
-        "  %pop_regs_ptr_{x:0>8} = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+        "  %ldm_regs_ptr_{x:0>8} = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
         .{ address, guest_state_regs_field },
     );
 
@@ -714,28 +803,36 @@ fn emitPopRegs(writer: *Io.Writer, address: u32, mask: u16) Io.Writer.Error!void
         if ((mask & (@as(u16, 1) << reg_index)) == 0) continue;
 
         try writer.print(
-            "  %pop_addr_r{d}_{x:0>8} = add i32 %sp_val_{x:0>8}, {d}\n",
+            "  %ldm_addr_r{d}_{x:0>8} = add i32 %ldm_base_val_{x:0>8}, {d}\n",
             .{ reg_index, address, address, slot_index * 4 },
         );
         try writer.print(
-            "  %pop_val_r{d}_{x:0>8} = call i32 @hmn_load32(ptr %state, i32 %pop_addr_r{d}_{x:0>8})\n",
+            "  %ldm_val_r{d}_{x:0>8} = call i32 @hmn_load32(ptr %state, i32 %ldm_addr_r{d}_{x:0>8})\n",
             .{ reg_index, address, reg_index, address },
         );
-        try writer.print(
-            "  %pop_dst_r{d}_{x:0>8} = getelementptr inbounds [16 x i32], ptr %pop_regs_ptr_{x:0>8}, i32 0, i32 {d}\n",
-            .{ reg_index, address, address, reg_index },
-        );
-        try writer.print("  store i32 %pop_val_r{d}_{x:0>8}, ptr %pop_dst_r{d}_{x:0>8}, align 4\n", .{
-            reg_index,
-            address,
-            reg_index,
-            address,
-        });
+        if (reg_index != 15) {
+            try writer.print(
+                "  %ldm_dst_r{d}_{x:0>8} = getelementptr inbounds [16 x i32], ptr %ldm_regs_ptr_{x:0>8}, i32 0, i32 {d}\n",
+                .{ reg_index, address, address, reg_index },
+            );
+            try writer.print("  store i32 %ldm_val_r{d}_{x:0>8}, ptr %ldm_dst_r{d}_{x:0>8}, align 4\n", .{
+                reg_index,
+                address,
+                reg_index,
+                address,
+            });
+        }
         slot_index += 1;
     }
 
-    try writer.print("  %pop_new_sp_{x:0>8} = add i32 %sp_val_{x:0>8}, {d}\n", .{ address, address, reg_count * 4 });
-    try writer.print("  store i32 %pop_new_sp_{x:0>8}, ptr %sp_ptr_{x:0>8}, align 4\n", .{ address, address });
+    if (writeback) {
+        try writer.print("  %ldm_new_base_{x:0>8} = add i32 %ldm_base_val_{x:0>8}, {d}\n", .{
+            address,
+            address,
+            reg_count * 4,
+        });
+        try writer.print("  store i32 %ldm_new_base_{x:0>8}, ptr %ldm_base_ptr_{x:0>8}, align 4\n", .{ address, address });
+    }
 }
 
 fn emitBranchCondition(
@@ -839,6 +936,10 @@ fn registerMaskCount(mask: u16) u16 {
     return count;
 }
 
+fn registerMaskIncludesPc(mask: u16) bool {
+    return (mask & (@as(u16, 1) << 15)) != 0;
+}
+
 fn flagFieldIndex(flag: Flag) u8 {
     return switch (flag) {
         .n => guest_state_flag_n_field,
@@ -889,6 +990,8 @@ test "llvm emission includes guest state and a lifted guest entry function" {
 
     const program = Program{
         .entry = .{ .address = 0x08000000, .isa = .arm },
+        .rom_base_address = 0x08000000,
+        .rom_bytes = &.{},
         .functions = &.{
             .{
                 .entry = .{ .address = 0x08000000, .isa = .arm },

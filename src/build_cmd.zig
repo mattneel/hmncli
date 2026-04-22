@@ -109,6 +109,8 @@ fn liftRom(
             .address = image.base_address,
             .isa = .arm,
         },
+        .rom_base_address = image.base_address,
+        .rom_bytes = image.bytes,
         .functions = try functions.toOwnedSlice(allocator),
         .output_mode = if (has_store and has_self_loop) .memory_summary else .register_r0_decimal,
     };
@@ -212,10 +214,15 @@ fn ensureDeclared(
         .movs_reg => _ = try catalog.lookupInstruction("armv4t", "movs_reg"),
         .orr_imm => _ = try catalog.lookupInstruction("armv4t", "orr_imm"),
         .add_imm => _ = try catalog.lookupInstruction("armv4t", "add_imm"),
+        .add_reg => _ = try catalog.lookupInstruction("armv4t", "add_reg"),
+        .sub_imm => _ = try catalog.lookupInstruction("armv4t", "sub_imm"),
         .subs_imm => _ = try catalog.lookupInstruction("armv4t", "subs_imm"),
+        .lsl_imm => _ = try catalog.lookupInstruction("armv4t", "lsl_imm"),
+        .mla => _ = try catalog.lookupInstruction("armv4t", "mla"),
         .ldr_word_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_word_imm"),
         .push => _ = try catalog.lookupInstruction("armv4t", "push_regs"),
         .pop => _ = try catalog.lookupInstruction("armv4t", "pop_regs"),
+        .ldm => _ = try catalog.lookupInstruction("armv4t", "ldm_regs"),
         .tst_imm => _ = try catalog.lookupInstruction("armv4t", "tst_imm"),
         .store => |store| switch (store.size) {
             .word => switch (store.offset) {
@@ -291,6 +298,10 @@ fn enqueueSuccessors(
         },
         .bx_lr => return,
         .bx_reg => return error.UnsupportedOpcode,
+        .pop => |mask| {
+            if ((mask & (@as(u16, 1) << 15)) != 0) return;
+            try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
+        },
         else => {
             try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
         },
@@ -729,6 +740,6 @@ test "build uses the real jsmolka arm rom and reports the next unsupported surfa
     );
     try std.testing.expectStringStartsWith(
         output.writer.buffered(),
-        "Unsupported opcode 0xE2422020 at 0x08001F58 for armv4t\n",
+        "Unsupported opcode 0xE2003001 at 0x08001EFC for armv4t\n",
     );
 }

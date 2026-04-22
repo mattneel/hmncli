@@ -418,3 +418,90 @@ test "build executes a synthetic mmio ldr tst branch slice" {
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("1\n", result.stdout);
 }
+
+test "build executes a synthetic arithmetic helper slice" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = [_]u8{
+        0x24, 0x20, 0xA0, 0xE3, // mov r2, #36
+        0x20, 0x20, 0x42, 0xE2, // sub r2, r2, #32
+        0x82, 0x21, 0xA0, 0xE1, // lsl r2, r2, #3
+        0x0A, 0x30, 0xA0, 0xE3, // mov r3, #10
+        0x02, 0x00, 0x83, 0xE0, // add r0, r3, r2
+        0xFE, 0xFF, 0xFF, 0xEA, // b .
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "arith.gba", .data = &rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try cli.build_cmd.run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "arith.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "gba-arith-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./gba-arith-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+}
+
+test "build executes a synthetic mla slice" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = [_]u8{
+        0x02, 0x00, 0xA0, 0xE3, // mov r0, #2
+        0x03, 0x10, 0xA0, 0xE3, // mov r1, #3
+        0x04, 0x40, 0xA0, 0xE3, // mov r4, #4
+        0x94, 0x01, 0x20, 0xE0, // mla r0, r4, r1, r0
+        0xFE, 0xFF, 0xFF, 0xEA, // b .
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "mla.gba", .data = &rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try cli.build_cmd.run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "mla.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "gba-mla-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./gba-mla-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("14\n", result.stdout);
+}

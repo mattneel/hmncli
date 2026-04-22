@@ -79,10 +79,31 @@ pub const DecodedInstruction = union(enum) {
         rn: u4,
         imm: u32,
     },
+    add_reg: struct {
+        rd: u4,
+        rn: u4,
+        rm: u4,
+    },
+    sub_imm: struct {
+        rd: u4,
+        rn: u4,
+        imm: u32,
+    },
     subs_imm: struct {
         rd: u4,
         rn: u4,
         imm: u32,
+    },
+    lsl_imm: struct {
+        rd: u4,
+        rm: u4,
+        imm: u32,
+    },
+    mla: struct {
+        rd: u4,
+        rm: u4,
+        rs: u4,
+        ra: u4,
     },
     store: struct {
         src: u4,
@@ -97,6 +118,11 @@ pub const DecodedInstruction = union(enum) {
     },
     push: u16,
     pop: u16,
+    ldm: struct {
+        base: u4,
+        mask: u16,
+        writeback: bool,
+    },
     tst_imm: struct {
         rn: u4,
         imm: u32,
@@ -134,17 +160,19 @@ fn decodeInstruction(raw_word: u32, insn: capstone_api.ArmInstruction) DecodeErr
         c.ARM_INS_MOV => parseMov(insn),
         c.ARM_INS_ADR => parseAdr(insn),
         c.ARM_INS_ORR => parseAlu3(.orr_imm, insn),
-        c.ARM_INS_ADD => parseAlu3(.add_imm, insn),
+        c.ARM_INS_ADD => parseAdd(insn),
         c.ARM_INS_SUB, c.ARM_INS_SUBS => if (insn.update_flags)
             parseAlu3(.subs_imm, insn)
         else
-            error.UnsupportedOpcode,
+            parseSub(insn),
+        c.ARM_INS_LSL => parseLsl(insn),
+        c.ARM_INS_MLA => parseMla(insn),
         c.ARM_INS_LDR => parseLoad(insn),
         c.ARM_INS_STR => parseStore(insn, .word),
         c.ARM_INS_STRB => parseStore(insn, .byte),
         c.ARM_INS_STRH => parseStore(insn, .halfword),
         c.ARM_INS_STMDB => parseStackTransfer(raw_word, insn, .push),
-        c.ARM_INS_LDM => parseStackTransfer(raw_word, insn, .pop),
+        c.ARM_INS_LDM => parseLdm(raw_word, insn),
         c.ARM_INS_TST => parseTst(insn),
         c.ARM_INS_B => parseBranch(insn),
         c.ARM_INS_BL => parseBl(raw_word, insn),
@@ -164,6 +192,13 @@ pub fn readHalfword(bytes: []const u8, offset: usize) u16 {
 }
 
 fn parseMov(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+    if (insn.operand_count == 3) {
+        return .{ .lsl_imm = .{
+            .rd = try operandRegister(insn, 0),
+            .rm = try operandRegister(insn, 1),
+            .imm = try operandImmediateU32(insn, 2),
+        } };
+    }
     if (insn.operand_count != 2) return error.UnsupportedOpcode;
     const rd = try operandRegister(insn, 0);
     const source = operandAt(insn, 1);
@@ -208,6 +243,56 @@ fn parseAlu3(
         .add_imm => .{ .add_imm = .{ .rd = rd, .rn = rn, .imm = imm } },
         .subs_imm => .{ .subs_imm = .{ .rd = rd, .rn = rn, .imm = imm } },
     };
+}
+
+fn parseAdd(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+    if (insn.operand_count != 3) return error.UnsupportedOpcode;
+    const rd = try operandRegister(insn, 0);
+    const rn = try operandRegister(insn, 1);
+    const source = operandAt(insn, 2);
+    if (source.subtracted) return error.UnsupportedOpcode;
+
+    return switch (source.value) {
+        .imm => |imm| .{ .add_imm = .{
+            .rd = rd,
+            .rn = rn,
+            .imm = try parseU32Immediate(imm),
+        } },
+        .reg => |reg| .{ .add_reg = .{
+            .rd = rd,
+            .rn = rn,
+            .rm = try parseRegisterId(reg),
+        } },
+        else => error.UnsupportedOpcode,
+    };
+}
+
+fn parseSub(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+    if (insn.operand_count != 3) return error.UnsupportedOpcode;
+    return .{ .sub_imm = .{
+        .rd = try operandRegister(insn, 0),
+        .rn = try operandRegister(insn, 1),
+        .imm = try operandImmediateU32(insn, 2),
+    } };
+}
+
+fn parseLsl(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+    if (insn.operand_count != 3) return error.UnsupportedOpcode;
+    return .{ .lsl_imm = .{
+        .rd = try operandRegister(insn, 0),
+        .rm = try operandRegister(insn, 1),
+        .imm = try operandImmediateU32(insn, 2),
+    } };
+}
+
+fn parseMla(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+    if (insn.operand_count != 4) return error.UnsupportedOpcode;
+    return .{ .mla = .{
+        .rd = try operandRegister(insn, 0),
+        .rm = try operandRegister(insn, 1),
+        .rs = try operandRegister(insn, 2),
+        .ra = try operandRegister(insn, 3),
+    } };
 }
 
 fn parseAdr(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
@@ -280,6 +365,22 @@ fn parseStackTransfer(
         .push => .{ .push = register_mask },
         .pop => .{ .pop = register_mask },
     };
+}
+
+fn parseLdm(word: u32, insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+    const base_reg: u4 = @truncate((word >> 16) & 0xF);
+    const register_mask: u16 = @truncate(word & 0xFFFF);
+
+    if (register_mask == 0) return error.UnsupportedOpcode;
+    if (base_reg == 13 and insn.writeback) {
+        return .{ .pop = register_mask };
+    }
+
+    return .{ .ldm = .{
+        .base = base_reg,
+        .mask = register_mask,
+        .writeback = insn.writeback,
+    } };
 }
 
 fn parseBranch(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
@@ -443,6 +544,18 @@ test "decode reads movs immediate" {
     );
 }
 
+test "decode reads sub immediate without flag updates" {
+    const decoded = try decode(0xE2422020, 0x08001F58);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .sub_imm = .{
+            .rd = 2,
+            .rn = 2,
+            .imm = 32,
+        } },
+        decoded,
+    );
+}
+
 test "decode reads unconditional branch target" {
     const decoded = try decode(0xEA00002E, 0x08000000);
     try std.testing.expectEqualDeep(
@@ -520,6 +633,18 @@ test "decode reads push and pop register masks" {
     try std.testing.expectEqualDeep(DecodedInstruction{ .pop = 0x0003 }, pop);
 }
 
+test "decode reads generic ldm register mask" {
+    const decoded = try decode(0xE893000C, 0x08001F68);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .ldm = .{
+            .base = 3,
+            .mask = 0x000C,
+            .writeback = false,
+        } },
+        decoded,
+    );
+}
+
 test "decode reads bx r0 for later target resolution" {
     const decoded = try decode(0xE12FFF10, 0x08000004);
     try std.testing.expectEqualDeep(
@@ -566,6 +691,18 @@ test "decode reads ldr word immediate" {
     );
 }
 
+test "decode reads lsl immediate" {
+    const decoded = try decode(0xE1A02182, 0x08001F5C);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .lsl_imm = .{
+            .rd = 2,
+            .rm = 2,
+            .imm = 3,
+        } },
+        decoded,
+    );
+}
+
 test "decode reads subs immediate" {
     const decoded = try decode(0xE2522004, 0x08000114);
     try std.testing.expectEqualDeep(
@@ -584,6 +721,31 @@ test "decode reads tst immediate" {
         DecodedInstruction{ .tst_imm = .{
             .rn = 1,
             .imm = 1,
+        } },
+        decoded,
+    );
+}
+
+test "decode reads add register" {
+    const decoded = try decode(0xE0830002, 0x08001F64);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .add_reg = .{
+            .rd = 0,
+            .rn = 3,
+            .rm = 2,
+        } },
+        decoded,
+    );
+}
+
+test "decode reads mla" {
+    const decoded = try decode(0xE0200194, 0x0800000C);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .mla = .{
+            .rd = 0,
+            .rm = 4,
+            .rs = 1,
+            .ra = 0,
         } },
         decoded,
     );
