@@ -817,7 +817,7 @@ fn resolveBxTarget(
 ) BuildError!armv4t_decode.DecodedInstruction {
     if (isExactThumbSavedLrInterworkingReturnEpilogue(image, function_entry, address, reg)) {
         // This is the exact `sbb_reg`-style Thumb interworking return shape:
-        // an entry `push {saved_reg, lr}` paired with `pop {saved_reg};
+        // an entry `push {saved_regs..., lr}` paired with `pop {saved_regs...};
         // pop {return_reg}; bx return_reg`.
         return .{ .thumb_saved_lr_return = {} };
     }
@@ -840,8 +840,8 @@ fn isExactThumbSavedLrInterworkingReturnEpilogue(
     if (isa != .thumb) return false;
     if (reg == 15) return false;
 
-    const saved_reg = thumbEntrySavedReg(image, function_entry) orelse return false;
-    if (reg == saved_reg) return false;
+    const saved_regs_mask = thumbEntrySavedRegsMask(image, function_entry) orelse return false;
+    if ((saved_regs_mask & (@as(u16, 1) << @intCast(reg))) != 0) return false;
 
     const previous = previousInstruction(image, isa, address) catch return false;
     _ = switch (previous.instruction) {
@@ -851,32 +851,48 @@ fn isExactThumbSavedLrInterworkingReturnEpilogue(
 
     const prior = previousInstruction(image, isa, previous.address) catch return false;
     _ = switch (prior.instruction) {
-        .pop => |mask| if (mask == (@as(u16, 1) << saved_reg)) saved_reg else return false,
+        .pop => |mask| if (mask == saved_regs_mask) mask else return false,
         else => return false,
     };
 
-    // Keep this self-limiting: only the exact `push {saved_reg, lr}` prologue
-    // paired with `pop {saved_reg}; pop {return_reg}; bx return_reg` is
-    // recognized as a return surface.
+    // Keep this self-limiting: only the exact `push {saved_regs..., lr}`
+    // prologue paired with `pop {saved_regs...}; pop {return_reg};
+    // bx return_reg` is recognized as a return surface.
     return true;
 }
 
-fn thumbEntrySavedReg(
+fn thumbEntrySavedRegsMask(
     image: gba_loader.RomImage,
     function_entry: armv4t_decode.CodeAddress,
-) ?u4 {
+) ?u16 {
     if (function_entry.isa != .thumb) return null;
-    const offset = offsetForAddress(image, function_entry.address, .thumb) orelse return null;
-    const word = armv4t_decode.readHalfword(image.bytes, offset);
-    if ((word & 0xFE00) != 0xB400) return null;
 
-    const saved_mask: u16 = @truncate(word & 0x00FF);
-    const has_lr = ((word >> 8) & 0x1) == 1;
-    if (!has_lr) return null;
-    if (saved_mask == 0) return null;
-    if ((saved_mask & (saved_mask - 1)) != 0) return null;
-
-    return @intCast(std.math.log2_int(u16, saved_mask));
+    var address = function_entry.address;
+    var literal_prefix_count: u2 = 0;
+    while (true) {
+        const decoded = decodeImageInstructionUnchecked(image, .thumb, address) catch return null;
+        switch (decoded.instruction) {
+            .ldr_word_imm => |load| {
+                // Keep this narrow: allow the exact Thumb literal-load prefix
+                // seen before the prologue in `sbb_reg`, but nothing broader.
+                if (decoded.size_bytes != 2) return null;
+                if (literal_prefix_count == 2) return null;
+                if (load.base != 15 or load.rd >= 8) return null;
+                literal_prefix_count += 1;
+                address += decoded.size_bytes;
+            },
+            .push => |mask| {
+                if (decoded.size_bytes != 2) return null;
+                const saved_mask = mask & 0x00FF;
+                const has_lr = (mask & (@as(u16, 1) << 14)) != 0;
+                if (!has_lr) return null;
+                if ((mask & ~@as(u16, 0x40FF)) != 0) return null;
+                if (saved_mask == 0) return null;
+                return saved_mask;
+            },
+            else => return null,
+        }
+    }
 }
 
 fn resolveDevkitArmCrt0StartupThumbBlxR3Target(
@@ -1986,6 +2002,45 @@ test "thumb saved-lr return epilogue resolves as a distinct return surface" {
     try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
 }
 
+test "thumb saved-lr return epilogue resolves exact low-register multi-save shape" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var rom: [8]u8 = .{ 0x30, 0xB5, 0x30, 0xBC, 0x01, 0xBC, 0x00, 0x47 };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-pop-bx-return-multi-save.gba", .data = &rom });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-bx-return-multi-save.gba");
+    defer image.deinit(std.testing.allocator);
+
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0006, 0);
+    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
+}
+
+test "thumb saved-lr return epilogue allows the exact sbb_reg literal-load prefix" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var rom: [16]u8 = .{
+        0x23, 0x4B,
+        0x24, 0x4A,
+        0x30, 0xB5,
+        0x30, 0xBC,
+        0x01, 0xBC,
+        0x00, 0x47,
+        0x00, 0x00,
+        0x00, 0x00,
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-pop-bx-return-multi-save-prefix.gba", .data = &rom });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-bx-return-multi-save-prefix.gba");
+    defer image.deinit(std.testing.allocator);
+
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_000A, 0);
+    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
+}
+
 test "thumb saved-lr return witness is anchored at function entry" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1998,6 +2053,25 @@ test "thumb saved-lr return witness is anchored at function entry" {
     }{
         .{
             .rom_bytes = &.{ 0x10, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
+            .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
+            .expect_ok = true,
+        },
+        .{
+            .rom_bytes = &.{ 0x30, 0xB5, 0x30, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
+            .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
+            .expect_ok = true,
+        },
+        .{
+            .rom_bytes = &.{
+                0x23, 0x4B,
+                0x24, 0x4A,
+                0x30, 0xB5,
+                0x30, 0xBC,
+                0x01, 0xBC,
+                0x00, 0x47,
+                0x00, 0x00,
+                0x00, 0x00,
+            },
             .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
             .expect_ok = true,
         },
@@ -2016,6 +2090,20 @@ test "thumb saved-lr return witness is anchored at function entry" {
             .function_entry = .{ .address = 0x0800_0000, .isa = .arm },
             .expect_ok = false,
         },
+        .{
+            .rom_bytes = &.{
+                0x00, 0x23,
+                0x24, 0x4A,
+                0x30, 0xB5,
+                0x30, 0xBC,
+                0x01, 0xBC,
+                0x00, 0x47,
+                0x00, 0x00,
+                0x00, 0x00,
+            },
+            .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
+            .expect_ok = false,
+        },
     };
 
     for (cases, 0..) |case, index| {
@@ -2026,7 +2114,8 @@ test "thumb saved-lr return witness is anchored at function entry" {
         const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", path);
         defer image.deinit(std.testing.allocator);
 
-        const result = resolveBxTarget(image, case.function_entry, 0x0800_0006, 0);
+        const bx_address: u32 = if (case.rom_bytes.len > 8) 0x0800_000A else 0x0800_0006;
+        const result = resolveBxTarget(image, case.function_entry, bx_address, 0);
         if (case.expect_ok) {
             try std.testing.expectEqualDeep(
                 armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} },
@@ -2079,6 +2168,24 @@ test "thumb saved-lr return epilogue rejects local tail near-misses" {
             .bx_reg = 1,
             .expect_error = true,
         },
+        .{
+            .rom_bytes = &.{ 0x30, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
+            .bx_address = 0x0800_0006,
+            .bx_reg = 0,
+            .expect_error = true,
+        },
+        .{
+            .rom_bytes = &.{ 0x30, 0xB5, 0x01, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
+            .bx_address = 0x0800_0006,
+            .bx_reg = 0,
+            .expect_error = true,
+        },
+        .{
+            .rom_bytes = &.{ 0x30, 0xB5, 0x30, 0xBC, 0x01, 0xBC, 0x40, 0x47 },
+            .bx_address = 0x0800_0006,
+            .bx_reg = 8,
+            .expect_error = true,
+        },
     };
 
     for (cases, 0..) |case, index| {
@@ -2114,8 +2221,8 @@ test "tonc fixtures advance past VBlankIntrWait and keep irq_demo deferred" {
     }{
         .{
             .rom_path = "tests/fixtures/real/tonc/sbb_reg.gba",
-            .old_blocker = "Unsupported opcode 0x00004700 at 0x08000456 for armv4t",
-            .next_blocker = "Unsupported opcode 0x00004700 at 0x08000316 for armv4t",
+            .old_blocker = "Unsupported opcode 0x00004700 at 0x08000316 for armv4t",
+            .next_blocker = "Unsupported opcode 0x00004700 at 0x080004E8 for armv4t",
             .still_blocked_here = false,
         },
         .{
@@ -2133,8 +2240,8 @@ test "tonc fixtures advance past VBlankIntrWait and keep irq_demo deferred" {
         .{
             .rom_path = "tests/fixtures/real/tonc/irq_demo.gba",
             .old_blocker = "Unsupported opcode 0x00004708 at 0x080006C6 for armv4t",
-            .next_blocker = "Unsupported opcode 0x00004708 at 0x080006C6 for armv4t",
-            .still_blocked_here = true,
+            .next_blocker = "Unsupported opcode 0x00004718 at 0x08003078 for armv4t",
+            .still_blocked_here = false,
         },
     };
     for (fixtures) |fixture| {
