@@ -327,7 +327,8 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
         .{guest_state_vblank_count_field},
     );
     try writer.print("  %vblank_curr = load i64, ptr %vblank_ptr, align 8\n", .{});
-    try writer.print("  %keyinput_value = call i16 @hmgba_sample_keyinput_for_frame(i64 %vblank_curr)\n", .{});
+    try writer.print("  %vblank_next = add i64 %vblank_curr, 1\n", .{});
+    try writer.print("  %keyinput_value = call i16 @hmgba_sample_keyinput_for_frame(i64 %vblank_next)\n", .{});
     try writer.print(
         "  %wait_io_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
         .{guest_state_io_field},
@@ -337,7 +338,6 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
         .{io_keyinput_offset},
     );
     try writer.print("  store i16 %keyinput_value, ptr %keyinput_ptr, align 1\n", .{});
-    try writer.print("  %vblank_next = add i64 %vblank_curr, 1\n", .{});
     try writer.print("  store i64 %vblank_next, ptr %vblank_ptr, align 8\n", .{});
     try writer.print(
         "  %dispstat_ptr = getelementptr inbounds [1024 x i8], ptr %wait_io_ptr, i32 0, i32 {d}\n",

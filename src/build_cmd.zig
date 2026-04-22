@@ -1681,6 +1681,34 @@ fn writeThumbStartupBranchRom(
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
+fn writeKeyinputReplayRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xE59F4028, // ldr r4, [pc, #0x28]
+        0xE1D410B0, // ldrh r1, [r4]
+        0xEF000005, // swi 0x05
+        0xE1D420B0, // ldrh r2, [r4]
+        0xEF000005, // swi 0x05
+        0xEF000005, // swi 0x05
+        0xE1D430B0, // ldrh r3, [r4]
+        0xE1A02502, // mov r2, r2, lsl #10
+        0xE1820001, // orr r0, r2, r1
+        0xE1A03A03, // mov r3, r3, lsl #20
+        0xE1800003, // orr r0, r0, r3
+        0xEF000000, // swi 0x00
+        0x04000130, // KEYINPUT
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
 test "build emits a native executable for the first gba mov-plus-div slice" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1720,6 +1748,52 @@ test "build emits a native executable for the first gba mov-plus-div slice" {
 
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("5\n", result.stdout);
+}
+
+test "gba keyinput startup state seeds frame 0 and VBlankIntrWait advances deterministically" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeKeyinputReplayRom(tmp.dir, io, "keyinput-replay.gba");
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "keyinput-replay.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "keyinput-replay-native",
+        },
+    );
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put("HOMONCULI_KEYINPUT_SCRIPT", "03ff,03fe,03fd,03fb");
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./keyinput-replay-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .environ_map = &environ_map,
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    const expected_value: u32 = 0x03FF | (0x03FE << 10) | (0x03FB << 20);
+    const expected_stdout = try std.fmt.allocPrint(std.testing.allocator, "{d}\n", .{expected_value});
+    defer std.testing.allocator.free(expected_stdout);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings(expected_stdout, result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
 }
 
 test "devkitARM crt0 header-check pruning accepts the startup pattern" {
