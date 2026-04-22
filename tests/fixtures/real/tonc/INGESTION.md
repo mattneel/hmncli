@@ -10,11 +10,12 @@
 ## First Homonculi Failure Surface
 
 - Re-measured after the startup trampoline veneer fix on 2026-04-22.
-- All four tonc demos now share the same next blocker:
-  - `sbb_reg`: `Unsupported opcode 0xF80FF000 at 0x08000178 for armv4t`
-  - `obj_demo`: `Unsupported opcode 0xF80FF000 at 0x08000178 for armv4t`
-  - `key_demo`: `Unsupported opcode 0xF80FF000 at 0x08000178 for armv4t`
-  - `irq_demo`: `Unsupported opcode 0xF80FF000 at 0x08000178 for armv4t`
+- The shared `0x0800019A / 0x4718` blocker is gone.
+- The fixtures now diverge on their next blockers:
+  - `sbb_reg`: `Unsupported opcode 0x0000001E at 0x080003FA for armv4t`
+  - `obj_demo`: `Unsupported opcode 0x00000000 at 0x080003A8 for armv4t`
+  - `key_demo`: `Unsupported opcode 0x00000021 at 0x080002F6 for armv4t`
+  - `irq_demo`: `Unsupported opcode 0x00000017 at 0x08000374 for armv4t`
 
 ## Scope Decisions
 

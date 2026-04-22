@@ -825,9 +825,6 @@ fn resolveDevkitArmCrt0StartupThumbBlxR3Target(
 ) BuildError!?u32 {
     if (isa != .thumb) return null;
 
-    const startup_limit = image.base_address + 0x200;
-    if (bl_address >= startup_limit or target_address >= startup_limit) return null;
-
     const target = decodeImageInstructionUnchecked(image, .thumb, target_address) catch return null;
     const bx = switch (target.instruction) {
         .bx_reg => |bx| bx,
@@ -835,7 +832,19 @@ fn resolveDevkitArmCrt0StartupThumbBlxR3Target(
     };
     if (bx.reg != 3) return null;
 
-    const raw_target = try resolvePreviousRegisterValue(image, isa, bl_address, 3);
+    const previous = try previousInstruction(image, isa, bl_address);
+    const load = switch (previous.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (load.rd != 3 or load.base != 15) return null;
+
+    const literal_address = pcValueForInstruction(.thumb, previous.address) + load.offset;
+    if (literal_address < image.base_address) return error.UnsupportedOpcode;
+    const literal_offset = literal_address - image.base_address;
+    if (literal_offset + 4 > image.bytes.len) return error.UnsupportedOpcode;
+
+    const raw_target = armv4t_decode.readWord(image.bytes, literal_offset);
     const code_target = normalizeCodeTarget(raw_target);
     if (code_target.isa != .thumb) return error.UnsupportedOpcode;
     if (offsetForAddress(image, code_target.address, code_target.isa) == null) return error.UnsupportedOpcode;
@@ -1656,26 +1665,41 @@ test "devkitARM crt0 header-check pruning ignores near-miss literals" {
     );
 }
 
-test "tonc fixtures stop at the shared arm decode blocker after startup pruning" {
+test "tonc fixtures diverge after the startup veneer is resolved exactly" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const fixtures = [_][]const u8{
-        "tests/fixtures/real/tonc/sbb_reg.gba",
-        "tests/fixtures/real/tonc/obj_demo.gba",
-        "tests/fixtures/real/tonc/key_demo.gba",
-        "tests/fixtures/real/tonc/irq_demo.gba",
+    const fixtures = [_]struct {
+        rom_path: []const u8,
+        blocker: []const u8,
+    }{
+        .{
+            .rom_path = "tests/fixtures/real/tonc/sbb_reg.gba",
+            .blocker = "Unsupported opcode 0x0000001E at 0x080003FA for armv4t",
+        },
+        .{
+            .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
+            .blocker = "Unsupported opcode 0x00000000 at 0x080003A8 for armv4t",
+        },
+        .{
+            .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
+            .blocker = "Unsupported opcode 0x00000021 at 0x080002F6 for armv4t",
+        },
+        .{
+            .rom_path = "tests/fixtures/real/tonc/irq_demo.gba",
+            .blocker = "Unsupported opcode 0x00000017 at 0x08000374 for armv4t",
+        },
     };
     for (fixtures) |fixture| {
-        const result = try buildFixtureCaptureOutput(std.testing.allocator, io, tmp.dir, fixture);
+        const result = try buildFixtureCaptureOutput(std.testing.allocator, io, tmp.dir, fixture.rom_path);
         defer std.testing.allocator.free(result.stderr);
 
         try std.testing.expect(result.failed);
         try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x00004730 at 0x08000124 for armv4t") == null);
         try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported control flow target 0x02000000 for gba") == null);
-        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0xF80FF000 at 0x08000178 for armv4t") != null);
         try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x00004718 at 0x0800019A for armv4t") == null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, fixture.blocker) != null);
     }
 }
 
