@@ -8,6 +8,13 @@ pub const ParseError = error{
 pub const OutputMode = enum {
     auto,
     frame_raw,
+    retired_count,
+};
+
+pub const OptimizeMode = enum {
+    debug,
+    release,
+    small,
 };
 
 pub const BuildCommand = struct {
@@ -17,6 +24,7 @@ pub const BuildCommand = struct {
     target: ?[]const u8 = null,
     output_mode: OutputMode = .auto,
     max_instructions: ?u64 = null,
+    optimize: OptimizeMode = .debug,
 };
 
 pub const Command = union(enum) {
@@ -72,11 +80,30 @@ fn parseBuild(args: []const []const u8) ParseError!Command {
                 build.output_mode = .frame_raw;
                 continue;
             }
+            if (std.mem.eql(u8, value, "retired_count")) {
+                build.output_mode = .retired_count;
+                continue;
+            }
             return error.InvalidCommand;
         }
         if (std.mem.eql(u8, flag, "--max-instructions")) {
             build.max_instructions = std.fmt.parseUnsigned(u64, value, 10) catch return error.InvalidCommand;
             continue;
+        }
+        if (std.mem.eql(u8, flag, "--opt")) {
+            if (std.mem.eql(u8, value, "debug")) {
+                build.optimize = .debug;
+                continue;
+            }
+            if (std.mem.eql(u8, value, "release")) {
+                build.optimize = .release;
+                continue;
+            }
+            if (std.mem.eql(u8, value, "small")) {
+                build.optimize = .small;
+                continue;
+            }
+            return error.InvalidCommand;
         }
         if (std.mem.eql(u8, flag, "-o")) {
             build.output_path = value;
@@ -86,7 +113,9 @@ fn parseBuild(args: []const []const u8) ParseError!Command {
     }
 
     if (build.machine_name.len == 0 or build.output_path.len == 0) return error.InvalidCommand;
-    if (build.output_mode == .frame_raw and build.max_instructions == null) return error.InvalidCommand;
+    if ((build.output_mode == .frame_raw or build.output_mode == .retired_count) and build.max_instructions == null) {
+        return error.InvalidCommand;
+    }
     return .{ .build = build };
 }
 
@@ -170,6 +199,75 @@ test "parse rejects frame_raw build without an instruction cap" {
             "frame_raw",
             "-o",
             "zig-out/bin/ppu-stripes",
+        }),
+    );
+}
+
+test "parse accepts retired_count output with explicit opt level" {
+    try std.testing.expectEqualDeep(
+        Command{ .build = .{
+            .rom_path = "tests/fixtures/phase1/gba-div.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "zig-out/bin/gba-div-retired",
+            .output_mode = .retired_count,
+            .max_instructions = 32,
+            .optimize = .release,
+        } },
+        try parse(&.{
+            "hmncli",
+            "build",
+            "tests/fixtures/phase1/gba-div.gba",
+            "--machine",
+            "gba",
+            "--target",
+            "x86_64-linux",
+            "--output",
+            "retired_count",
+            "--max-instructions",
+            "32",
+            "--opt",
+            "release",
+            "-o",
+            "zig-out/bin/gba-div-retired",
+        }),
+    );
+}
+
+test "parse rejects retired_count build without an instruction cap" {
+    try std.testing.expectError(
+        error.InvalidCommand,
+        parse(&.{
+            "hmncli",
+            "build",
+            "tests/fixtures/phase1/gba-div.gba",
+            "--machine",
+            "gba",
+            "--target",
+            "x86_64-linux",
+            "--output",
+            "retired_count",
+            "-o",
+            "zig-out/bin/gba-div-retired",
+        }),
+    );
+}
+
+test "parse rejects unknown optimization level" {
+    try std.testing.expectError(
+        error.InvalidCommand,
+        parse(&.{
+            "hmncli",
+            "build",
+            "tests/fixtures/phase1/gba-div.gba",
+            "--machine",
+            "gba",
+            "--target",
+            "x86_64-linux",
+            "--opt",
+            "turbo",
+            "-o",
+            "zig-out/bin/gba-div-retired",
         }),
     );
 }

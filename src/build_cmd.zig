@@ -27,6 +27,22 @@ pub const BuildError = std.mem.Allocator.Error ||
         ToolFailed,
     };
 
+fn clangOptimizeFlag(optimize: parse.OptimizeMode) []const u8 {
+    return switch (optimize) {
+        .debug => "-O0",
+        .release => "-O3",
+        .small => "-Oz",
+    };
+}
+
+fn zigOptimizeModeArg(optimize: parse.OptimizeMode) []const u8 {
+    return switch (optimize) {
+        .debug => "Debug",
+        .release => "ReleaseFast",
+        .small => "ReleaseSmall",
+    };
+}
+
 pub fn run(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -62,7 +78,7 @@ pub fn run(
     defer allocator.free(llvm_path);
     try ensureParentDir(io, cwd, llvm_path);
     try writeLlvmFile(io, allocator, cwd, llvm_path, program);
-    const runtime_helper_obj = if (options.output_mode == .frame_raw)
+    const runtime_helper_obj = if (options.output_mode == .frame_raw or options.output_mode == .retired_count)
         try compileRuntimeHelper(io, allocator, cwd, writer, options)
     else
         null;
@@ -128,6 +144,7 @@ fn liftRomWithOptions(
         else
             .register_r0_decimal,
         .frame_raw => .frame_raw,
+        .retired_count => .retired_count,
     };
     const owned_functions = try functions.toOwnedSlice(allocator);
 
@@ -141,7 +158,10 @@ fn liftRomWithOptions(
         .save_hardware = detectSaveHardware(image.bytes),
         .functions = owned_functions,
         .output_mode = output_mode,
-        .instruction_limit = if (requested_output_mode == .frame_raw) max_instructions else null,
+        .instruction_limit = if (requested_output_mode == .frame_raw or requested_output_mode == .retired_count)
+            max_instructions
+        else
+            null,
     };
 }
 
@@ -1275,7 +1295,7 @@ fn compileLlvm(
     defer if (maybe_target_flag) |target_flag| allocator.free(target_flag);
 
     try argv.append(allocator, "clang");
-    try argv.append(allocator, "-O0");
+    try argv.append(allocator, clangOptimizeFlag(options.optimize));
     try argv.append(allocator, "-x");
     try argv.append(allocator, "ir");
     try argv.append(allocator, llvm_path);
@@ -1331,7 +1351,7 @@ fn compileRuntimeHelper(
     try argv.append(allocator, "build-obj");
     try argv.append(allocator, helper_source_path);
     try argv.append(allocator, "-O");
-    try argv.append(allocator, "ReleaseSmall");
+    try argv.append(allocator, zigOptimizeModeArg(options.optimize));
     try argv.append(allocator, "-fPIC");
     if (options.target) |target| {
         try argv.append(allocator, "-target");
@@ -2180,4 +2200,103 @@ test "build executes the real jsmolka hello rom and dumps the expected mode4 fra
     try frame_test_support.expectPixel(frame, 82, 78, .{ 255, 255, 255, 255 });
     try frame_test_support.expectPixel(frame, 80, 78, .{ 0, 0, 0, 255 });
     try frame_test_support.expectPixel(frame, 120, 79, .{ 255, 255, 255, 255 });
+}
+
+test "build optimization levels map to toolchain flags" {
+    try std.testing.expectEqualStrings("-O0", clangOptimizeFlag(.debug));
+    try std.testing.expectEqualStrings("-O3", clangOptimizeFlag(.release));
+    try std.testing.expectEqualStrings("-Oz", clangOptimizeFlag(.small));
+
+    try std.testing.expectEqualStrings("Debug", zigOptimizeModeArg(.debug));
+    try std.testing.expectEqualStrings("ReleaseFast", zigOptimizeModeArg(.release));
+    try std.testing.expectEqualStrings("ReleaseSmall", zigOptimizeModeArg(.small));
+}
+
+test "build executes a self-loop slice and reports retired instruction count" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = [_]u8{
+        0x00, 0x00, 0xA0, 0xE3, // mov r0, #0
+        0x01, 0x00, 0x80, 0xE2, // add r0, r0, #1
+        0xFD, 0xFF, 0xFF, 0xEA, // b   0x08000004
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "loop.gba", .data = &rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "loop.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_mode = .retired_count,
+            .max_instructions = 7,
+            .output_path = "loop-retired-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./loop-retired-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("retired=7\n", result.stdout);
+}
+
+test "build retired counts accumulate across lifted function calls" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = [_]u8{
+        0x0A, 0x00, 0xA0, 0xE3, // mov r0, #10
+        0x01, 0x00, 0x00, 0xEB, // bl  0x08000010
+        0xFE, 0xFF, 0xFF, 0xEA, // b   .
+        0x00, 0x00, 0x00, 0x00, // padding
+        0x07, 0x00, 0x80, 0xE2, // add r0, r0, #7
+        0x1E, 0xFF, 0x2F, 0xE1, // bx  lr
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "call-count.gba", .data = &rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "call-count.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_mode = .retired_count,
+            .max_instructions = 5,
+            .output_path = "call-count-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./call-count-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("retired=5\n", result.stdout);
 }
