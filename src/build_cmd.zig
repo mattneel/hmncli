@@ -818,10 +818,10 @@ fn resolveBxTarget(
     address: u32,
     reg: u4,
 ) BuildError!armv4t_decode.DecodedInstruction {
-    if (isValidatedThumbSavedLrReturnEpilogue(image, function_entry, address, reg)) {
-        // This is a validated Thumb epilogue: the function already saved `lr`
-        // in its prologue, and the exact `pop {same_reg}; bx same_reg` tail is
-        // returning that saved link value from the stack.
+    if (isExactThumbSavedLrInterworkingReturnEpilogue(image, function_entry, address, reg)) {
+        // This is the exact `sbb_reg`-style Thumb interworking return shape:
+        // an entry `push {saved_reg, lr}` paired with `pop {saved_reg};
+        // pop {return_reg}; bx return_reg`.
         return .{ .thumb_saved_lr_return = {} };
     }
     if (function_entry.isa == .thumb and reg == 6) {
@@ -833,7 +833,7 @@ fn resolveBxTarget(
     return .{ .bx_target = normalizeCodeTarget(try resolvePreviousRegisterValue(image, function_entry.isa, address, reg)) };
 }
 
-fn isValidatedThumbSavedLrReturnEpilogue(
+fn isExactThumbSavedLrInterworkingReturnEpilogue(
     image: gba_loader.RomImage,
     function_entry: armv4t_decode.CodeAddress,
     address: u32,
@@ -841,32 +841,45 @@ fn isValidatedThumbSavedLrReturnEpilogue(
 ) bool {
     const isa = function_entry.isa;
     if (isa != .thumb) return false;
-    if (!functionEntryHasSavedLrPush(image, function_entry)) return false;
     if (reg == 15) return false;
 
+    const saved_reg = thumbEntrySavedReg(image, function_entry) orelse return false;
+    if (reg == saved_reg) return false;
+
     const previous = previousInstruction(image, isa, address) catch return false;
-    const pop_mask = switch (previous.instruction) {
-        .pop => |mask| mask,
+    _ = switch (previous.instruction) {
+        .pop => |mask| if (mask == (@as(u16, 1) << reg)) reg else return false,
         else => return false,
     };
 
-    // Keep this self-limiting: only the exact `pop {same_reg}; bx same_reg`
-    // epilogue is recognized, and only when the function entry itself proves
-    // this function saved `lr` in its own prologue.
-    return pop_mask == (@as(u16, 1) << reg);
+    const prior = previousInstruction(image, isa, previous.address) catch return false;
+    _ = switch (prior.instruction) {
+        .pop => |mask| if (mask == (@as(u16, 1) << saved_reg)) saved_reg else return false,
+        else => return false,
+    };
+
+    // Keep this self-limiting: only the exact `push {saved_reg, lr}` prologue
+    // paired with `pop {saved_reg}; pop {return_reg}; bx return_reg` is
+    // recognized as a return surface.
+    return true;
 }
 
-fn functionEntryHasSavedLrPush(
+fn thumbEntrySavedReg(
     image: gba_loader.RomImage,
     function_entry: armv4t_decode.CodeAddress,
-) bool {
-    if (function_entry.isa != .thumb) return false;
-    const entry = decodeImageInstructionUnchecked(image, .thumb, function_entry.address) catch return false;
-    const mask = switch (entry.instruction) {
-        .push => |mask| mask,
-        else => return false,
-    };
-    return (mask & (@as(u16, 1) << 14)) != 0;
+) ?u4 {
+    if (function_entry.isa != .thumb) return null;
+    const offset = offsetForAddress(image, function_entry.address, .thumb) orelse return null;
+    const word = armv4t_decode.readHalfword(image.bytes, offset);
+    if ((word & 0xFE00) != 0xB400) return null;
+
+    const saved_mask: u16 = @truncate(word & 0x00FF);
+    const has_lr = ((word >> 8) & 0x1) == 1;
+    if (!has_lr) return null;
+    if (saved_mask == 0) return null;
+    if ((saved_mask & (saved_mask - 1)) != 0) return null;
+
+    return @intCast(std.math.log2_int(u16, saved_mask));
 }
 
 fn resolveDevkitArmCrt0StartupThumbBlxR3Target(
@@ -1887,15 +1900,13 @@ test "thumb saved-lr return epilogue resolves as a distinct return surface" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var rom: [8]u8 = .{ 0x00, 0xB5, 0x01, 0xBC, 0x00, 0x47, 0x00, 0xBF };
+    var rom: [8]u8 = .{ 0x10, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 };
     try tmp.dir.writeFile(io, .{ .sub_path = "thumb-pop-bx-return.gba", .data = &rom });
 
     const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-bx-return.gba");
     defer image.deinit(std.testing.allocator);
 
-    try std.testing.expect(functionEntryHasSavedLrPush(image, .{ .address = 0x0800_0000, .isa = .thumb }));
-
-    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0004, 0);
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0006, 0);
     try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
 }
 
@@ -1907,22 +1918,27 @@ test "thumb saved-lr return witness is anchored at function entry" {
     const cases = [_]struct {
         rom_bytes: []const u8,
         function_entry: armv4t_decode.CodeAddress,
-        want_entry_saved_lr: bool,
+        expect_ok: bool,
     }{
         .{
-            .rom_bytes = &.{ 0x00, 0xB5, 0x00, 0xBF, 0x00, 0xBC, 0x00, 0x47 },
+            .rom_bytes = &.{ 0x10, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
             .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
-            .want_entry_saved_lr = true,
+            .expect_ok = true,
         },
         .{
-            .rom_bytes = &.{ 0x10, 0xB4, 0x00, 0xB5, 0x01, 0xBC, 0x00, 0x47 },
+            .rom_bytes = &.{ 0x00, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
             .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
-            .want_entry_saved_lr = false,
+            .expect_ok = false,
         },
         .{
-            .rom_bytes = &.{ 0x00, 0xB4, 0x00, 0xB5, 0x01, 0xBC, 0x00, 0x47 },
+            .rom_bytes = &.{ 0x30, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
+            .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
+            .expect_ok = false,
+        },
+        .{
+            .rom_bytes = &.{ 0x10, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
             .function_entry = .{ .address = 0x0800_0000, .isa = .arm },
-            .want_entry_saved_lr = false,
+            .expect_ok = false,
         },
     };
 
@@ -1934,7 +1950,15 @@ test "thumb saved-lr return witness is anchored at function entry" {
         const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", path);
         defer image.deinit(std.testing.allocator);
 
-        try std.testing.expectEqual(case.want_entry_saved_lr, functionEntryHasSavedLrPush(image, case.function_entry));
+        const result = resolveBxTarget(image, case.function_entry, 0x0800_0006, 0);
+        if (case.expect_ok) {
+            try std.testing.expectEqualDeep(
+                armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} },
+                try result,
+            );
+        } else {
+            try std.testing.expectError(error.UnsupportedOpcode, result);
+        }
     }
 }
 
@@ -1946,21 +1970,37 @@ test "thumb saved-lr return epilogue rejects local tail near-misses" {
     const cases = [_]struct {
         rom_bytes: []const u8,
         bx_address: u32,
+        bx_reg: u4,
         expect_error: bool,
     }{
         .{
-            .rom_bytes = &.{ 0x00, 0xB5, 0x01, 0xBC, 0x00, 0x47, 0x00, 0xBF },
-            .bx_address = 0x0800_0004,
+            .rom_bytes = &.{ 0x10, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
+            .bx_address = 0x0800_0006,
+            .bx_reg = 0,
             .expect_error = false,
         },
         .{
-            .rom_bytes = &.{ 0x00, 0xB5, 0x02, 0xBC, 0x00, 0x47, 0x00, 0xBF },
-            .bx_address = 0x0800_0004,
+            .rom_bytes = &.{ 0x00, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
+            .bx_address = 0x0800_0006,
+            .bx_reg = 0,
             .expect_error = true,
         },
         .{
-            .rom_bytes = &.{ 0x00, 0xB5, 0x03, 0xBC, 0x00, 0x47, 0x00, 0xBF },
-            .bx_address = 0x0800_0004,
+            .rom_bytes = &.{ 0x10, 0xB5, 0x01, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
+            .bx_address = 0x0800_0006,
+            .bx_reg = 0,
+            .expect_error = true,
+        },
+        .{
+            .rom_bytes = &.{ 0x10, 0xB5, 0x03, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
+            .bx_address = 0x0800_0006,
+            .bx_reg = 0,
+            .expect_error = true,
+        },
+        .{
+            .rom_bytes = &.{ 0x10, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x08, 0x47 },
+            .bx_address = 0x0800_0006,
+            .bx_reg = 1,
             .expect_error = true,
         },
     };
@@ -1973,7 +2013,7 @@ test "thumb saved-lr return epilogue rejects local tail near-misses" {
         const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", path);
         defer image.deinit(std.testing.allocator);
 
-        const result = resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, case.bx_address, 0);
+        const result = resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, case.bx_address, case.bx_reg);
         if (case.expect_error) {
             try std.testing.expectError(error.UnsupportedOpcode, result);
         } else {
@@ -1985,7 +2025,7 @@ test "thumb saved-lr return epilogue rejects local tail near-misses" {
     }
 }
 
-test "tonc fixtures advance past the validated Thumb saved-lr return surface" {
+test "tonc fixtures advance the sbb_reg slice and keep irq_demo deferred" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1994,26 +2034,31 @@ test "tonc fixtures advance past the validated Thumb saved-lr return surface" {
         rom_path: []const u8,
         old_blocker: []const u8,
         next_blocker: []const u8,
+        still_blocked_here: bool,
     }{
         .{
             .rom_path = "tests/fixtures/real/tonc/sbb_reg.gba",
             .old_blocker = "Unsupported opcode 0x00004700 at 0x08000456 for armv4t",
             .next_blocker = "Unsupported SWI 0x000005 at 0x08000820 for gba",
+            .still_blocked_here = false,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
             .old_blocker = "Unsupported opcode 0x00000000 at 0x080003A8 for armv4t",
             .next_blocker = "Unsupported opcode 0x00004718 at 0x080003B8 for armv4t",
+            .still_blocked_here = false,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
             .old_blocker = "Unsupported opcode 0x00000021 at 0x080002F6 for armv4t",
             .next_blocker = "Unsupported SWI 0x000005 at 0x08000768 for gba",
+            .still_blocked_here = false,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/irq_demo.gba",
             .old_blocker = "Unsupported opcode 0x00004708 at 0x080006C6 for armv4t",
-            .next_blocker = "Unsupported opcode 0x00004718 at 0x08003078 for armv4t",
+            .next_blocker = "Unsupported opcode 0x00004708 at 0x080006C6 for armv4t",
+            .still_blocked_here = true,
         },
     };
     for (fixtures) |fixture| {
@@ -2021,7 +2066,11 @@ test "tonc fixtures advance past the validated Thumb saved-lr return surface" {
         defer std.testing.allocator.free(result.stderr);
 
         try std.testing.expect(result.failed);
-        try std.testing.expect(std.mem.indexOf(u8, result.stderr, fixture.old_blocker) == null);
+        if (fixture.still_blocked_here) {
+            try std.testing.expect(std.mem.indexOf(u8, result.stderr, fixture.old_blocker) != null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, result.stderr, fixture.old_blocker) == null);
+        }
         try std.testing.expect(std.mem.indexOf(u8, result.stderr, fixture.next_blocker) != null);
     }
 }
