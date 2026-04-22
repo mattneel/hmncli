@@ -61,6 +61,14 @@ pub const DecodedInstruction = union(enum) {
         rd: u4,
         rm: u4,
     },
+    movs_imm: struct {
+        rd: u4,
+        imm: u32,
+    },
+    movs_reg: struct {
+        rd: u4,
+        rm: u4,
+    },
     orr_imm: struct {
         rd: u4,
         rn: u4,
@@ -81,6 +89,17 @@ pub const DecodedInstruction = union(enum) {
         base: u4,
         offset: Offset,
         size: StoreSize,
+    },
+    ldr_word_imm: struct {
+        rd: u4,
+        base: u4,
+        offset: u32,
+    },
+    push: u16,
+    pop: u16,
+    tst_imm: struct {
+        rn: u4,
+        imm: u32,
     },
     branch: struct {
         cond: Cond,
@@ -120,9 +139,13 @@ fn decodeInstruction(raw_word: u32, insn: capstone_api.ArmInstruction) DecodeErr
             parseAlu3(.subs_imm, insn)
         else
             error.UnsupportedOpcode,
+        c.ARM_INS_LDR => parseLoad(insn),
         c.ARM_INS_STR => parseStore(insn, .word),
         c.ARM_INS_STRB => parseStore(insn, .byte),
         c.ARM_INS_STRH => parseStore(insn, .halfword),
+        c.ARM_INS_STMDB => parseStackTransfer(raw_word, insn, .push),
+        c.ARM_INS_LDM => parseStackTransfer(raw_word, insn, .pop),
+        c.ARM_INS_TST => parseTst(insn),
         c.ARM_INS_B => parseBranch(insn),
         c.ARM_INS_BL => parseBl(raw_word, insn),
         c.ARM_INS_BX => parseBx(insn),
@@ -147,14 +170,26 @@ fn parseMov(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
     if (source.subtracted) return error.UnsupportedOpcode;
 
     return switch (source.value) {
-        .imm => |imm| .{ .mov_imm = .{
-            .rd = rd,
-            .imm = try parseU32Immediate(imm),
-        } },
-        .reg => |reg| .{ .mov_reg = .{
-            .rd = rd,
-            .rm = try parseRegisterId(reg),
-        } },
+        .imm => |imm| if (insn.update_flags)
+            .{ .movs_imm = .{
+                .rd = rd,
+                .imm = try parseU32Immediate(imm),
+            } }
+        else
+            .{ .mov_imm = .{
+                .rd = rd,
+                .imm = try parseU32Immediate(imm),
+            } },
+        .reg => |reg| if (insn.update_flags)
+            .{ .movs_reg = .{
+                .rd = rd,
+                .rm = try parseRegisterId(reg),
+            } }
+        else
+            .{ .mov_reg = .{
+                .rd = rd,
+                .rm = try parseRegisterId(reg),
+            } },
         else => error.UnsupportedOpcode,
     };
 }
@@ -206,6 +241,47 @@ fn parseStore(insn: capstone_api.ArmInstruction, size: StoreSize) DecodeError!De
     } };
 }
 
+fn parseLoad(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+    if (insn.operand_count != 2) return error.UnsupportedOpcode;
+
+    const rd = try operandRegister(insn, 0);
+    const mem_op = operandAt(insn, 1);
+    if (mem_op.subtracted) return error.UnsupportedOpcode;
+
+    const mem = switch (mem_op.value) {
+        .mem => |value| value,
+        else => return error.UnsupportedOpcode,
+    };
+
+    if (mem.disp < 0) return error.UnsupportedOpcode;
+    if (mem.index != c.ARM_REG_INVALID) return error.UnsupportedOpcode;
+    if (mem.scale != 0 and mem.scale != 1) return error.UnsupportedOpcode;
+
+    return .{ .ldr_word_imm = .{
+        .rd = rd,
+        .base = try parseRegisterId(mem.base),
+        .offset = @intCast(mem.disp),
+    } };
+}
+
+fn parseStackTransfer(
+    word: u32,
+    insn: capstone_api.ArmInstruction,
+    comptime kind: enum { push, pop },
+) DecodeError!DecodedInstruction {
+    const base_reg: u4 = @truncate((word >> 16) & 0xF);
+    const register_mask: u16 = @truncate(word & 0xFFFF);
+
+    if (base_reg != 13) return error.UnsupportedOpcode;
+    if (!insn.writeback) return error.UnsupportedOpcode;
+    if (register_mask == 0) return error.UnsupportedOpcode;
+
+    return switch (kind) {
+        .push => .{ .push = register_mask },
+        .pop => .{ .pop = register_mask },
+    };
+}
+
 fn parseBranch(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
     if (insn.operand_count != 1) return error.UnsupportedOpcode;
     const cond: Cond = switch (insn.cc) {
@@ -238,6 +314,14 @@ fn parseSwi(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
     if (imm > 0x00FF_FFFF) return error.UnsupportedOpcode;
     return .{ .swi = .{
         .imm24 = @truncate(imm),
+    } };
+}
+
+fn parseTst(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+    if (insn.operand_count != 2) return error.UnsupportedOpcode;
+    return .{ .tst_imm = .{
+        .rn = try operandRegister(insn, 0),
+        .imm = try operandImmediateU32(insn, 1),
     } };
 }
 
@@ -351,6 +435,14 @@ test "decode reads mov immediate" {
     );
 }
 
+test "decode reads movs immediate" {
+    const decoded = try decode(0xE3B00000, 0x080002D0);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .movs_imm = .{ .rd = 0, .imm = 0 } },
+        decoded,
+    );
+}
+
 test "decode reads unconditional branch target" {
     const decoded = try decode(0xEA00002E, 0x08000000);
     try std.testing.expectEqualDeep(
@@ -420,6 +512,14 @@ test "decode reads bx lr" {
     try std.testing.expectEqualDeep(DecodedInstruction.bx_lr, decoded);
 }
 
+test "decode reads push and pop register masks" {
+    const push = try decode(0xE92D0003, 0x08001D4C);
+    try std.testing.expectEqualDeep(DecodedInstruction{ .push = 0x0003 }, push);
+
+    const pop = try decode(0xE8BD0003, 0x08001D6C);
+    try std.testing.expectEqualDeep(DecodedInstruction{ .pop = 0x0003 }, pop);
+}
+
 test "decode reads bx r0 for later target resolution" {
     const decoded = try decode(0xE12FFF10, 0x08000004);
     try std.testing.expectEqualDeep(
@@ -454,6 +554,18 @@ test "decode reads halfword store with immediate offset" {
     );
 }
 
+test "decode reads ldr word immediate" {
+    const decoded = try decode(0xE5901004, 0x08001D54);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .ldr_word_imm = .{
+            .rd = 1,
+            .base = 0,
+            .offset = 4,
+        } },
+        decoded,
+    );
+}
+
 test "decode reads subs immediate" {
     const decoded = try decode(0xE2522004, 0x08000114);
     try std.testing.expectEqualDeep(
@@ -466,10 +578,32 @@ test "decode reads subs immediate" {
     );
 }
 
+test "decode reads tst immediate" {
+    const decoded = try decode(0xE3110001, 0x08001D58);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .tst_imm = .{
+            .rn = 1,
+            .imm = 1,
+        } },
+        decoded,
+    );
+}
+
+test "decode reads movs register" {
+    const decoded = try decode(0xE1B0C00C, 0x08001D74);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .movs_reg = .{
+            .rd = 12,
+            .rm = 12,
+        } },
+        decoded,
+    );
+}
+
 test "decode reads thumb mov immediate" {
     const decoded = try decodeThumb(0x2007, 0x08000008);
     try std.testing.expectEqualDeep(
-        DecodedInstruction{ .mov_imm = .{ .rd = 0, .imm = 7 } },
+        DecodedInstruction{ .movs_imm = .{ .rd = 0, .imm = 7 } },
         decoded,
     );
 }

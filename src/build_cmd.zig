@@ -208,9 +208,15 @@ fn ensureDeclared(
     switch (decoded) {
         .mov_imm => _ = try catalog.lookupInstruction("armv4t", "mov_imm"),
         .mov_reg => _ = try catalog.lookupInstruction("armv4t", "mov_reg"),
+        .movs_imm => _ = try catalog.lookupInstruction("armv4t", "movs_imm"),
+        .movs_reg => _ = try catalog.lookupInstruction("armv4t", "movs_reg"),
         .orr_imm => _ = try catalog.lookupInstruction("armv4t", "orr_imm"),
         .add_imm => _ = try catalog.lookupInstruction("armv4t", "add_imm"),
         .subs_imm => _ = try catalog.lookupInstruction("armv4t", "subs_imm"),
+        .ldr_word_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_word_imm"),
+        .push => _ = try catalog.lookupInstruction("armv4t", "push_regs"),
+        .pop => _ = try catalog.lookupInstruction("armv4t", "pop_regs"),
+        .tst_imm => _ = try catalog.lookupInstruction("armv4t", "tst_imm"),
         .store => |store| switch (store.size) {
             .word => switch (store.offset) {
                 .imm => _ = try catalog.lookupInstruction("armv4t", "str_word_imm"),
@@ -226,7 +232,7 @@ fn ensureDeclared(
         .bx_lr => _ = try catalog.lookupInstruction("armv4t", "bx_lr"),
         .msr_cpsr_f_imm => _ = try catalog.lookupInstruction("armv4t", "msr_cpsr_f_imm"),
         .swi => |swi| {
-            if (swi.imm24 != 0x000006) {
+            if (!isDivSwi(swi.imm24)) {
                 try renderUnsupportedShim(writer, address, swi.imm24);
                 return error.UnsupportedShim;
             }
@@ -249,6 +255,10 @@ fn enqueueSuccessors(
 ) BuildError!void {
     switch (decoded) {
         .mov_reg => |mov| {
+            if (mov.rd == 15 and mov.rm == 14) return;
+            try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
+        },
+        .movs_reg => |mov| {
             if (mov.rd == 15 and mov.rm == 14) return;
             try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
         },
@@ -469,6 +479,10 @@ fn branchInstructionName(cond: armv4t_decode.Cond) []const u8 {
         .le => "ble",
         .al => "b",
     };
+}
+
+fn isDivSwi(imm24: u24) bool {
+    return imm24 == 0x000006 or imm24 == 0x060000;
 }
 
 fn isStore(decoded: armv4t_decode.DecodedInstruction) bool {
@@ -715,6 +729,6 @@ test "build uses the real jsmolka arm rom and reports the next unsupported surfa
     );
     try std.testing.expectStringStartsWith(
         output.writer.buffered(),
-        "Unsupported opcode 0xE92D0003 at 0x08001D4C for armv4t\n",
+        "Unsupported opcode 0xE2422020 at 0x08001F58 for armv4t\n",
     );
 }
