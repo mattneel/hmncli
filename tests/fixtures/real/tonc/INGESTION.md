@@ -4,7 +4,7 @@
 
 - `sbb_reg`: now stops at `Unsupported opcode 0x00004700 at 0x080004E8 for armv4t`
 - `obj_demo`: now stops at `Unsupported opcode 0xF81DF000 at 0x0800037A for armv4t`
-- `key_demo`: now stops at `Unsupported opcode 0xF860F000 at 0x08000294 for armv4t`
+- `key_demo`: now stops at `Unsupported opcode 0xF80BF000 at 0x08000802 for armv4t`
 - `irq_demo`: now stops at `Unsupported opcode 0x00004718 at 0x08003078 for armv4t`
 
 ## First Homonculi Failure Surface
@@ -15,7 +15,7 @@
 - The fixtures now diverge on their next blockers:
   - `sbb_reg`: `Unsupported opcode 0x00004700 at 0x080004E8 for armv4t`
   - `obj_demo`: `Unsupported opcode 0xF81DF000 at 0x0800037A for armv4t`
-  - `key_demo`: `Unsupported opcode 0xF860F000 at 0x08000294 for armv4t`
+  - `key_demo`: `Unsupported opcode 0xF80BF000 at 0x08000802 for armv4t`
   - `irq_demo`: `Unsupported opcode 0x00004718 at 0x08003078 for armv4t`
 
 ## Scope Decisions

@@ -951,7 +951,8 @@ fn resolveExactLocalThumbBlxR3VeneerTarget(
     if (bx.reg != 3) return null;
 
     if (!isMeasuredLocalThumbBlxR3VeneerNop(image, target_address + 2)) return null;
-    return try resolveMeasuredLocalThumbBlxR3CallerTarget(image, isa, bl_address);
+    if (try resolveExactKeyDemoLocalThumbBlxR3CallerTarget(image, isa, bl_address)) |resolved_target| return resolved_target;
+    return try resolveExactObjDemoLocalThumbBlxR3CallerTarget(image, isa, bl_address);
 }
 
 fn isMeasuredLocalThumbBlxR3VeneerNop(image: gba_loader.RomImage, address: u32) bool {
@@ -964,35 +965,58 @@ fn isMeasuredLocalThumbBlxR3VeneerNop(image: gba_loader.RomImage, address: u32) 
     return raw_halfword == 0x46C0 or raw_halfword == 0x0000;
 }
 
-fn resolveMeasuredLocalThumbBlxR3CallerTarget(
+fn resolveExactKeyDemoLocalThumbBlxR3CallerTarget(
     image: gba_loader.RomImage,
     isa: armv4t_decode.InstructionSet,
     bl_address: u32,
 ) BuildError!?u32 {
     if (isa != .thumb) return null;
 
-    var address = bl_address;
-    var steps: u3 = 0;
-    while (steps < 4) : (steps += 1) {
-        const previous = previousInstruction(image, isa, address) catch return null;
-        address = previous.address;
+    const previous = try previousInstruction(image, isa, bl_address);
+    const load = switch (previous.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (load.rd != 3 or load.base != 15) return null;
+    return try resolveThumbPcRelativeLiteralCodeTarget(image, previous.address, load);
+}
 
-        switch (previous.instruction) {
-            .ldr_word_imm => |load| {
-                if (load.rd == 3 and load.base == 15) return try resolveThumbPcRelativeLiteralCodeTarget(image, previous.address, load);
-                if (load.base != 15 or load.rd == 3) return null;
-            },
-            .lsls_imm => |shift| {
-                if (shift.rd == 3 or shift.rm == 3) return null;
-            },
-            .lsrs_imm => |shift| {
-                if (shift.rd == 3 or shift.rm == 3) return null;
-            },
-            else => return null,
-        }
-    }
+fn resolveExactObjDemoLocalThumbBlxR3CallerTarget(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    bl_address: u32,
+) BuildError!?u32 {
+    if (isa != .thumb) return null;
 
-    return null;
+    const lsls_insn = try previousInstruction(image, isa, bl_address);
+    const lsls = switch (lsls_insn.instruction) {
+        .lsls_imm => |shift| shift,
+        else => return null,
+    };
+    if (lsls.rd != 2 or lsls.rm != 2 or lsls.imm != 2) return null;
+
+    const ldr_r0_insn = try previousInstruction(image, isa, lsls_insn.address);
+    const ldr_r0 = switch (ldr_r0_insn.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (ldr_r0.rd != 0 or ldr_r0.base != 15) return null;
+
+    const ldr_r1_insn = try previousInstruction(image, isa, ldr_r0_insn.address);
+    const ldr_r1 = switch (ldr_r1_insn.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (ldr_r1.rd != 1 or ldr_r1.base != 15) return null;
+
+    const ldr_r3_insn = try previousInstruction(image, isa, ldr_r1_insn.address);
+    const ldr_r3 = switch (ldr_r3_insn.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (ldr_r3.rd != 3 or ldr_r3.base != 15) return null;
+
+    return try resolveThumbPcRelativeLiteralCodeTarget(image, ldr_r3_insn.address, ldr_r3);
 }
 
 fn resolveThumbPcRelativeLiteralCodeTarget(
@@ -2162,7 +2186,7 @@ test "local thumb blx r3 veneer rejects near misses" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cases = [_]struct {
+    const key_cases = [_]struct {
         caller_load: u16,
         stub: u16,
         after_stub: u16,
@@ -2189,8 +2213,8 @@ test "local thumb blx r3 veneer rejects near misses" {
         },
     };
 
-    for (cases, 0..) |case, index| {
-        const path = try std.fmt.allocPrint(std.testing.allocator, "local-blx-r3-near-miss-{d}.gba", .{index});
+    for (key_cases, 0..) |case, index| {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "local-blx-r3-key-near-miss-{d}.gba", .{index});
         defer std.testing.allocator.free(path);
 
         try writeLocalThumbBlxR3VeneerRom(
@@ -2213,6 +2237,53 @@ test "local thumb blx r3 veneer rejects near misses" {
                 .{ .address = 0x0800_0000, .isa = .thumb },
                 0x0800_0004,
                 .{ .bl = .{ .target = 0x0800_0008 } },
+            ),
+        );
+    }
+
+    const obj_cases = [_]struct {
+        caller_load: u16,
+        between: [3]u16,
+    }{
+        .{
+            .caller_load = 0x4B04,
+            .between = .{ 0x4903, 0x4803, 0x0852 },
+        },
+        .{
+            .caller_load = 0x4B04,
+            .between = .{ 0x4903, 0x4A03, 0x0092 },
+        },
+        .{
+            .caller_load = 0x4B04,
+            .between = .{ 0x0852, 0x4803, 0x0092 },
+        },
+    };
+
+    for (obj_cases, 0..) |case, index| {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "local-blx-r3-obj-near-miss-{d}.gba", .{index});
+        defer std.testing.allocator.free(path);
+
+        try writeSeparatedLocalThumbBlxR3VeneerRom(
+            tmp.dir,
+            io,
+            path,
+            case.caller_load,
+            case.between,
+            0x4718,
+            0x46C0,
+            0x0800_0015,
+        );
+
+        const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", path);
+        defer image.deinit(std.testing.allocator);
+
+        try std.testing.expectEqualDeep(
+            armv4t_decode.DecodedInstruction{ .bl = .{ .target = 0x0800_000C } },
+            try resolveDecodedInstruction(
+                image,
+                .{ .address = 0x0800_0000, .isa = .thumb },
+                0x0800_000A,
+                .{ .bl = .{ .target = 0x0800_000C } },
             ),
         );
     }
@@ -2468,7 +2539,7 @@ test "tonc fixture frontiers reflect the exact local thumb blx r3 veneer slice" 
             .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
             .old_blocker = "Unsupported opcode 0x00000021 at 0x080002F6 for armv4t",
             .cleared_blocker = "Unsupported opcode 0x00004718 at 0x0800081C for armv4t",
-            .next_blocker = "Unsupported opcode 0xF860F000 at 0x08000294 for armv4t",
+            .next_blocker = "Unsupported opcode 0xF80BF000 at 0x08000802 for armv4t",
             .still_blocked_here = false,
         },
         .{
