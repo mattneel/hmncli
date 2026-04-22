@@ -1388,6 +1388,98 @@ test "build executes the real jsmolka stripes rom and produces the expected memo
     );
 }
 
+test "build executes the real jsmolka shades rom and produces the expected memory summary" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/real/jsmolka/ppu-shades.gba",
+        std.testing.allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer std.testing.allocator.free(rom);
+    try tmp.dir.writeFile(io, .{ .sub_path = "ppu-shades.gba", .data = rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "ppu-shades.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "ppu-shades-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./ppu-shades-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(2048),
+        .stderr_limit = .limited(2048),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings(
+        "IO0=00000100 IO8=00000104 PAL0=00000000 PAL2=00000800 VRAM4000=00000000 MAP0800=00000000 MAP0804=00000001\n",
+        result.stdout,
+    );
+}
+
+test "build executes the real jsmolka hello rom and produces the expected memory summary" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/real/jsmolka/ppu-hello.gba",
+        std.testing.allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer std.testing.allocator.free(rom);
+    try tmp.dir.writeFile(io, .{ .sub_path = "ppu-hello.gba", .data = rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "ppu-hello.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "ppu-hello-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./ppu-hello-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(2048),
+        .stderr_limit = .limited(2048),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings(
+        "IO0=00000404 IO8=00000000 PAL0=00000000 PAL2=0000FFFF VRAM4000=00000000 MAP0800=00000000 MAP0804=00000000\n",
+        result.stdout,
+    );
+}
+
 test "lifted real arm rom reaches the report block" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
