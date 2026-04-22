@@ -318,15 +318,11 @@ fn previousInstruction(
     }
 }
 
-fn nextInstruction(
+fn nextStartupThumbVeneerInstruction(
     image: gba_loader.RomImage,
-    isa: armv4t_decode.InstructionSet,
-    address: u32,
+    target_address: u32,
 ) BuildError!DecodedNode {
-    return switch (isa) {
-        .arm => decodeImageInstructionUnchecked(image, isa, address + 4),
-        .thumb => decodeImageInstructionUnchecked(image, isa, address + 2),
-    };
+    return decodeImageInstructionUnchecked(image, .thumb, target_address + 2);
 }
 
 fn ensureDeclared(
@@ -843,10 +839,13 @@ fn resolveDevkitArmCrt0StartupThumbBlxR3Target(
     };
     if (bx.reg != 3) return null;
 
+    // This is the devkitARM crt0 veneer shape: `_blx_r3_stub` is wrapped by
+    // `bx lr` before it and `subs r3, r4, r2` after it, so the caller-side
+    // `ldr r3, [pc, #imm]` can be resolved directly without a general analysis.
     const previous_target = previousInstruction(image, isa, target_address) catch return null;
     if (previous_target.instruction != .bx_lr) return null;
 
-    const next_target = nextInstruction(image, isa, target_address) catch return null;
+    const next_target = nextStartupThumbVeneerInstruction(image, target_address) catch return null;
     const subs = switch (next_target.instruction) {
         .subs_reg => |subs| subs,
         else => return null,
@@ -870,6 +869,25 @@ fn resolveDevkitArmCrt0StartupThumbBlxR3Target(
     if (code_target.isa != .thumb) return error.UnsupportedOpcode;
     if (offsetForAddress(image, code_target.address, code_target.isa) == null) return error.UnsupportedOpcode;
     return code_target.address;
+}
+
+fn writeStartupThumbBlxR3VeneerRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+    caller_load: u16,
+    before_stub: u16,
+    stub: u16,
+    after_stub: u16,
+    literal: u32,
+) !void {
+    var rom: [32]u8 = std.mem.zeroes([32]u8);
+    std.mem.writeInt(u16, rom[2..4], caller_load, .little);
+    std.mem.writeInt(u16, rom[6..8], before_stub, .little);
+    std.mem.writeInt(u16, rom[8..10], stub, .little);
+    std.mem.writeInt(u16, rom[10..12], after_stub, .little);
+    std.mem.writeInt(u32, rom[16..20], literal, .little);
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
 fn resolveStartupThumbBxR6TargetValue(
@@ -1684,6 +1702,139 @@ test "devkitARM crt0 header-check pruning ignores near-miss literals" {
         @as(?bool, null),
         try resolveDevkitArmCrt0HeaderCheckBranch(image, .thumb, 0x0800_0004, branch),
     );
+}
+
+test "devkitARM crt0 startup blx r3 veneer resolves the caller literal target" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeStartupThumbBlxR3VeneerRom(
+        tmp.dir,
+        io,
+        "startup-blx-r3.gba",
+        0x4B03,
+        0x4770,
+        0x4718,
+        0x1AA3,
+        0x0800_0009,
+    );
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "startup-blx-r3.gba");
+    defer image.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(
+        @as(?u32, 0x0800_0008),
+        try resolveDevkitArmCrt0StartupThumbBlxR3Target(image, .thumb, 0x0800_0004, 0x0800_0008),
+    );
+}
+
+test "devkitARM crt0 startup blx r3 veneer rejects boundary mismatches" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cases = [_]struct {
+        caller_load: u16,
+        before_stub: u16,
+        stub: u16,
+        after_stub: u16,
+        expected: ?u32,
+    }{
+        .{
+            .caller_load = 0x4A03,
+            .before_stub = 0x4770,
+            .stub = 0x4718,
+            .after_stub = 0x1AA3,
+            .expected = null,
+        },
+        .{
+            .caller_load = 0x6803,
+            .before_stub = 0x4770,
+            .stub = 0x4718,
+            .after_stub = 0x1AA3,
+            .expected = null,
+        },
+        .{
+            .caller_load = 0x4B03,
+            .before_stub = 0x46C0,
+            .stub = 0x4718,
+            .after_stub = 0x1AA3,
+            .expected = null,
+        },
+        .{
+            .caller_load = 0x4B03,
+            .before_stub = 0x4770,
+            .stub = 0x4718,
+            .after_stub = 0x46C0,
+            .expected = null,
+        },
+    };
+
+    for (cases, 0..) |case, index| {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "startup-blx-r3-{d}.gba", .{index});
+        defer std.testing.allocator.free(path);
+
+        try writeStartupThumbBlxR3VeneerRom(
+            tmp.dir,
+            io,
+            path,
+            case.caller_load,
+            case.before_stub,
+            case.stub,
+            case.after_stub,
+            0x0800_0009,
+        );
+
+        const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", path);
+        defer image.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(
+            case.expected,
+            try resolveDevkitArmCrt0StartupThumbBlxR3Target(image, .thumb, 0x0800_0004, 0x0800_0008),
+        );
+    }
+}
+
+test "devkitARM crt0 startup blx r3 veneer rejects invalid literal targets" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cases = [_]struct {
+        literal: u32,
+    }{
+        .{
+            .literal = 0x0800_0008,
+        },
+        .{
+            .literal = 0x0800_0021,
+        },
+    };
+
+    for (cases, 0..) |case, index| {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "startup-blx-r3-invalid-{d}.gba", .{index});
+        defer std.testing.allocator.free(path);
+
+        try writeStartupThumbBlxR3VeneerRom(
+            tmp.dir,
+            io,
+            path,
+            0x4B03,
+            0x4770,
+            0x4718,
+            0x1AA3,
+            case.literal,
+        );
+
+        const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", path);
+        defer image.deinit(std.testing.allocator);
+
+        try std.testing.expectError(
+            error.UnsupportedOpcode,
+            resolveDevkitArmCrt0StartupThumbBlxR3Target(image, .thumb, 0x0800_0004, 0x0800_0008),
+        );
+    }
 }
 
 test "tonc fixtures diverge after the startup veneer is resolved exactly" {
