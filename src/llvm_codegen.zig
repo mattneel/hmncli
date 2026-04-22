@@ -184,13 +184,21 @@ fn emitSaveNormalizedOffset(
     writer: *Io.Writer,
     addr_name: []const u8,
     prefix: []const u8,
+    mirror_len: u32,
 ) Io.Writer.Error!void {
     try writer.print("  %{s}_save_window_offset = sub i32 %{s}, {d}\n", .{ prefix, addr_name, save_region_base });
     try writer.print("  %{s}_save_offset = and i32 %{s}_save_window_offset, {d}\n", .{
         prefix,
         prefix,
-        save_region_len - 1,
+        mirror_len - 1,
     });
+}
+
+fn saveMirrorLen(hardware: SaveHardware) u32 {
+    return switch (hardware) {
+        .sram => 32_768,
+        .none, .flash64, .flash128 => save_region_len,
+    };
 }
 
 pub fn emitModule(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
@@ -547,7 +555,7 @@ fn emitLoadHelper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
         .sram, .flash64, .flash128 => {
             try writer.print("  br i1 %save_hit, label %load_save_sram, label %check_real_rom\n", .{});
             try writer.print("load_save_sram:\n", .{});
-            try emitSaveNormalizedOffset(writer, "addr", "load32");
+            try emitSaveNormalizedOffset(writer, "addr", "load32", saveMirrorLen(program.save_hardware));
             if (program.save_hardware == .flash128) {
                 try writer.print("  %load32_save_bank = load i32, ptr %save_bank_load_ptr, align 4\n", .{});
                 try writer.print("  %load32_save_bank_base = shl i32 %load32_save_bank, 16\n", .{});
@@ -659,7 +667,7 @@ fn emitLoad8Helper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
             .sram, .flash64, .flash128 => {
                 try writer.print("  br i1 %save_hit8, label %load8_save_sram, label %check_load8_rom\n", .{});
                 try writer.print("load8_save_sram:\n", .{});
-                try emitSaveNormalizedOffset(writer, "addr", "load8");
+                try emitSaveNormalizedOffset(writer, "addr", "load8", saveMirrorLen(program.save_hardware));
                 if (program.save_hardware == .flash128) {
                     try writer.print("  %load8_save_bank = load i32, ptr %save_bank_load8_ptr, align 4\n", .{});
                     try writer.print("  %load8_save_bank_base = shl i32 %load8_save_bank, 16\n", .{});
@@ -684,7 +692,7 @@ fn emitLoad8Helper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
         try writer.print("  %rom8_offset = and i32 %rom8_window_offset, 33554431\n", .{});
         try writer.print("  %rom8_in_range = icmp ult i32 %rom8_offset, {d}\n", .{rom_span});
         try writer.print("  %rom8_hit = and i1 %rom8_window_hit, %rom8_in_range\n", .{});
-        try writer.print("  br i1 %rom8_hit, label %load8_rom, label %check_load8_region_0\n", .{});
+        try writer.print("  br i1 %rom8_hit, label %load8_rom, label %check_load8_rom_default\n", .{});
         try writer.print("load8_rom:\n", .{});
         try writer.print(
             "  %rom8_ptr = getelementptr inbounds [{d} x i8], ptr @rom_data, i32 0, i32 %rom8_offset\n",
@@ -693,6 +701,15 @@ fn emitLoad8Helper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
         try writer.print("  %rom8_value = load i8, ptr %rom8_ptr, align 1\n", .{});
         try writer.print("  %rom8_i32 = zext i8 %rom8_value to i32\n", .{});
         try writer.print("  ret i32 %rom8_i32\n", .{});
+        try writer.print("check_load8_rom_default:\n", .{});
+        try writer.print("  br i1 %rom8_window_hit, label %load8_rom_default, label %check_load8_region_0\n", .{});
+        try writer.print("load8_rom_default:\n", .{});
+        try writer.print("  %rom8_default_halfword = lshr i32 %addr, 1\n", .{});
+        try writer.print("  %rom8_default_shift_sel = and i32 %addr, 1\n", .{});
+        try writer.print("  %rom8_default_shift = shl i32 %rom8_default_shift_sel, 3\n", .{});
+        try writer.print("  %rom8_default_shifted = lshr i32 %rom8_default_halfword, %rom8_default_shift\n", .{});
+        try writer.print("  %rom8_default_byte = and i32 %rom8_default_shifted, 255\n", .{});
+        try writer.print("  ret i32 %rom8_default_byte\n", .{});
     } else {
         switch (program.save_hardware) {
             .none => {
@@ -703,7 +720,7 @@ fn emitLoad8Helper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
             .sram, .flash64, .flash128 => {
                 try writer.print("  br i1 %save_hit8, label %load8_save_sram, label %check_load8_region_0\n", .{});
                 try writer.print("load8_save_sram:\n", .{});
-                try emitSaveNormalizedOffset(writer, "addr", "load8");
+                try emitSaveNormalizedOffset(writer, "addr", "load8", saveMirrorLen(program.save_hardware));
                 if (program.save_hardware == .flash128) {
                     try writer.print("  %load8_save_bank = load i32, ptr %save_bank_load8_ptr, align 4\n", .{});
                     try writer.print("  %load8_save_bank_base = shl i32 %load8_save_bank, 16\n", .{});
@@ -827,7 +844,7 @@ fn emitSizedLoadHelper(
             .sram, .flash64, .flash128 => {
                 try writer.print("  br i1 %{s}_save_hit, label %{s}_save_sram, label %check_{s}_rom\n", .{ load_name, load_name, load_name });
                 try writer.print("{s}_save_sram:\n", .{load_name});
-                try emitSaveNormalizedOffset(writer, "addr", load_name);
+                try emitSaveNormalizedOffset(writer, "addr", load_name, saveMirrorLen(program.save_hardware));
                 if (program.save_hardware == .flash128) {
                     try writer.print("  %{s}_save_bank = load i32, ptr %save_{s}_bank_ptr, align 4\n", .{ load_name, load_name });
                     try writer.print("  %{s}_save_bank_base = shl i32 %{s}_save_bank, 16\n", .{ load_name, load_name });
@@ -895,7 +912,7 @@ fn emitSizedLoadHelper(
             .sram, .flash64, .flash128 => {
                 try writer.print("  br i1 %{s}_save_hit, label %{s}_save_sram, label %check_{s}_region_0\n", .{ load_name, load_name, load_name });
                 try writer.print("{s}_save_sram:\n", .{load_name});
-                try emitSaveNormalizedOffset(writer, "addr", load_name);
+                try emitSaveNormalizedOffset(writer, "addr", load_name, saveMirrorLen(program.save_hardware));
                 if (program.save_hardware == .flash128) {
                     try writer.print("  %{s}_save_bank = load i32, ptr %save_{s}_bank_ptr, align 4\n", .{ load_name, load_name });
                     try writer.print("  %{s}_save_bank_base = shl i32 %{s}_save_bank, 16\n", .{ load_name, load_name });
@@ -1008,7 +1025,7 @@ fn emitStoreHelper(writer: *Io.Writer, program: Program, bits: u16) Io.Writer.Er
                 0,
             });
             try writer.print("store_save_{d}:\n", .{bits});
-            try emitSaveNormalizedOffset(writer, "addr", store_name);
+            try emitSaveNormalizedOffset(writer, "addr", store_name, saveMirrorLen(program.save_hardware));
             try writer.print(
                 "  %save_store_ptr_{d} = getelementptr inbounds [131072 x i8], ptr %save_ptr_{d}, i32 0, i32 %{s}_save_offset\n",
                 .{ bits, bits, store_name },
@@ -1053,7 +1070,7 @@ fn emitStoreHelper(writer: *Io.Writer, program: Program, bits: u16) Io.Writer.Er
                 0,
             });
             try writer.print("store_save_{d}:\n", .{bits});
-            try emitSaveNormalizedOffset(writer, "addr", store_name);
+            try emitSaveNormalizedOffset(writer, "addr", store_name, saveMirrorLen(program.save_hardware));
             if (program.save_hardware == .flash128) {
                 try writer.print("  %flash_bank_{d} = load i32, ptr %flash_bank_ptr_{d}, align 4\n", .{ bits, bits });
                 try writer.print("  %flash_bank_base_{d} = shl i32 %flash_bank_{d}, 16\n", .{ bits, bits });
