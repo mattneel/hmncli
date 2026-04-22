@@ -14,5 +14,5 @@ git checkout db70fa29a0baae12c5c7603426d8535ebb5cc6ed
 
 for demo in basic/sbb_reg basic/obj_demo basic/key_demo ext/irq_demo; do
   make -C "$demo"
-  cp "$demo/$(basename "$demo").gba" "$fixture_dir/$(basename "$demo").gba"
+  install -m 0644 "$demo/$(basename "$demo").gba" "$fixture_dir/$(basename "$demo").gba"
 done
