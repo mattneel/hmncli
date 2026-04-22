@@ -5,6 +5,7 @@ const armv4t_decode = @import("armv4t_decode.zig");
 pub const OutputMode = enum {
     register_r0_decimal,
     memory_summary,
+    arm_report,
 };
 
 pub const InstructionNode = struct {
@@ -101,6 +102,8 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
         "@.fmt_mem = private unnamed_addr constant [79 x i8] c\"IO0=%08X IO8=%08X PAL0=%08X PAL2=%08X VRAM4000=%08X MAP0800=%08X MAP0804=%08X\\0A\\00\", align 1\n",
         .{},
     );
+    try writer.print("@.fmt_arm_pass = private unnamed_addr constant [6 x i8] c\"PASS\\0A\\00\", align 1\n", .{});
+    try writer.print("@.fmt_arm_fail = private unnamed_addr constant [9 x i8] c\"FAIL %d\\0A\\00\", align 1\n", .{});
     try writer.print("declare i32 @printf(ptr, ...)\n", .{});
     try writer.print("declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg)\n\n", .{});
     try writer.print("declare {{ i32, i1 }} @llvm.sadd.with.overflow.i32(i32, i32)\n", .{});
@@ -377,6 +380,7 @@ fn emitMain(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
 
 fn emitInstructionBlock(writer: *Io.Writer, function: Function, node: InstructionNode) Io.Writer.Error!void {
     try writer.print("pc_{x:0>8}:\n", .{node.address});
+    try emitArchitecturalPcState(writer, function.entry.isa, node.address);
     if (node.condition != .al and !instructionHandlesOwnCondition(node.instruction)) {
         try emitBranchCondition(writer, "state", node.address, node.condition);
         try writer.print(
@@ -405,6 +409,10 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             try writer.print("  store i32 {d}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ mov.imm, node.address });
             try writer.print("  %movs_imm_val_{x:0>8} = or i32 {d}, 0\n", .{ node.address, mov.imm });
             try emitUpdateNzFlags(writer, "state", node.address, "movs_imm_val");
+            if (mov.carry) |carry| {
+                try emitFlagPtr(writer, "state", node.address, .c);
+                try writer.print("  store i1 {s}, ptr %flag_c_ptr_{x:0>8}, align 1\n", .{ boolLiteral(carry), node.address });
+            }
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .mvn_imm => |mvn| {
@@ -420,6 +428,10 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             }
             try emitRegPtr(writer, "state", node.address, "rm", mov.rm);
             try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            if (mov.rd == 15) {
+                try emitPcDispatch(writer, function, node.address, "rm_val");
+                return;
+            }
             try emitRegPtr(writer, "state", node.address, "rd", mov.rd);
             try writer.print("  store i32 %rm_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
@@ -443,6 +455,23 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             try writer.print("  %orr_val_{x:0>8} = or i32 %rn_val_{x:0>8}, {d}\n", .{ node.address, node.address, orr.imm });
             try emitRegPtr(writer, "state", node.address, "rd", orr.rd);
             try writer.print("  store i32 %orr_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .eor_imm => |eor| {
+            try emitRegPtr(writer, "state", node.address, "rn", eor.rn);
+            try writer.print("  %rn_val_{x:0>8} = load i32, ptr %rn_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try writer.print("  %eor_val_{x:0>8} = xor i32 %rn_val_{x:0>8}, {d}\n", .{ node.address, node.address, eor.imm });
+            try emitRegPtr(writer, "state", node.address, "rd", eor.rd);
+            try writer.print("  store i32 %eor_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .bic_imm => |bic| {
+            try emitRegPtr(writer, "state", node.address, "rn", bic.rn);
+            try writer.print("  %rn_val_{x:0>8} = load i32, ptr %rn_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try writer.print("  %bic_mask_{x:0>8} = xor i32 {d}, -1\n", .{ node.address, bic.imm });
+            try writer.print("  %bic_val_{x:0>8} = and i32 %rn_val_{x:0>8}, %bic_mask_{x:0>8}\n", .{ node.address, node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rd", bic.rd);
+            try writer.print("  store i32 %bic_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .orr_shift_reg => |orr| {
@@ -491,12 +520,28 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             try writer.print("  store i32 %adcs_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
+        .adc_imm => |add| {
+            try emitRegPtr(writer, "state", node.address, "rn", add.rn);
+            try writer.print("  %rn_val_{x:0>8} = load i32, ptr %rn_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitAdcImmValue(writer, "state", node.address, "rn_val", add.imm, "adc_val");
+            try emitRegPtr(writer, "state", node.address, "rd", add.rd);
+            try writer.print("  store i32 %adc_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
         .sbcs_imm => |sub| {
             try emitRegPtr(writer, "state", node.address, "rn", sub.rn);
             try writer.print("  %rn_val_{x:0>8} = load i32, ptr %rn_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitSbcImmWithFlags(writer, "state", node.address, "rn_val", sub.imm, "sbcs_val");
             try emitRegPtr(writer, "state", node.address, "rd", sub.rd);
             try writer.print("  store i32 %sbcs_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .sbc_imm => |sub| {
+            try emitRegPtr(writer, "state", node.address, "rn", sub.rn);
+            try writer.print("  %rn_val_{x:0>8} = load i32, ptr %rn_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitSbcImmValue(writer, "state", node.address, "rn_val", sub.imm, "sbc_val");
+            try emitRegPtr(writer, "state", node.address, "rd", sub.rd);
+            try writer.print("  store i32 %sbc_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .add_reg => |add| {
@@ -507,6 +552,22 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             try writer.print("  %add_val_{x:0>8} = add i32 %rn_val_{x:0>8}, %rm_val_{x:0>8}\n", .{ node.address, node.address, node.address });
             try emitRegPtr(writer, "state", node.address, "rd", add.rd);
             try writer.print("  store i32 %add_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .rsb_imm => |sub| {
+            try emitRegPtr(writer, "state", node.address, "rn", sub.rn);
+            try writer.print("  %rn_val_{x:0>8} = load i32, ptr %rn_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try writer.print("  %rsb_val_{x:0>8} = sub i32 {d}, %rn_val_{x:0>8}\n", .{ node.address, sub.imm, node.address });
+            try emitRegPtr(writer, "state", node.address, "rd", sub.rd);
+            try writer.print("  store i32 %rsb_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .rsc_imm => |sub| {
+            try emitRegPtr(writer, "state", node.address, "rn", sub.rn);
+            try writer.print("  %rn_val_{x:0>8} = load i32, ptr %rn_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRscImmValue(writer, "state", node.address, sub.imm, "rn_val", "rsc_val");
+            try emitRegPtr(writer, "state", node.address, "rd", sub.rd);
+            try writer.print("  store i32 %rsc_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .sub_imm => |sub| {
@@ -533,12 +594,56 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             try writer.print("  store i32 %lsl_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
+        .lsl_reg => |lsl| {
+            try emitRegPtr(writer, "state", node.address, "rm", lsl.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rs", lsl.rs);
+            try writer.print("  %rs_val_{x:0>8} = load i32, ptr %rs_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitLslRegValue(writer, node.address, "rm_val", "rs_val", "lsl_val");
+            try emitRegPtr(writer, "state", node.address, "rd", lsl.rd);
+            try writer.print("  store i32 %lsl_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .asr_imm => |asr| {
+            try emitRegPtr(writer, "state", node.address, "rm", asr.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitAsrImmValue(writer, node.address, "rm_val", asr.imm, "asr_val");
+            try emitRegPtr(writer, "state", node.address, "rd", asr.rd);
+            try writer.print("  store i32 %asr_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .asr_reg => |asr| {
+            try emitRegPtr(writer, "state", node.address, "rm", asr.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rs", asr.rs);
+            try writer.print("  %rs_val_{x:0>8} = load i32, ptr %rs_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitAsrRegValue(writer, node.address, "rm_val", "rs_val", "asr_val");
+            try emitRegPtr(writer, "state", node.address, "rd", asr.rd);
+            try writer.print("  store i32 %asr_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
         .lsls_imm => |lsl| {
             try emitRegPtr(writer, "state", node.address, "rm", lsl.rm);
             try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitLslsImmWithFlags(writer, "state", node.address, "rm_val", lsl.imm, "lsls_val");
             try emitRegPtr(writer, "state", node.address, "rd", lsl.rd);
             try writer.print("  store i32 %lsls_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .lsrs_imm => |lsr| {
+            try emitRegPtr(writer, "state", node.address, "rm", lsr.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitLsrsImmWithFlags(writer, "state", node.address, "rm_val", lsr.imm, "lsr_val");
+            try emitRegPtr(writer, "state", node.address, "rd", lsr.rd);
+            try writer.print("  store i32 %lsr_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .asrs_imm => |asr| {
+            try emitRegPtr(writer, "state", node.address, "rm", asr.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitAsrsImmWithFlags(writer, "state", node.address, "rm_val", asr.imm, "asr_val");
+            try emitRegPtr(writer, "state", node.address, "rd", asr.rd);
+            try writer.print("  store i32 %asr_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .lsls_reg => |lsl| {
@@ -554,9 +659,83 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
         .lsr_imm => |lsr| {
             try emitRegPtr(writer, "state", node.address, "rm", lsr.rm);
             try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
-            try writer.print("  %lsr_val_{x:0>8} = lshr i32 %rm_val_{x:0>8}, {d}\n", .{ node.address, node.address, lsr.imm });
+            try emitLsrImmValue(writer, node.address, "rm_val", lsr.imm, "lsr_val");
             try emitRegPtr(writer, "state", node.address, "rd", lsr.rd);
             try writer.print("  store i32 %lsr_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .lsr_reg => |lsr| {
+            try emitRegPtr(writer, "state", node.address, "rm", lsr.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rs", lsr.rs);
+            try writer.print("  %rs_val_{x:0>8} = load i32, ptr %rs_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitLsrRegValue(writer, node.address, "rm_val", "rs_val", "lsr_val");
+            try emitRegPtr(writer, "state", node.address, "rd", lsr.rd);
+            try writer.print("  store i32 %lsr_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .lsrs_reg => |lsr| {
+            try emitRegPtr(writer, "state", node.address, "rm", lsr.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rs", lsr.rs);
+            try writer.print("  %rs_val_{x:0>8} = load i32, ptr %rs_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitLsrsRegWithFlags(writer, "state", node.address, "rm_val", "rs_val", "lsr_val");
+            try emitRegPtr(writer, "state", node.address, "rd", lsr.rd);
+            try writer.print("  store i32 %lsr_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .asrs_reg => |asr| {
+            try emitRegPtr(writer, "state", node.address, "rm", asr.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rs", asr.rs);
+            try writer.print("  %rs_val_{x:0>8} = load i32, ptr %rs_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitAsrsRegWithFlags(writer, "state", node.address, "rm_val", "rs_val", "asr_val");
+            try emitRegPtr(writer, "state", node.address, "rd", asr.rd);
+            try writer.print("  store i32 %asr_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .ror_imm => |ror| {
+            try emitRegPtr(writer, "state", node.address, "rm", ror.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRorImmValue(writer, node.address, "rm_val", ror.imm, "ror_val");
+            try emitRegPtr(writer, "state", node.address, "rd", ror.rd);
+            try writer.print("  store i32 %ror_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .ror_reg => |ror| {
+            try emitRegPtr(writer, "state", node.address, "rm", ror.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rs", ror.rs);
+            try writer.print("  %rs_val_{x:0>8} = load i32, ptr %rs_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRorRegValue(writer, node.address, "rm_val", "rs_val", "ror_val");
+            try emitRegPtr(writer, "state", node.address, "rd", ror.rd);
+            try writer.print("  store i32 %ror_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .rors_imm => |ror| {
+            try emitRegPtr(writer, "state", node.address, "rm", ror.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRorsImmWithFlags(writer, "state", node.address, "rm_val", ror.imm, "ror_val");
+            try emitRegPtr(writer, "state", node.address, "rd", ror.rd);
+            try writer.print("  store i32 %ror_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .rors_reg => |ror| {
+            try emitRegPtr(writer, "state", node.address, "rm", ror.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rs", ror.rs);
+            try writer.print("  %rs_val_{x:0>8} = load i32, ptr %rs_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRorsRegWithFlags(writer, "state", node.address, "rm_val", "rs_val", "ror_val");
+            try emitRegPtr(writer, "state", node.address, "rd", ror.rd);
+            try writer.print("  store i32 %ror_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .rrxs => |rrx| {
+            try emitRegPtr(writer, "state", node.address, "rm", rrx.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRrxsWithFlags(writer, "state", node.address, "rm_val", "rrx_val");
+            try emitRegPtr(writer, "state", node.address, "rd", rrx.rd);
+            try writer.print("  store i32 %rrx_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .mla => |mla| {
@@ -607,6 +786,29 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             try emitRegPtr(writer, "state", node.address, "rn", cmp.rn);
             try writer.print("  %rn_val_{x:0>8} = load i32, ptr %rn_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitSubImmWithFlags(writer, "state", node.address, "rn_val", cmp.imm, "cmp_val");
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .cmp_reg => |cmp| {
+            try emitRegPtr(writer, "state", node.address, "rn", cmp.rn);
+            try writer.print("  %rn_val_{x:0>8} = load i32, ptr %rn_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rm", cmp.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitSubRegWithFlags(writer, "state", node.address, "rn_val", "rm_val", "cmp_val");
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .cmn_reg => |cmn| {
+            try emitRegPtr(writer, "state", node.address, "rn", cmn.rn);
+            try writer.print("  %rn_val_{x:0>8} = load i32, ptr %rn_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rm", cmn.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitAddRegWithFlags(writer, "state", node.address, "rn_val", "rm_val", "cmn_val");
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .teq_imm => |teq| {
+            try emitRegPtr(writer, "state", node.address, "rn", teq.rn);
+            try writer.print("  %rn_val_{x:0>8} = load i32, ptr %rn_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try writer.print("  %teq_val_{x:0>8} = xor i32 %rn_val_{x:0>8}, {d}\n", .{ node.address, node.address, teq.imm });
+            try emitUpdateNzFlags(writer, "state", node.address, "teq_val");
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .store => |store| {
@@ -847,6 +1049,65 @@ fn emitAddImmWithFlags(
     try writer.print("  store i1 %add_signed_overflow_{x:0>8}, ptr %flag_v_ptr_{x:0>8}, align 1\n", .{ address, address });
 }
 
+fn emitAddRegWithFlags(
+    writer: *Io.Writer,
+    state_name: []const u8,
+    address: u32,
+    lhs_prefix: []const u8,
+    rhs_prefix: []const u8,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try writer.print(
+        "  %sadd_pair_{x:0>8} = call {{ i32, i1 }} @llvm.sadd.with.overflow.i32(i32 %{s}_{x:0>8}, i32 %{s}_{x:0>8})\n",
+        .{ address, lhs_prefix, address, rhs_prefix, address },
+    );
+    try writer.print(
+        "  %uadd_pair_{x:0>8} = call {{ i32, i1 }} @llvm.uadd.with.overflow.i32(i32 %{s}_{x:0>8}, i32 %{s}_{x:0>8})\n",
+        .{ address, lhs_prefix, address, rhs_prefix, address },
+    );
+    try writer.print(
+        "  %{s}_{x:0>8} = extractvalue {{ i32, i1 }} %sadd_pair_{x:0>8}, 0\n",
+        .{ result_prefix, address, address },
+    );
+    try writer.print("  %add_signed_overflow_{x:0>8} = extractvalue {{ i32, i1 }} %sadd_pair_{x:0>8}, 1\n", .{ address, address });
+    try writer.print("  %add_unsigned_overflow_{x:0>8} = extractvalue {{ i32, i1 }} %uadd_pair_{x:0>8}, 1\n", .{ address, address });
+    try emitUpdateNzFlags(writer, state_name, address, result_prefix);
+    try emitFlagPtr(writer, state_name, address, .c);
+    try writer.print("  store i1 %add_unsigned_overflow_{x:0>8}, ptr %flag_c_ptr_{x:0>8}, align 1\n", .{ address, address });
+    try emitFlagPtr(writer, state_name, address, .v);
+    try writer.print("  store i1 %add_signed_overflow_{x:0>8}, ptr %flag_v_ptr_{x:0>8}, align 1\n", .{ address, address });
+}
+
+fn emitSubRegWithFlags(
+    writer: *Io.Writer,
+    state_name: []const u8,
+    address: u32,
+    lhs_prefix: []const u8,
+    rhs_prefix: []const u8,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try writer.print(
+        "  %ssub_pair_{x:0>8} = call {{ i32, i1 }} @llvm.ssub.with.overflow.i32(i32 %{s}_{x:0>8}, i32 %{s}_{x:0>8})\n",
+        .{ address, lhs_prefix, address, rhs_prefix, address },
+    );
+    try writer.print(
+        "  %usub_pair_{x:0>8} = call {{ i32, i1 }} @llvm.usub.with.overflow.i32(i32 %{s}_{x:0>8}, i32 %{s}_{x:0>8})\n",
+        .{ address, lhs_prefix, address, rhs_prefix, address },
+    );
+    try writer.print(
+        "  %{s}_{x:0>8} = extractvalue {{ i32, i1 }} %ssub_pair_{x:0>8}, 0\n",
+        .{ result_prefix, address, address },
+    );
+    try writer.print("  %sub_signed_overflow_{x:0>8} = extractvalue {{ i32, i1 }} %ssub_pair_{x:0>8}, 1\n", .{ address, address });
+    try writer.print("  %sub_unsigned_overflow_{x:0>8} = extractvalue {{ i32, i1 }} %usub_pair_{x:0>8}, 1\n", .{ address, address });
+    try emitUpdateNzFlags(writer, state_name, address, result_prefix);
+    try writer.print("  %sub_carry_{x:0>8} = xor i1 %sub_unsigned_overflow_{x:0>8}, true\n", .{ address, address });
+    try emitFlagPtr(writer, state_name, address, .c);
+    try writer.print("  store i1 %sub_carry_{x:0>8}, ptr %flag_c_ptr_{x:0>8}, align 1\n", .{ address, address });
+    try emitFlagPtr(writer, state_name, address, .v);
+    try writer.print("  store i1 %sub_signed_overflow_{x:0>8}, ptr %flag_v_ptr_{x:0>8}, align 1\n", .{ address, address });
+}
+
 fn emitAdcImmWithFlags(
     writer: *Io.Writer,
     state_name: []const u8,
@@ -897,6 +1158,20 @@ fn emitAdcImmWithFlags(
     try writer.print("  store i1 %adc_carry_{x:0>8}, ptr %flag_c_ptr_{x:0>8}, align 1\n", .{ address, address });
     try emitFlagPtr(writer, state_name, address, .v);
     try writer.print("  store i1 %adc_overflow_{x:0>8}, ptr %flag_v_ptr_{x:0>8}, align 1\n", .{ address, address });
+}
+
+fn emitAdcImmValue(
+    writer: *Io.Writer,
+    state_name: []const u8,
+    address: u32,
+    lhs_prefix: []const u8,
+    imm: u32,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try emitFlagLoad(writer, state_name, address, .c);
+    try writer.print("  %adc_carry_in_{x:0>8} = zext i1 %flag_c_val_{x:0>8} to i32\n", .{ address, address });
+    try writer.print("  %adc_sum_0_{x:0>8} = add i32 %{s}_{x:0>8}, {d}\n", .{ address, lhs_prefix, address, imm });
+    try writer.print("  %{s}_{x:0>8} = add i32 %adc_sum_0_{x:0>8}, %adc_carry_in_{x:0>8}\n", .{ result_prefix, address, address, address });
 }
 
 fn emitSbcImmWithFlags(
@@ -953,6 +1228,139 @@ fn emitSbcImmWithFlags(
     try writer.print("  store i1 %sbc_overflow_{x:0>8}, ptr %flag_v_ptr_{x:0>8}, align 1\n", .{ address, address });
 }
 
+fn emitSbcImmValue(
+    writer: *Io.Writer,
+    state_name: []const u8,
+    address: u32,
+    lhs_prefix: []const u8,
+    imm: u32,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try emitFlagLoad(writer, state_name, address, .c);
+    try writer.print("  %sbc_borrow_in_{x:0>8} = xor i1 %flag_c_val_{x:0>8}, true\n", .{ address, address });
+    try writer.print("  %sbc_borrow_i32_{x:0>8} = zext i1 %sbc_borrow_in_{x:0>8} to i32\n", .{ address, address });
+    try writer.print("  %sbc_sum_0_{x:0>8} = sub i32 %{s}_{x:0>8}, {d}\n", .{ address, lhs_prefix, address, imm });
+    try writer.print("  %{s}_{x:0>8} = sub i32 %sbc_sum_0_{x:0>8}, %sbc_borrow_i32_{x:0>8}\n", .{ result_prefix, address, address, address });
+}
+
+fn emitRscImmValue(
+    writer: *Io.Writer,
+    state_name: []const u8,
+    address: u32,
+    imm: u32,
+    rhs_prefix: []const u8,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try emitFlagLoad(writer, state_name, address, .c);
+    try writer.print("  %rsc_borrow_in_{x:0>8} = xor i1 %flag_c_val_{x:0>8}, true\n", .{ address, address });
+    try writer.print("  %rsc_borrow_i32_{x:0>8} = zext i1 %rsc_borrow_in_{x:0>8} to i32\n", .{ address, address });
+    try writer.print("  %rsc_sum_0_{x:0>8} = sub i32 {d}, %{s}_{x:0>8}\n", .{ address, imm, rhs_prefix, address });
+    try writer.print("  %{s}_{x:0>8} = sub i32 %rsc_sum_0_{x:0>8}, %rsc_borrow_i32_{x:0>8}\n", .{ result_prefix, address, address, address });
+}
+
+fn emitAsrImmValue(
+    writer: *Io.Writer,
+    address: u32,
+    value_prefix: []const u8,
+    imm: u32,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    const shift_amount = if (imm >= 32) 31 else imm;
+    try writer.print(
+        "  %{s}_{x:0>8} = ashr i32 %{s}_{x:0>8}, {d}\n",
+        .{ result_prefix, address, value_prefix, address, shift_amount },
+    );
+}
+
+fn emitAsrsImmWithFlags(
+    writer: *Io.Writer,
+    state_name: []const u8,
+    address: u32,
+    value_prefix: []const u8,
+    imm: u32,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try emitAsrImmValue(writer, address, value_prefix, imm, result_prefix);
+    try emitUpdateNzFlags(writer, state_name, address, result_prefix);
+    const carry_shift_amount = if (imm >= 32) 31 else imm - 1;
+    try writer.print(
+        "  %asr_carry_src_{x:0>8} = lshr i32 %{s}_{x:0>8}, {d}\n",
+        .{ address, value_prefix, address, carry_shift_amount },
+    );
+    try writer.print("  %asr_carry_bit_{x:0>8} = and i32 %asr_carry_src_{x:0>8}, 1\n", .{ address, address });
+    try writer.print("  %asr_carry_{x:0>8} = icmp ne i32 %asr_carry_bit_{x:0>8}, 0\n", .{ address, address });
+    try emitFlagPtr(writer, state_name, address, .c);
+    try writer.print("  store i1 %asr_carry_{x:0>8}, ptr %flag_c_ptr_{x:0>8}, align 1\n", .{ address, address });
+}
+
+fn emitLsrImmValue(
+    writer: *Io.Writer,
+    address: u32,
+    value_prefix: []const u8,
+    imm: u32,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    if (imm >= 32) {
+        try writer.print("  %{s}_{x:0>8} = and i32 %{s}_{x:0>8}, 0\n", .{ result_prefix, address, value_prefix, address });
+        return;
+    }
+    try writer.print(
+        "  %{s}_{x:0>8} = lshr i32 %{s}_{x:0>8}, {d}\n",
+        .{ result_prefix, address, value_prefix, address, imm },
+    );
+}
+
+fn emitLsrsImmWithFlags(
+    writer: *Io.Writer,
+    state_name: []const u8,
+    address: u32,
+    value_prefix: []const u8,
+    imm: u32,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try emitLsrImmValue(writer, address, value_prefix, imm, result_prefix);
+    try emitUpdateNzFlags(writer, state_name, address, result_prefix);
+    const carry_shift_amount = if (imm >= 32) 31 else imm - 1;
+    try writer.print(
+        "  %lsr_carry_src_{x:0>8} = lshr i32 %{s}_{x:0>8}, {d}\n",
+        .{ address, value_prefix, address, carry_shift_amount },
+    );
+    try writer.print("  %lsr_carry_bit_{x:0>8} = and i32 %lsr_carry_src_{x:0>8}, 1\n", .{ address, address });
+    try writer.print("  %lsr_carry_{x:0>8} = icmp ne i32 %lsr_carry_bit_{x:0>8}, 0\n", .{ address, address });
+    try emitFlagPtr(writer, state_name, address, .c);
+    try writer.print("  store i1 %lsr_carry_{x:0>8}, ptr %flag_c_ptr_{x:0>8}, align 1\n", .{ address, address });
+}
+
+fn emitRorImmValue(
+    writer: *Io.Writer,
+    address: u32,
+    value_prefix: []const u8,
+    imm: u32,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try emitShiftImm(writer, address, value_prefix, result_prefix, .{
+        .kind = .ror,
+        .amount = imm,
+    });
+}
+
+fn emitRorsImmWithFlags(
+    writer: *Io.Writer,
+    state_name: []const u8,
+    address: u32,
+    value_prefix: []const u8,
+    imm: u32,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try emitRorImmValue(writer, address, value_prefix, imm, result_prefix);
+    try emitUpdateNzFlags(writer, state_name, address, result_prefix);
+    try writer.print("  %ror_carry_src_{x:0>8} = lshr i32 %{s}_{x:0>8}, 31\n", .{ address, result_prefix, address });
+    try writer.print("  %ror_carry_bit_{x:0>8} = and i32 %ror_carry_src_{x:0>8}, 1\n", .{ address, address });
+    try writer.print("  %ror_carry_{x:0>8} = icmp ne i32 %ror_carry_bit_{x:0>8}, 0\n", .{ address, address });
+    try emitFlagPtr(writer, state_name, address, .c);
+    try writer.print("  store i1 %ror_carry_{x:0>8}, ptr %flag_c_ptr_{x:0>8}, align 1\n", .{ address, address });
+}
+
 fn emitLslsImmWithFlags(
     writer: *Io.Writer,
     state_name: []const u8,
@@ -985,6 +1393,45 @@ fn emitLslsImmWithFlags(
     try writer.print("  store i1 %lsls_carry_{x:0>8}, ptr %flag_c_ptr_{x:0>8}, align 1\n", .{ address, address });
 }
 
+fn emitLslRegValue(
+    writer: *Io.Writer,
+    address: u32,
+    value_prefix: []const u8,
+    amount_prefix: []const u8,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try writer.print("  %lsl_amount_{x:0>8} = and i32 %{s}_{x:0>8}, 255\n", .{ address, amount_prefix, address });
+    try writer.print("  %lsl_is_zero_{x:0>8} = icmp eq i32 %lsl_amount_{x:0>8}, 0\n", .{ address, address });
+    try writer.print(
+        "  br i1 %lsl_is_zero_{x:0>8}, label %lsl_zero_{x:0>8}, label %lsl_nonzero_{x:0>8}\n",
+        .{ address, address, address },
+    );
+    try writer.print("lsl_zero_{x:0>8}:\n", .{address});
+    try writer.print("  br label %lsl_join_{x:0>8}\n", .{address});
+
+    try writer.print("lsl_nonzero_{x:0>8}:\n", .{address});
+    try writer.print("  %lsl_lt32_{x:0>8} = icmp ult i32 %lsl_amount_{x:0>8}, 32\n", .{ address, address });
+    try writer.print(
+        "  br i1 %lsl_lt32_{x:0>8}, label %lsl_lt32_block_{x:0>8}, label %lsl_ge32_{x:0>8}\n",
+        .{ address, address, address },
+    );
+    try writer.print("lsl_lt32_block_{x:0>8}:\n", .{address});
+    try writer.print(
+        "  %lsl_lt32_result_{x:0>8} = shl i32 %{s}_{x:0>8}, %lsl_amount_{x:0>8}\n",
+        .{ address, value_prefix, address, address },
+    );
+    try writer.print("  br label %lsl_join_{x:0>8}\n", .{address});
+
+    try writer.print("lsl_ge32_{x:0>8}:\n", .{address});
+    try writer.print("  br label %lsl_join_{x:0>8}\n", .{address});
+
+    try writer.print("lsl_join_{x:0>8}:\n", .{address});
+    try writer.print(
+        "  %{s}_{x:0>8} = phi i32 [ %{s}_{x:0>8}, %lsl_zero_{x:0>8} ], [ %lsl_lt32_result_{x:0>8}, %lsl_lt32_block_{x:0>8} ], [ 0, %lsl_ge32_{x:0>8} ]\n",
+        .{ result_prefix, address, value_prefix, address, address, address, address, address },
+    );
+}
+
 fn emitLslsRegWithFlags(
     writer: *Io.Writer,
     state_name: []const u8,
@@ -994,7 +1441,8 @@ fn emitLslsRegWithFlags(
     result_prefix: []const u8,
 ) Io.Writer.Error!void {
     try emitFlagLoad(writer, state_name, address, .c);
-    try writer.print("  %lsls_is_zero_{x:0>8} = icmp eq i32 %{s}_{x:0>8}, 0\n", .{ address, amount_prefix, address });
+    try writer.print("  %lsls_amount_{x:0>8} = and i32 %{s}_{x:0>8}, 255\n", .{ address, amount_prefix, address });
+    try writer.print("  %lsls_is_zero_{x:0>8} = icmp eq i32 %lsls_amount_{x:0>8}, 0\n", .{ address, address });
     try writer.print(
         "  br i1 %lsls_is_zero_{x:0>8}, label %lsls_zero_{x:0>8}, label %lsls_nonzero_{x:0>8}\n",
         .{ address, address, address },
@@ -1003,7 +1451,7 @@ fn emitLslsRegWithFlags(
     try writer.print("  br label %lsls_join_{x:0>8}\n", .{address});
 
     try writer.print("lsls_nonzero_{x:0>8}:\n", .{address});
-    try writer.print("  %lsls_lt32_{x:0>8} = icmp ult i32 %{s}_{x:0>8}, 32\n", .{ address, amount_prefix, address });
+    try writer.print("  %lsls_lt32_{x:0>8} = icmp ult i32 %lsls_amount_{x:0>8}, 32\n", .{ address, address });
     try writer.print(
         "  br i1 %lsls_lt32_{x:0>8}, label %lsls_lt32_block_{x:0>8}, label %lsls_ge32_{x:0>8}\n",
         .{ address, address, address },
@@ -1011,10 +1459,10 @@ fn emitLslsRegWithFlags(
 
     try writer.print("lsls_lt32_block_{x:0>8}:\n", .{address});
     try writer.print(
-        "  %lsls_lt32_result_{x:0>8} = shl i32 %{s}_{x:0>8}, %{s}_{x:0>8}\n",
-        .{ address, value_prefix, address, amount_prefix, address },
+        "  %lsls_lt32_result_{x:0>8} = shl i32 %{s}_{x:0>8}, %lsls_amount_{x:0>8}\n",
+        .{ address, value_prefix, address, address },
     );
-    try writer.print("  %lsls_carry_shift_{x:0>8} = sub i32 32, %{s}_{x:0>8}\n", .{ address, amount_prefix, address });
+    try writer.print("  %lsls_carry_shift_{x:0>8} = sub i32 32, %lsls_amount_{x:0>8}\n", .{ address, address });
     try writer.print(
         "  %lsls_lt32_carry_src_{x:0>8} = lshr i32 %{s}_{x:0>8}, %lsls_carry_shift_{x:0>8}\n",
         .{ address, value_prefix, address, address },
@@ -1024,7 +1472,7 @@ fn emitLslsRegWithFlags(
     try writer.print("  br label %lsls_join_{x:0>8}\n", .{address});
 
     try writer.print("lsls_ge32_{x:0>8}:\n", .{address});
-    try writer.print("  %lsls_eq32_{x:0>8} = icmp eq i32 %{s}_{x:0>8}, 32\n", .{ address, amount_prefix, address });
+    try writer.print("  %lsls_eq32_{x:0>8} = icmp eq i32 %lsls_amount_{x:0>8}, 32\n", .{ address, address });
     try writer.print(
         "  br i1 %lsls_eq32_{x:0>8}, label %lsls_eq32_block_{x:0>8}, label %lsls_gt32_block_{x:0>8}\n",
         .{ address, address, address },
@@ -1049,6 +1497,321 @@ fn emitLslsRegWithFlags(
     );
     try emitUpdateNzFlags(writer, state_name, address, result_prefix);
     try writer.print("  store i1 %lsls_reg_carry_{x:0>8}, ptr %flag_c_ptr_{x:0>8}, align 1\n", .{ address, address });
+}
+
+fn emitLsrRegValue(
+    writer: *Io.Writer,
+    address: u32,
+    value_prefix: []const u8,
+    amount_prefix: []const u8,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try writer.print("  %lsr_amount_{x:0>8} = and i32 %{s}_{x:0>8}, 255\n", .{ address, amount_prefix, address });
+    try writer.print("  %lsr_is_zero_{x:0>8} = icmp eq i32 %lsr_amount_{x:0>8}, 0\n", .{ address, address });
+    try writer.print(
+        "  br i1 %lsr_is_zero_{x:0>8}, label %lsr_zero_{x:0>8}, label %lsr_nonzero_{x:0>8}\n",
+        .{ address, address, address },
+    );
+    try writer.print("lsr_zero_{x:0>8}:\n", .{address});
+    try writer.print("  br label %lsr_join_{x:0>8}\n", .{address});
+
+    try writer.print("lsr_nonzero_{x:0>8}:\n", .{address});
+    try writer.print("  %lsr_lt32_{x:0>8} = icmp ult i32 %lsr_amount_{x:0>8}, 32\n", .{ address, address });
+    try writer.print(
+        "  br i1 %lsr_lt32_{x:0>8}, label %lsr_lt32_block_{x:0>8}, label %lsr_ge32_{x:0>8}\n",
+        .{ address, address, address },
+    );
+    try writer.print("lsr_lt32_block_{x:0>8}:\n", .{address});
+    try writer.print(
+        "  %lsr_lt32_result_{x:0>8} = lshr i32 %{s}_{x:0>8}, %lsr_amount_{x:0>8}\n",
+        .{ address, value_prefix, address, address },
+    );
+    try writer.print("  br label %lsr_join_{x:0>8}\n", .{address});
+
+    try writer.print("lsr_ge32_{x:0>8}:\n", .{address});
+    try writer.print("  br label %lsr_join_{x:0>8}\n", .{address});
+
+    try writer.print("lsr_join_{x:0>8}:\n", .{address});
+    try writer.print(
+        "  %{s}_{x:0>8} = phi i32 [ %{s}_{x:0>8}, %lsr_zero_{x:0>8} ], [ %lsr_lt32_result_{x:0>8}, %lsr_lt32_block_{x:0>8} ], [ 0, %lsr_ge32_{x:0>8} ]\n",
+        .{ result_prefix, address, value_prefix, address, address, address, address, address },
+    );
+}
+
+fn emitLsrsRegWithFlags(
+    writer: *Io.Writer,
+    state_name: []const u8,
+    address: u32,
+    value_prefix: []const u8,
+    amount_prefix: []const u8,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try emitFlagLoad(writer, state_name, address, .c);
+    try writer.print("  %lsrs_amount_{x:0>8} = and i32 %{s}_{x:0>8}, 255\n", .{ address, amount_prefix, address });
+    try writer.print("  %lsrs_is_zero_{x:0>8} = icmp eq i32 %lsrs_amount_{x:0>8}, 0\n", .{ address, address });
+    try writer.print(
+        "  br i1 %lsrs_is_zero_{x:0>8}, label %lsrs_zero_{x:0>8}, label %lsrs_nonzero_{x:0>8}\n",
+        .{ address, address, address },
+    );
+    try writer.print("lsrs_zero_{x:0>8}:\n", .{address});
+    try writer.print("  br label %lsrs_join_{x:0>8}\n", .{address});
+
+    try writer.print("lsrs_nonzero_{x:0>8}:\n", .{address});
+    try writer.print("  %lsrs_lt32_{x:0>8} = icmp ult i32 %lsrs_amount_{x:0>8}, 32\n", .{ address, address });
+    try writer.print(
+        "  br i1 %lsrs_lt32_{x:0>8}, label %lsrs_lt32_block_{x:0>8}, label %lsrs_ge32_{x:0>8}\n",
+        .{ address, address, address },
+    );
+
+    try writer.print("lsrs_lt32_block_{x:0>8}:\n", .{address});
+    try writer.print(
+        "  %lsrs_lt32_result_{x:0>8} = lshr i32 %{s}_{x:0>8}, %lsrs_amount_{x:0>8}\n",
+        .{ address, value_prefix, address, address },
+    );
+    try writer.print("  %lsrs_carry_shift_{x:0>8} = sub i32 %lsrs_amount_{x:0>8}, 1\n", .{ address, address });
+    try writer.print(
+        "  %lsrs_lt32_carry_src_{x:0>8} = lshr i32 %{s}_{x:0>8}, %lsrs_carry_shift_{x:0>8}\n",
+        .{ address, value_prefix, address, address },
+    );
+    try writer.print("  %lsrs_lt32_carry_bit_{x:0>8} = and i32 %lsrs_lt32_carry_src_{x:0>8}, 1\n", .{ address, address });
+    try writer.print("  %lsrs_lt32_carry_{x:0>8} = icmp ne i32 %lsrs_lt32_carry_bit_{x:0>8}, 0\n", .{ address, address });
+    try writer.print("  br label %lsrs_join_{x:0>8}\n", .{address});
+
+    try writer.print("lsrs_ge32_{x:0>8}:\n", .{address});
+    try writer.print("  %lsrs_eq32_{x:0>8} = icmp eq i32 %lsrs_amount_{x:0>8}, 32\n", .{ address, address });
+    try writer.print(
+        "  br i1 %lsrs_eq32_{x:0>8}, label %lsrs_eq32_block_{x:0>8}, label %lsrs_gt32_block_{x:0>8}\n",
+        .{ address, address, address },
+    );
+    try writer.print("lsrs_eq32_block_{x:0>8}:\n", .{address});
+    try writer.print("  %lsrs_eq32_carry_src_{x:0>8} = lshr i32 %{s}_{x:0>8}, 31\n", .{ address, value_prefix, address });
+    try writer.print("  %lsrs_eq32_carry_bit_{x:0>8} = and i32 %lsrs_eq32_carry_src_{x:0>8}, 1\n", .{ address, address });
+    try writer.print("  %lsrs_eq32_carry_{x:0>8} = icmp ne i32 %lsrs_eq32_carry_bit_{x:0>8}, 0\n", .{ address, address });
+    try writer.print("  br label %lsrs_join_{x:0>8}\n", .{address});
+    try writer.print("lsrs_gt32_block_{x:0>8}:\n", .{address});
+    try writer.print("  br label %lsrs_join_{x:0>8}\n", .{address});
+
+    try writer.print("lsrs_join_{x:0>8}:\n", .{address});
+    try writer.print(
+        "  %{s}_{x:0>8} = phi i32 [ %{s}_{x:0>8}, %lsrs_zero_{x:0>8} ], [ %lsrs_lt32_result_{x:0>8}, %lsrs_lt32_block_{x:0>8} ], [ 0, %lsrs_eq32_block_{x:0>8} ], [ 0, %lsrs_gt32_block_{x:0>8} ]\n",
+        .{ result_prefix, address, value_prefix, address, address, address, address, address, address },
+    );
+    try writer.print(
+        "  %lsrs_reg_carry_{x:0>8} = phi i1 [ %flag_c_val_{x:0>8}, %lsrs_zero_{x:0>8} ], [ %lsrs_lt32_carry_{x:0>8}, %lsrs_lt32_block_{x:0>8} ], [ %lsrs_eq32_carry_{x:0>8}, %lsrs_eq32_block_{x:0>8} ], [ false, %lsrs_gt32_block_{x:0>8} ]\n",
+        .{ address, address, address, address, address, address, address, address },
+    );
+    try emitUpdateNzFlags(writer, state_name, address, result_prefix);
+    try writer.print("  store i1 %lsrs_reg_carry_{x:0>8}, ptr %flag_c_ptr_{x:0>8}, align 1\n", .{ address, address });
+}
+
+fn emitAsrRegValue(
+    writer: *Io.Writer,
+    address: u32,
+    value_prefix: []const u8,
+    amount_prefix: []const u8,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try writer.print("  %asr_amount_{x:0>8} = and i32 %{s}_{x:0>8}, 255\n", .{ address, amount_prefix, address });
+    try writer.print("  %asr_is_zero_{x:0>8} = icmp eq i32 %asr_amount_{x:0>8}, 0\n", .{ address, address });
+    try writer.print(
+        "  br i1 %asr_is_zero_{x:0>8}, label %asr_zero_{x:0>8}, label %asr_nonzero_{x:0>8}\n",
+        .{ address, address, address },
+    );
+    try writer.print("asr_zero_{x:0>8}:\n", .{address});
+    try writer.print("  br label %asr_join_{x:0>8}\n", .{address});
+    try writer.print("asr_nonzero_{x:0>8}:\n", .{address});
+    try writer.print("  %asr_lt32_{x:0>8} = icmp ult i32 %asr_amount_{x:0>8}, 32\n", .{ address, address });
+    try writer.print(
+        "  br i1 %asr_lt32_{x:0>8}, label %asr_lt32_block_{x:0>8}, label %asr_ge32_{x:0>8}\n",
+        .{ address, address, address },
+    );
+    try writer.print("asr_lt32_block_{x:0>8}:\n", .{address});
+    try writer.print(
+        "  %asr_lt32_result_{x:0>8} = ashr i32 %{s}_{x:0>8}, %asr_amount_{x:0>8}\n",
+        .{ address, value_prefix, address, address },
+    );
+    try writer.print("  br label %asr_join_{x:0>8}\n", .{address});
+    try writer.print("asr_ge32_{x:0>8}:\n", .{address});
+    try writer.print("  %asr_ge32_result_{x:0>8} = ashr i32 %{s}_{x:0>8}, 31\n", .{ address, value_prefix, address });
+    try writer.print("  br label %asr_join_{x:0>8}\n", .{address});
+    try writer.print("asr_join_{x:0>8}:\n", .{address});
+    try writer.print(
+        "  %{s}_{x:0>8} = phi i32 [ %{s}_{x:0>8}, %asr_zero_{x:0>8} ], [ %asr_lt32_result_{x:0>8}, %asr_lt32_block_{x:0>8} ], [ %asr_ge32_result_{x:0>8}, %asr_ge32_{x:0>8} ]\n",
+        .{ result_prefix, address, value_prefix, address, address, address, address, address, address },
+    );
+}
+
+fn emitAsrsRegWithFlags(
+    writer: *Io.Writer,
+    state_name: []const u8,
+    address: u32,
+    value_prefix: []const u8,
+    amount_prefix: []const u8,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try emitFlagLoad(writer, state_name, address, .c);
+    try writer.print("  %asrs_amount_{x:0>8} = and i32 %{s}_{x:0>8}, 255\n", .{ address, amount_prefix, address });
+    try writer.print("  %asrs_is_zero_{x:0>8} = icmp eq i32 %asrs_amount_{x:0>8}, 0\n", .{ address, address });
+    try writer.print(
+        "  br i1 %asrs_is_zero_{x:0>8}, label %asrs_zero_{x:0>8}, label %asrs_nonzero_{x:0>8}\n",
+        .{ address, address, address },
+    );
+    try writer.print("asrs_zero_{x:0>8}:\n", .{address});
+    try writer.print("  br label %asrs_join_{x:0>8}\n", .{address});
+    try writer.print("asrs_nonzero_{x:0>8}:\n", .{address});
+    try writer.print("  %asrs_lt32_{x:0>8} = icmp ult i32 %asrs_amount_{x:0>8}, 32\n", .{ address, address });
+    try writer.print(
+        "  br i1 %asrs_lt32_{x:0>8}, label %asrs_lt32_block_{x:0>8}, label %asrs_ge32_{x:0>8}\n",
+        .{ address, address, address },
+    );
+    try writer.print("asrs_lt32_block_{x:0>8}:\n", .{address});
+    try writer.print(
+        "  %asrs_lt32_result_{x:0>8} = ashr i32 %{s}_{x:0>8}, %asrs_amount_{x:0>8}\n",
+        .{ address, value_prefix, address, address },
+    );
+    try writer.print("  %asrs_carry_shift_{x:0>8} = sub i32 %asrs_amount_{x:0>8}, 1\n", .{ address, address });
+    try writer.print(
+        "  %asrs_lt32_carry_src_{x:0>8} = lshr i32 %{s}_{x:0>8}, %asrs_carry_shift_{x:0>8}\n",
+        .{ address, value_prefix, address, address },
+    );
+    try writer.print("  %asrs_lt32_carry_bit_{x:0>8} = and i32 %asrs_lt32_carry_src_{x:0>8}, 1\n", .{ address, address });
+    try writer.print("  %asrs_lt32_carry_{x:0>8} = icmp ne i32 %asrs_lt32_carry_bit_{x:0>8}, 0\n", .{ address, address });
+    try writer.print("  br label %asrs_join_{x:0>8}\n", .{address});
+    try writer.print("asrs_ge32_{x:0>8}:\n", .{address});
+    try writer.print("  %asrs_ge32_result_{x:0>8} = ashr i32 %{s}_{x:0>8}, 31\n", .{ address, value_prefix, address });
+    try writer.print("  %asrs_ge32_carry_src_{x:0>8} = lshr i32 %{s}_{x:0>8}, 31\n", .{ address, value_prefix, address });
+    try writer.print("  %asrs_ge32_carry_bit_{x:0>8} = and i32 %asrs_ge32_carry_src_{x:0>8}, 1\n", .{ address, address });
+    try writer.print("  %asrs_ge32_carry_{x:0>8} = icmp ne i32 %asrs_ge32_carry_bit_{x:0>8}, 0\n", .{ address, address });
+    try writer.print("  br label %asrs_join_{x:0>8}\n", .{address});
+    try writer.print("asrs_join_{x:0>8}:\n", .{address});
+    try writer.print(
+        "  %{s}_{x:0>8} = phi i32 [ %{s}_{x:0>8}, %asrs_zero_{x:0>8} ], [ %asrs_lt32_result_{x:0>8}, %asrs_lt32_block_{x:0>8} ], [ %asrs_ge32_result_{x:0>8}, %asrs_ge32_{x:0>8} ]\n",
+        .{ result_prefix, address, value_prefix, address, address, address, address, address, address },
+    );
+    try writer.print(
+        "  %asrs_reg_carry_{x:0>8} = phi i1 [ %flag_c_val_{x:0>8}, %asrs_zero_{x:0>8} ], [ %asrs_lt32_carry_{x:0>8}, %asrs_lt32_block_{x:0>8} ], [ %asrs_ge32_carry_{x:0>8}, %asrs_ge32_{x:0>8} ]\n",
+        .{ address, address, address, address, address, address, address },
+    );
+    try emitUpdateNzFlags(writer, state_name, address, result_prefix);
+    try writer.print("  store i1 %asrs_reg_carry_{x:0>8}, ptr %flag_c_ptr_{x:0>8}, align 1\n", .{ address, address });
+}
+
+fn emitRorRegValue(
+    writer: *Io.Writer,
+    address: u32,
+    value_prefix: []const u8,
+    amount_prefix: []const u8,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try writer.print("  %ror_amount_{x:0>8} = and i32 %{s}_{x:0>8}, 255\n", .{ address, amount_prefix, address });
+    try writer.print("  %ror_is_zero_{x:0>8} = icmp eq i32 %ror_amount_{x:0>8}, 0\n", .{ address, address });
+    try writer.print(
+        "  br i1 %ror_is_zero_{x:0>8}, label %ror_zero_{x:0>8}, label %ror_nonzero_{x:0>8}\n",
+        .{ address, address, address },
+    );
+    try writer.print("ror_zero_{x:0>8}:\n", .{address});
+    try writer.print("  br label %ror_join_{x:0>8}\n", .{address});
+    try writer.print("ror_nonzero_{x:0>8}:\n", .{address});
+    try writer.print("  %ror_mod_{x:0>8} = and i32 %ror_amount_{x:0>8}, 31\n", .{ address, address });
+    try writer.print("  %ror_mod_zero_{x:0>8} = icmp eq i32 %ror_mod_{x:0>8}, 0\n", .{ address, address });
+    try writer.print(
+        "  br i1 %ror_mod_zero_{x:0>8}, label %ror_mod_zero_block_{x:0>8}, label %ror_mod_nonzero_{x:0>8}\n",
+        .{ address, address, address },
+    );
+    try writer.print("ror_mod_zero_block_{x:0>8}:\n", .{address});
+    try writer.print("  br label %ror_join_{x:0>8}\n", .{address});
+    try writer.print("ror_mod_nonzero_{x:0>8}:\n", .{address});
+    try writer.print(
+        "  %ror_lo_{x:0>8} = lshr i32 %{s}_{x:0>8}, %ror_mod_{x:0>8}\n",
+        .{ address, value_prefix, address, address },
+    );
+    try writer.print("  %ror_left_shift_{x:0>8} = sub i32 32, %ror_mod_{x:0>8}\n", .{ address, address });
+    try writer.print(
+        "  %ror_hi_{x:0>8} = shl i32 %{s}_{x:0>8}, %ror_left_shift_{x:0>8}\n",
+        .{ address, value_prefix, address, address },
+    );
+    try writer.print("  %ror_mod_result_{x:0>8} = or i32 %ror_lo_{x:0>8}, %ror_hi_{x:0>8}\n", .{ address, address, address });
+    try writer.print("  br label %ror_join_{x:0>8}\n", .{address});
+    try writer.print("ror_join_{x:0>8}:\n", .{address});
+    try writer.print(
+        "  %{s}_{x:0>8} = phi i32 [ %{s}_{x:0>8}, %ror_zero_{x:0>8} ], [ %{s}_{x:0>8}, %ror_mod_zero_block_{x:0>8} ], [ %ror_mod_result_{x:0>8}, %ror_mod_nonzero_{x:0>8} ]\n",
+        .{ result_prefix, address, value_prefix, address, address, value_prefix, address, address, address, address },
+    );
+}
+
+fn emitRorsRegWithFlags(
+    writer: *Io.Writer,
+    state_name: []const u8,
+    address: u32,
+    value_prefix: []const u8,
+    amount_prefix: []const u8,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try emitFlagLoad(writer, state_name, address, .c);
+    try writer.print("  %rors_amount_{x:0>8} = and i32 %{s}_{x:0>8}, 255\n", .{ address, amount_prefix, address });
+    try writer.print("  %rors_is_zero_{x:0>8} = icmp eq i32 %rors_amount_{x:0>8}, 0\n", .{ address, address });
+    try writer.print(
+        "  br i1 %rors_is_zero_{x:0>8}, label %rors_zero_{x:0>8}, label %rors_nonzero_{x:0>8}\n",
+        .{ address, address, address },
+    );
+    try writer.print("rors_zero_{x:0>8}:\n", .{address});
+    try writer.print("  br label %rors_join_{x:0>8}\n", .{address});
+    try writer.print("rors_nonzero_{x:0>8}:\n", .{address});
+    try writer.print("  %rors_mod_{x:0>8} = and i32 %rors_amount_{x:0>8}, 31\n", .{ address, address });
+    try writer.print("  %rors_mod_zero_{x:0>8} = icmp eq i32 %rors_mod_{x:0>8}, 0\n", .{ address, address });
+    try writer.print(
+        "  br i1 %rors_mod_zero_{x:0>8}, label %rors_mod_zero_block_{x:0>8}, label %rors_mod_nonzero_{x:0>8}\n",
+        .{ address, address, address },
+    );
+    try writer.print("rors_mod_zero_block_{x:0>8}:\n", .{address});
+    try writer.print("  %rors_mod_zero_carry_src_{x:0>8} = lshr i32 %{s}_{x:0>8}, 31\n", .{ address, value_prefix, address });
+    try writer.print("  %rors_mod_zero_carry_bit_{x:0>8} = and i32 %rors_mod_zero_carry_src_{x:0>8}, 1\n", .{ address, address });
+    try writer.print("  %rors_mod_zero_carry_{x:0>8} = icmp ne i32 %rors_mod_zero_carry_bit_{x:0>8}, 0\n", .{ address, address });
+    try writer.print("  br label %rors_join_{x:0>8}\n", .{address});
+    try writer.print("rors_mod_nonzero_{x:0>8}:\n", .{address});
+    try writer.print(
+        "  %rors_lo_{x:0>8} = lshr i32 %{s}_{x:0>8}, %rors_mod_{x:0>8}\n",
+        .{ address, value_prefix, address, address },
+    );
+    try writer.print("  %rors_left_shift_{x:0>8} = sub i32 32, %rors_mod_{x:0>8}\n", .{ address, address });
+    try writer.print(
+        "  %rors_hi_{x:0>8} = shl i32 %{s}_{x:0>8}, %rors_left_shift_{x:0>8}\n",
+        .{ address, value_prefix, address, address },
+    );
+    try writer.print("  %rors_mod_result_{x:0>8} = or i32 %rors_lo_{x:0>8}, %rors_hi_{x:0>8}\n", .{ address, address, address });
+    try writer.print("  %rors_mod_carry_src_{x:0>8} = lshr i32 %rors_mod_result_{x:0>8}, 31\n", .{ address, address });
+    try writer.print("  %rors_mod_carry_bit_{x:0>8} = and i32 %rors_mod_carry_src_{x:0>8}, 1\n", .{ address, address });
+    try writer.print("  %rors_mod_carry_{x:0>8} = icmp ne i32 %rors_mod_carry_bit_{x:0>8}, 0\n", .{ address, address });
+    try writer.print("  br label %rors_join_{x:0>8}\n", .{address});
+    try writer.print("rors_join_{x:0>8}:\n", .{address});
+    try writer.print(
+        "  %{s}_{x:0>8} = phi i32 [ %{s}_{x:0>8}, %rors_zero_{x:0>8} ], [ %{s}_{x:0>8}, %rors_mod_zero_block_{x:0>8} ], [ %rors_mod_result_{x:0>8}, %rors_mod_nonzero_{x:0>8} ]\n",
+        .{ result_prefix, address, value_prefix, address, address, value_prefix, address, address, address, address },
+    );
+    try writer.print(
+        "  %rors_reg_carry_{x:0>8} = phi i1 [ %flag_c_val_{x:0>8}, %rors_zero_{x:0>8} ], [ %rors_mod_zero_carry_{x:0>8}, %rors_mod_zero_block_{x:0>8} ], [ %rors_mod_carry_{x:0>8}, %rors_mod_nonzero_{x:0>8} ]\n",
+        .{ address, address, address, address, address, address, address },
+    );
+    try emitUpdateNzFlags(writer, state_name, address, result_prefix);
+    try writer.print("  store i1 %rors_reg_carry_{x:0>8}, ptr %flag_c_ptr_{x:0>8}, align 1\n", .{ address, address });
+}
+
+fn emitRrxsWithFlags(
+    writer: *Io.Writer,
+    state_name: []const u8,
+    address: u32,
+    value_prefix: []const u8,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try emitFlagLoad(writer, state_name, address, .c);
+    try writer.print("  %rrx_carry_in_{x:0>8} = zext i1 %flag_c_val_{x:0>8} to i32\n", .{ address, address });
+    try writer.print("  %rrx_carry_hi_{x:0>8} = shl i32 %rrx_carry_in_{x:0>8}, 31\n", .{ address, address });
+    try writer.print("  %rrx_value_lo_{x:0>8} = lshr i32 %{s}_{x:0>8}, 1\n", .{ address, value_prefix, address });
+    try writer.print("  %{s}_{x:0>8} = or i32 %rrx_carry_hi_{x:0>8}, %rrx_value_lo_{x:0>8}\n", .{ result_prefix, address, address, address });
+    try emitUpdateNzFlags(writer, state_name, address, result_prefix);
+    try writer.print("  %rrx_carry_bit_{x:0>8} = and i32 %{s}_{x:0>8}, 1\n", .{ address, value_prefix, address });
+    try writer.print("  %rrx_carry_{x:0>8} = icmp ne i32 %rrx_carry_bit_{x:0>8}, 0\n", .{ address, address });
+    try writer.print("  store i1 %rrx_carry_{x:0>8}, ptr %flag_c_ptr_{x:0>8}, align 1\n", .{ address, address });
 }
 
 fn emitFinalOutput(writer: *Io.Writer, output_mode: OutputMode) Io.Writer.Error!void {
@@ -1098,6 +1861,23 @@ fn emitFinalOutput(writer: *Io.Writer, output_mode: OutputMode) Io.Writer.Error!
                 .{},
             );
         },
+        .arm_report => {
+            try writer.print(
+                "  %state_regs_done = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+                .{guest_state_regs_field},
+            );
+            try writer.print("  %r12_ptr_done = getelementptr inbounds [16 x i32], ptr %state_regs_done, i32 0, i32 12\n", .{});
+            try writer.print("  %arm_report_code = load i32, ptr %r12_ptr_done, align 4\n", .{});
+            try writer.print("  %arm_report_pass = icmp eq i32 %arm_report_code, 0\n", .{});
+            try writer.print("  br i1 %arm_report_pass, label %arm_report_pass_block, label %arm_report_fail_block\n", .{});
+            try writer.print("arm_report_pass_block:\n", .{});
+            try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_arm_pass)\n", .{});
+            try writer.print("  br label %arm_report_done\n", .{});
+            try writer.print("arm_report_fail_block:\n", .{});
+            try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_arm_fail, i32 %arm_report_code)\n", .{});
+            try writer.print("  br label %arm_report_done\n", .{});
+            try writer.print("arm_report_done:\n", .{});
+        },
     }
 }
 
@@ -1115,6 +1895,18 @@ fn emitRegPtr(
     try writer.print(
         "  %{s}_ptr_{x:0>8} = getelementptr inbounds [16 x i32], ptr %regs_ptr_{s}_{x:0>8}, i32 0, i32 {d}\n",
         .{ prefix, address, prefix, address, reg_index },
+    );
+}
+
+fn emitArchitecturalPcState(
+    writer: *Io.Writer,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+) Io.Writer.Error!void {
+    try emitRegPtr(writer, "state", address, "pc_state", 15);
+    try writer.print(
+        "  store i32 {d}, ptr %pc_state_ptr_{x:0>8}, align 4\n",
+        .{ architecturalPcValue(isa, address), address },
     );
 }
 
@@ -1371,6 +2163,13 @@ fn instructionSetName(isa: armv4t_decode.InstructionSet) []const u8 {
     };
 }
 
+fn architecturalPcValue(isa: armv4t_decode.InstructionSet, address: u32) u32 {
+    return switch (isa) {
+        .arm => address + 8,
+        .thumb => address + 4,
+    };
+}
+
 fn registerMaskCount(mask: u16) u16 {
     var remaining = mask;
     var count: u16 = 0;
@@ -1413,6 +2212,25 @@ fn emitFallthrough(writer: *Io.Writer, function: Function, address: u32) Io.Writ
 
 fn emitBranchTo(writer: *Io.Writer, address: u32) Io.Writer.Error!void {
     try writer.print("  br label %pc_{x:0>8}\n", .{address});
+}
+
+fn emitPcDispatch(
+    writer: *Io.Writer,
+    function: Function,
+    address: u32,
+    value_prefix: []const u8,
+) Io.Writer.Error!void {
+    try writer.print(
+        "  switch i32 %{s}_{x:0>8}, label %guest_return_{s}_{x:0>8} [\n",
+        .{ value_prefix, address, instructionSetName(function.entry.isa), function.entry.address },
+    );
+    for (function.instructions) |candidate| {
+        try writer.print(
+            "    i32 {d}, label %pc_{x:0>8}\n",
+            .{ candidate.address, candidate.address },
+        );
+    }
+    try writer.print("  ]\n", .{});
 }
 
 fn emitFunctionReturn(writer: *Io.Writer, entry: armv4t_decode.CodeAddress) Io.Writer.Error!void {

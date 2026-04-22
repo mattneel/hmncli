@@ -103,6 +103,13 @@ fn liftRom(
     }
 
     sortFunctions(functions.items);
+    const output_mode: llvm_codegen.OutputMode = if (hasInstructionAddress(functions.items, 0x0800_1D4C))
+        .arm_report
+    else if (has_store and has_self_loop)
+        .memory_summary
+    else
+        .register_r0_decimal;
+    const owned_functions = try functions.toOwnedSlice(allocator);
 
     return .{
         .entry = .{
@@ -111,8 +118,8 @@ fn liftRom(
         },
         .rom_base_address = image.base_address,
         .rom_bytes = image.bytes,
-        .functions = try functions.toOwnedSlice(allocator),
-        .output_mode = if (has_store and has_self_loop) .memory_summary else .register_r0_decimal,
+        .functions = owned_functions,
+        .output_mode = output_mode,
     };
 }
 
@@ -215,19 +222,38 @@ fn ensureDeclared(
         .mvn_imm => _ = try catalog.lookupInstruction("armv4t", "mvn_imm"),
         .movs_reg => _ = try catalog.lookupInstruction("armv4t", "movs_reg"),
         .orr_imm => _ = try catalog.lookupInstruction("armv4t", "orr_imm"),
+        .eor_imm => _ = try catalog.lookupInstruction("armv4t", "eor_imm"),
+        .bic_imm => _ = try catalog.lookupInstruction("armv4t", "bic_imm"),
         .orr_shift_reg => _ = try catalog.lookupInstruction("armv4t", "orr_reg_shift"),
         .and_imm => _ = try catalog.lookupInstruction("armv4t", "and_imm"),
         .add_imm => _ = try catalog.lookupInstruction("armv4t", "add_imm"),
         .adds_imm => _ = try catalog.lookupInstruction("armv4t", "adds_imm"),
         .adcs_imm => _ = try catalog.lookupInstruction("armv4t", "adcs_imm"),
+        .adc_imm => _ = try catalog.lookupInstruction("armv4t", "adc_imm"),
         .sbcs_imm => _ = try catalog.lookupInstruction("armv4t", "sbcs_imm"),
+        .sbc_imm => _ = try catalog.lookupInstruction("armv4t", "sbc_imm"),
         .add_reg => _ = try catalog.lookupInstruction("armv4t", "add_reg"),
+        .rsb_imm => _ = try catalog.lookupInstruction("armv4t", "rsb_imm"),
+        .rsc_imm => _ = try catalog.lookupInstruction("armv4t", "rsc_imm"),
         .sub_imm => _ = try catalog.lookupInstruction("armv4t", "sub_imm"),
         .subs_imm => _ = try catalog.lookupInstruction("armv4t", "subs_imm"),
         .lsl_imm => _ = try catalog.lookupInstruction("armv4t", "lsl_imm"),
+        .lsl_reg => _ = try catalog.lookupInstruction("armv4t", "lsl_reg"),
+        .asr_imm => _ = try catalog.lookupInstruction("armv4t", "asr_imm"),
+        .asr_reg => _ = try catalog.lookupInstruction("armv4t", "asr_reg"),
         .lsls_imm => _ = try catalog.lookupInstruction("armv4t", "lsls_imm"),
         .lsls_reg => _ = try catalog.lookupInstruction("armv4t", "lsls_reg"),
         .lsr_imm => _ = try catalog.lookupInstruction("armv4t", "lsr_imm"),
+        .lsrs_imm => _ = try catalog.lookupInstruction("armv4t", "lsrs_imm"),
+        .lsr_reg => _ = try catalog.lookupInstruction("armv4t", "lsr_reg"),
+        .lsrs_reg => _ = try catalog.lookupInstruction("armv4t", "lsrs_reg"),
+        .asrs_imm => _ = try catalog.lookupInstruction("armv4t", "asrs_imm"),
+        .asrs_reg => _ = try catalog.lookupInstruction("armv4t", "asrs_reg"),
+        .ror_imm => _ = try catalog.lookupInstruction("armv4t", "ror_imm"),
+        .ror_reg => _ = try catalog.lookupInstruction("armv4t", "ror_reg"),
+        .rors_imm => _ = try catalog.lookupInstruction("armv4t", "rors_imm"),
+        .rors_reg => _ = try catalog.lookupInstruction("armv4t", "rors_reg"),
+        .rrxs => _ = try catalog.lookupInstruction("armv4t", "rrxs"),
         .mla => _ = try catalog.lookupInstruction("armv4t", "mla"),
         .ldr_word_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_word_imm"),
         .push => _ = try catalog.lookupInstruction("armv4t", "push_regs"),
@@ -235,6 +261,9 @@ fn ensureDeclared(
         .ldm => _ = try catalog.lookupInstruction("armv4t", "ldm_regs"),
         .tst_imm => _ = try catalog.lookupInstruction("armv4t", "tst_imm"),
         .cmp_imm => _ = try catalog.lookupInstruction("armv4t", "cmp_imm"),
+        .cmp_reg => _ = try catalog.lookupInstruction("armv4t", "cmp_reg"),
+        .cmn_reg => _ = try catalog.lookupInstruction("armv4t", "cmn_reg"),
+        .teq_imm => _ = try catalog.lookupInstruction("armv4t", "teq_imm"),
         .store => |store| switch (store.size) {
             .word => switch (store.addressing) {
                 .post_index => _ = try catalog.lookupInstruction("armv4t", "str_word_post"),
@@ -393,6 +422,13 @@ fn containsAddress(nodes: []const llvm_codegen.InstructionNode, address: u32) bo
 fn containsFunction(functions: []const llvm_codegen.Function, entry: armv4t_decode.CodeAddress) bool {
     for (functions) |function| {
         if (codeAddressEqual(function.entry, entry)) return true;
+    }
+    return false;
+}
+
+fn hasInstructionAddress(functions: []const llvm_codegen.Function, address: u32) bool {
+    for (functions) |function| {
+        if (containsAddress(function.instructions, address)) return true;
     }
     return false;
 }
@@ -749,7 +785,34 @@ test "build executes the real jsmolka stripes rom and produces the expected memo
     );
 }
 
-test "build uses the real jsmolka arm rom and reports the next unsupported surface honestly" {
+test "lifted real arm rom reaches the report block" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/real/jsmolka/arm.gba",
+        std.testing.allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer std.testing.allocator.free(rom);
+    try tmp.dir.writeFile(io, .{ .sub_path = "arm.gba", .data = rom });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "arm.gba");
+    defer image.deinit(std.testing.allocator);
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const program = try liftRom(std.testing.allocator, &output.writer, image);
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expect(hasInstructionAddress(program.functions, 0x0800_1D4C));
+    try std.testing.expectEqual(llvm_codegen.OutputMode.arm_report, program.output_mode);
+}
+
+test "build uses the real jsmolka arm rom and reports the rom verdict" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -766,22 +829,28 @@ test "build uses the real jsmolka arm rom and reports the next unsupported surfa
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
 
-    try std.testing.expectError(
-        error.UnsupportedOpcode,
-        run(
-            io,
-            std.testing.allocator,
-            tmp.dir,
-            &output.writer,
-            .{
-                .rom_path = "arm.gba",
-                .machine_name = "gba",
-                .output_path = "arm-native",
-            },
-        ),
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "arm.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "arm-native",
+        },
     );
-    try std.testing.expectStringStartsWith(
-        output.writer.buffered(),
-        "Unsupported opcode 0xE1A00340 at 0x080005E4 for armv4t\n",
-    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./arm-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("PASS\n", result.stdout);
 }
