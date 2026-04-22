@@ -82,17 +82,26 @@ pub fn version() CapstoneVersion {
 }
 
 pub fn disassembleOneArm32(word: u32, address: u64) DisassembleError!ArmInstruction {
+    var word_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &word_bytes, word, .little);
+    return disassembleOne(&word_bytes, address, c.CS_MODE_ARM);
+}
+
+pub fn disassembleOneThumb16(halfword: u16, address: u64) DisassembleError!ArmInstruction {
+    var halfword_bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &halfword_bytes, halfword, .little);
+    return disassembleOne(&halfword_bytes, address, c.CS_MODE_THUMB);
+}
+
+fn disassembleOne(bytes: []const u8, address: u64, mode: u32) DisassembleError!ArmInstruction {
     var handle: usize = 0;
-    if (c.cs_open(c.CS_ARCH_ARM, c.CS_MODE_ARM, &handle) != c.CS_ERR_OK) return error.OpenFailed;
+    if (c.cs_open(c.CS_ARCH_ARM, mode, &handle) != c.CS_ERR_OK) return error.OpenFailed;
     defer _ = c.cs_close(&handle);
 
     if (c.cs_option(handle, c.CS_OPT_DETAIL, c.CS_OPT_ON) != c.CS_ERR_OK) return error.OptionFailed;
 
-    var word_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &word_bytes, word, .little);
-
     var insn_ptr: [*c]c.cs_insn = null;
-    const decoded_count = c.cs_disasm(handle, &word_bytes, word_bytes.len, address, 1, &insn_ptr);
+    const decoded_count = c.cs_disasm(handle, bytes.ptr, bytes.len, address, 1, &insn_ptr);
     if (decoded_count != 1 or insn_ptr == null) return error.DisassembleFailed;
     defer c.cs_free(insn_ptr, decoded_count);
 
@@ -170,6 +179,23 @@ test "capstone exposes structured store detail" {
             try std.testing.expectEqual(@as(u32, c.ARM_REG_R2), mem.index);
             try std.testing.expectEqual(@as(i32, 0), mem.disp);
         },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "capstone exposes structured thumb detail" {
+    const actual = try disassembleOneThumb16(0x2007, 0x08000008);
+    try std.testing.expectEqual(@as(u32, c.ARM_INS_MOV), actual.id);
+    try std.testing.expectEqual(@as(u64, 0x08000008), actual.address);
+    try std.testing.expectEqual(@as(u16, 2), actual.size);
+    try std.testing.expectEqual(@as(u32, c.ARMCC_AL), actual.cc);
+    try std.testing.expectEqual(@as(u8, 2), actual.operand_count);
+    switch (actual.operands[0].value) {
+        .reg => |reg| try std.testing.expectEqual(@as(u32, c.ARM_REG_R0), reg),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (actual.operands[1].value) {
+        .imm => |imm| try std.testing.expectEqual(@as(i64, 7), imm),
         else => return error.TestUnexpectedResult,
     }
 }

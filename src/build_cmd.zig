@@ -14,6 +14,7 @@ pub const BuildError = std.mem.Allocator.Error ||
     Io.Dir.ReadFileAllocError ||
     Io.Dir.WriteFileError ||
     std.process.RunError ||
+    armv4t_decode.DecodeError ||
     catalog.CatalogError ||
     error{
         UnsupportedMachine,
@@ -68,7 +69,7 @@ fn liftRom(
     writer: *Io.Writer,
     image: gba_loader.RomImage,
 ) BuildError!llvm_codegen.Program {
-    var pending_functions: std.ArrayList(u32) = .empty;
+    var pending_functions: std.ArrayList(armv4t_decode.CodeAddress) = .empty;
     defer pending_functions.deinit(allocator);
 
     var functions: std.ArrayList(llvm_codegen.Function) = .empty;
@@ -80,7 +81,10 @@ fn liftRom(
     var has_store = false;
     var has_self_loop = false;
 
-    try pending_functions.append(allocator, image.base_address);
+    try pending_functions.append(allocator, .{
+        .address = image.base_address,
+        .isa = .arm,
+    });
 
     while (pending_functions.items.len != 0) {
         const function_entry = pending_functions.items[pending_functions.items.len - 1];
@@ -101,7 +105,10 @@ fn liftRom(
     sortFunctions(functions.items);
 
     return .{
-        .entry_address = image.base_address,
+        .entry = .{
+            .address = image.base_address,
+            .isa = .arm,
+        },
         .functions = try functions.toOwnedSlice(allocator),
         .output_mode = if (has_store and has_self_loop) .memory_summary else .register_r0_decimal,
     };
@@ -111,8 +118,8 @@ fn liftFunction(
     allocator: std.mem.Allocator,
     writer: *Io.Writer,
     image: gba_loader.RomImage,
-    function_entry: u32,
-    pending_functions: *std.ArrayList(u32),
+    function_entry: armv4t_decode.CodeAddress,
+    pending_functions: *std.ArrayList(armv4t_decode.CodeAddress),
     has_store: *bool,
     has_self_loop: *bool,
 ) BuildError!llvm_codegen.Function {
@@ -122,21 +129,43 @@ fn liftFunction(
     var nodes: std.ArrayList(llvm_codegen.InstructionNode) = .empty;
     defer nodes.deinit(allocator);
 
-    try pending_blocks.append(allocator, function_entry);
+    try pending_blocks.append(allocator, function_entry.address);
 
     while (pending_blocks.items.len != 0) {
         const address = pending_blocks.items[pending_blocks.items.len - 1];
         pending_blocks.items.len -= 1;
 
         if (containsAddress(nodes.items, address)) continue;
-        const offset = offsetForAddress(image, address) orelse {
+        const offset = offsetForAddress(image, address, function_entry.isa) orelse {
             try writer.print("Unsupported control flow target 0x{X:0>8} for gba\n", .{address});
             return error.UnsupportedOpcode;
         };
 
-        const word = armv4t_decode.readWord(image.bytes, offset);
-        const decoded = armv4t_decode.decode(word, address) catch {
-            try renderUnsupportedOpcode(writer, word, address);
+        const size_bytes = instructionSizeBytes(function_entry.isa);
+        const raw_opcode, const decoded_initial = switch (function_entry.isa) {
+            .arm => blk: {
+                const word = armv4t_decode.readWord(image.bytes, offset);
+                break :blk .{ word, armv4t_decode.decode(word, address) catch |err| return switch (err) {
+                    error.UnsupportedOpcode => {
+                        try renderUnsupportedOpcode(writer, word, address);
+                        return error.UnsupportedOpcode;
+                    },
+                    else => |other| return other,
+                } };
+            },
+            .thumb => blk: {
+                const halfword = armv4t_decode.readHalfword(image.bytes, offset);
+                break :blk .{ @as(u32, halfword), armv4t_decode.decodeThumb(halfword, address) catch |err| return switch (err) {
+                    error.UnsupportedOpcode => {
+                        try renderUnsupportedOpcode(writer, halfword, address);
+                        return error.UnsupportedOpcode;
+                    },
+                    else => |other| return other,
+                } };
+            },
+        };
+        const decoded = resolveDecodedInstruction(image, function_entry.isa, address, decoded_initial) catch {
+            try renderUnsupportedOpcode(writer, raw_opcode, address);
             return error.UnsupportedOpcode;
         };
 
@@ -145,6 +174,7 @@ fn liftFunction(
 
         try nodes.append(allocator, .{
             .address = address,
+            .size_bytes = size_bytes,
             .instruction = decoded,
         });
 
@@ -154,7 +184,9 @@ fn liftFunction(
             &pending_blocks,
             pending_functions,
             image,
+            function_entry.isa,
             address,
+            size_bytes,
             decoded,
             has_self_loop,
         );
@@ -163,7 +195,7 @@ fn liftFunction(
     sortNodes(nodes.items);
 
     return .{
-        .entry_address = function_entry,
+        .entry = function_entry,
         .instructions = try nodes.toOwnedSlice(allocator),
     };
 }
@@ -175,6 +207,7 @@ fn ensureDeclared(
 ) BuildError!void {
     switch (decoded) {
         .mov_imm => _ = try catalog.lookupInstruction("armv4t", "mov_imm"),
+        .mov_reg => _ = try catalog.lookupInstruction("armv4t", "mov_reg"),
         .orr_imm => _ = try catalog.lookupInstruction("armv4t", "orr_imm"),
         .add_imm => _ = try catalog.lookupInstruction("armv4t", "add_imm"),
         .subs_imm => _ = try catalog.lookupInstruction("armv4t", "subs_imm"),
@@ -188,6 +221,8 @@ fn ensureDeclared(
         },
         .branch => |branch| _ = try catalog.lookupInstruction("armv4t", branchInstructionName(branch.cond)),
         .bl => _ = try catalog.lookupInstruction("armv4t", "bl"),
+        .bx_target => _ = try catalog.lookupInstruction("armv4t", "bx_reg"),
+        .bx_reg => return error.UnsupportedOpcode,
         .bx_lr => _ = try catalog.lookupInstruction("armv4t", "bx_lr"),
         .msr_cpsr_f_imm => _ = try catalog.lookupInstruction("armv4t", "msr_cpsr_f_imm"),
         .swi => |swi| {
@@ -204,37 +239,50 @@ fn enqueueSuccessors(
     allocator: std.mem.Allocator,
     writer: *Io.Writer,
     pending_blocks: *std.ArrayList(u32),
-    pending_functions: *std.ArrayList(u32),
+    pending_functions: *std.ArrayList(armv4t_decode.CodeAddress),
     image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
     address: u32,
+    size_bytes: u8,
     decoded: armv4t_decode.DecodedInstruction,
     has_self_loop: *bool,
 ) BuildError!void {
     switch (decoded) {
+        .mov_reg => |mov| {
+            if (mov.rd == 15 and mov.rm == 14) return;
+            try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
+        },
         .branch => |branch| {
             if (branch.cond == .al) {
                 if (branch.target == address) {
                     has_self_loop.* = true;
                     return;
                 }
-                try enqueueAddress(allocator, writer, pending_blocks, image, branch.target);
+                try enqueueBlockAddress(allocator, writer, pending_blocks, image, isa, branch.target);
                 return;
             }
 
-            try enqueueFallthrough(allocator, pending_blocks, image, address);
+            try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
             if (branch.target == address) {
                 has_self_loop.* = true;
                 return;
             }
-            try enqueueAddress(allocator, writer, pending_blocks, image, branch.target);
+            try enqueueBlockAddress(allocator, writer, pending_blocks, image, isa, branch.target);
         },
         .bl => |bl| {
-            try enqueueAddress(allocator, writer, pending_functions, image, bl.target);
-            try enqueueFallthrough(allocator, pending_blocks, image, address);
+            try enqueueFunctionAddress(allocator, writer, pending_functions, image, .{
+                .address = bl.target,
+                .isa = isa,
+            });
+            try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
+        },
+        .bx_target => |target| {
+            try enqueueFunctionAddress(allocator, writer, pending_functions, image, target);
         },
         .bx_lr => return,
+        .bx_reg => return error.UnsupportedOpcode,
         else => {
-            try enqueueFallthrough(allocator, pending_blocks, image, address);
+            try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
         },
     }
 }
@@ -243,33 +291,54 @@ fn enqueueFallthrough(
     allocator: std.mem.Allocator,
     pending: *std.ArrayList(u32),
     image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
     address: u32,
+    size_bytes: u8,
 ) std.mem.Allocator.Error!void {
-    const next_address = address + 4;
-    if (offsetForAddress(image, next_address) != null) {
+    const next_address = address + size_bytes;
+    if (offsetForAddress(image, next_address, isa) != null) {
         try pending.append(allocator, next_address);
     }
 }
 
-fn enqueueAddress(
+fn enqueueBlockAddress(
     allocator: std.mem.Allocator,
     writer: *Io.Writer,
     pending: *std.ArrayList(u32),
     image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
     address: u32,
 ) BuildError!void {
-    if (offsetForAddress(image, address) == null) {
+    if (offsetForAddress(image, address, isa) == null) {
         try writer.print("Unsupported control flow target 0x{X:0>8} for gba\n", .{address});
         return error.UnsupportedOpcode;
     }
     try pending.append(allocator, address);
 }
 
-fn offsetForAddress(image: gba_loader.RomImage, address: u32) ?usize {
+fn enqueueFunctionAddress(
+    allocator: std.mem.Allocator,
+    writer: *Io.Writer,
+    pending: *std.ArrayList(armv4t_decode.CodeAddress),
+    image: gba_loader.RomImage,
+    target: armv4t_decode.CodeAddress,
+) BuildError!void {
+    if (offsetForAddress(image, target.address, target.isa) == null) {
+        try writer.print("Unsupported control flow target 0x{X:0>8} for gba\n", .{target.address});
+        return error.UnsupportedOpcode;
+    }
+    try pending.append(allocator, target);
+}
+
+fn offsetForAddress(
+    image: gba_loader.RomImage,
+    address: u32,
+    isa: armv4t_decode.InstructionSet,
+) ?usize {
     if (address < image.base_address) return null;
     const offset = address - image.base_address;
-    if ((offset % 4) != 0) return null;
-    if (offset >= image.bytes.len) return null;
+    if ((offset % instructionSizeBytes(isa)) != 0) return null;
+    if (offset + instructionSizeBytes(isa) > image.bytes.len) return null;
     return offset;
 }
 
@@ -280,9 +349,9 @@ fn containsAddress(nodes: []const llvm_codegen.InstructionNode, address: u32) bo
     return false;
 }
 
-fn containsFunction(functions: []const llvm_codegen.Function, entry_address: u32) bool {
+fn containsFunction(functions: []const llvm_codegen.Function, entry: armv4t_decode.CodeAddress) bool {
     for (functions) |function| {
-        if (function.entry_address == entry_address) return true;
+        if (codeAddressEqual(function.entry, entry)) return true;
     }
     return false;
 }
@@ -305,10 +374,81 @@ fn sortFunctions(functions: []llvm_codegen.Function) void {
         var min_index = i;
         var j: usize = i + 1;
         while (j < functions.len) : (j += 1) {
-            if (functions[j].entry_address < functions[min_index].entry_address) min_index = j;
+            if (codeAddressLessThan(functions[j].entry, functions[min_index].entry)) min_index = j;
         }
         if (min_index != i) std.mem.swap(llvm_codegen.Function, &functions[i], &functions[min_index]);
     }
+}
+
+fn resolveDecodedInstruction(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+    decoded: armv4t_decode.DecodedInstruction,
+) BuildError!armv4t_decode.DecodedInstruction {
+    return switch (decoded) {
+        .bx_reg => |bx| try resolveBxTarget(image, isa, address, bx.reg),
+        else => decoded,
+    };
+}
+
+fn resolveBxTarget(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+    reg: u4,
+) BuildError!armv4t_decode.DecodedInstruction {
+    const previous_size = instructionSizeBytes(isa);
+    if (address < image.base_address + previous_size) return error.UnsupportedOpcode;
+    const previous_address = address - previous_size;
+    const offset = offsetForAddress(image, previous_address, isa) orelse return error.UnsupportedOpcode;
+    const previous_decoded = switch (isa) {
+        .arm => try armv4t_decode.decode(armv4t_decode.readWord(image.bytes, offset), previous_address),
+        .thumb => try armv4t_decode.decodeThumb(armv4t_decode.readHalfword(image.bytes, offset), previous_address),
+    };
+
+    return switch (previous_decoded) {
+        .add_imm => |add| blk: {
+            if (add.rd != reg or add.rn != 15) return error.UnsupportedOpcode;
+            const target_value = pcValueForInstruction(isa, previous_address) + add.imm;
+            break :blk .{ .bx_target = normalizeCodeTarget(target_value) };
+        },
+        .mov_imm => |mov| blk: {
+            if (mov.rd != reg) return error.UnsupportedOpcode;
+            break :blk .{ .bx_target = normalizeCodeTarget(mov.imm) };
+        },
+        else => error.UnsupportedOpcode,
+    };
+}
+
+fn normalizeCodeTarget(raw_target: u32) armv4t_decode.CodeAddress {
+    return .{
+        .address = raw_target & ~@as(u32, 1),
+        .isa = if ((raw_target & 1) == 0) .arm else .thumb,
+    };
+}
+
+fn pcValueForInstruction(isa: armv4t_decode.InstructionSet, address: u32) u32 {
+    return switch (isa) {
+        .arm => address + 8,
+        .thumb => (address + 4) & ~@as(u32, 3),
+    };
+}
+
+fn instructionSizeBytes(isa: armv4t_decode.InstructionSet) u8 {
+    return switch (isa) {
+        .arm => 4,
+        .thumb => 2,
+    };
+}
+
+fn codeAddressEqual(a: armv4t_decode.CodeAddress, b: armv4t_decode.CodeAddress) bool {
+    return a.address == b.address and a.isa == b.isa;
+}
+
+fn codeAddressLessThan(a: armv4t_decode.CodeAddress, b: armv4t_decode.CodeAddress) bool {
+    if (a.address != b.address) return a.address < b.address;
+    return @intFromEnum(a.isa) < @intFromEnum(b.isa);
 }
 
 fn branchInstructionName(cond: armv4t_decode.Cond) []const u8 {
@@ -575,6 +715,6 @@ test "build uses the real jsmolka arm rom and reports the next unsupported surfa
     );
     try std.testing.expectStringStartsWith(
         output.writer.buffered(),
-        "Unsupported opcode 0xE12FFF10 at 0x0800028C for armv4t\n",
+        "Unsupported opcode 0xE92D0003 at 0x08001D4C for armv4t\n",
     );
 }

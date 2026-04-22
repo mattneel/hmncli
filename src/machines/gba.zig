@@ -121,6 +121,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .id = .{
             .kind = .instruction,
             .namespace = "armv4t",
+            .name = "mov_reg",
+        },
+        .isa = .armv4t,
+        .mnemonic = "mov",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 interworking surface for register-to-register moves, including thumb high-register copies."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
             .name = "orr_imm",
         },
         .isa = .armv4t,
@@ -438,6 +452,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .tests = &.{},
         .doc_refs = &.{},
         .notes = &.{"Phase 1 call surface for direct branch-and-link targets."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "bx_reg",
+        },
+        .isa = .armv4t,
+        .mnemonic = "bx",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 interworking surface for statically-known branch-exchange register targets."},
     },
     .{
         .id = .{

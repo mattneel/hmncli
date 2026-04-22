@@ -147,8 +147,8 @@ test "build emits guest-state llvm with a separate guest entry function" {
     defer std.testing.allocator.free(llvm_bytes);
 
     try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "%GuestState = type") != null);
-    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "define void @guest_08000000(ptr %state)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "call void @guest_08000000(ptr %state)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "define void @guest_arm_08000000(ptr %state)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "call void @guest_arm_08000000(ptr %state)") != null);
 }
 
 test "build executes a synthetic direct bl plus bx lr slice" {
@@ -272,6 +272,51 @@ test "build executes a synthetic beq slice" {
 
     const result = try std.process.run(std.testing.allocator, io, .{
         .argv = &.{"./gba-beq-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("7\n", result.stdout);
+}
+
+test "build executes a synthetic arm-thumb-arm interworking slice" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = [_]u8{
+        0x01, 0x00, 0x8F, 0xE2, // add r0, pc, #1
+        0x10, 0xFF, 0x2F, 0xE1, // bx  r0
+        0x07, 0x20, // movs r0, #7
+        0x01, 0xA1, // adr  r1, 0x08000010
+        0x08, 0x47, // bx   r1
+        0xC0, 0x46, // nop
+        0xFE, 0xFF, 0xFF, 0xEA, // b .
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "interwork.gba", .data = &rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try cli.build_cmd.run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "interwork.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "gba-interwork-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./gba-interwork-native"},
         .cwd = .{ .dir = tmp.dir },
         .stdout_limit = .limited(1024),
         .stderr_limit = .limited(1024),

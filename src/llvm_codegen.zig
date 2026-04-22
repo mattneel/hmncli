@@ -9,16 +9,17 @@ pub const OutputMode = enum {
 
 pub const InstructionNode = struct {
     address: u32,
+    size_bytes: u8,
     instruction: armv4t_decode.DecodedInstruction,
 };
 
 pub const Function = struct {
-    entry_address: u32,
+    entry: armv4t_decode.CodeAddress,
     instructions: []const InstructionNode,
 };
 
 pub const Program = struct {
-    entry_address: u32,
+    entry: armv4t_decode.CodeAddress,
     functions: []const Function,
     output_mode: OutputMode,
 
@@ -186,13 +187,19 @@ fn emitRegionDispatch(
 }
 
 fn emitGuestFunction(writer: *Io.Writer, function: Function) Io.Writer.Error!void {
-    try writer.print("define void @guest_{x:0>8}(ptr %state) {{\n", .{function.entry_address});
+    try writer.print("define void @guest_{s}_{x:0>8}(ptr %state) {{\n", .{
+        instructionSetName(function.entry.isa),
+        function.entry.address,
+    });
     try writer.print("entry:\n", .{});
-    try emitBranchTo(writer, function.entry_address);
+    try emitBranchTo(writer, function.entry.address);
     for (function.instructions) |node| {
         try emitInstructionBlock(writer, function, node);
     }
-    try writer.print("guest_return_{x:0>8}:\n", .{function.entry_address});
+    try writer.print("guest_return_{s}_{x:0>8}:\n", .{
+        instructionSetName(function.entry.isa),
+        function.entry.address,
+    });
     try writer.print("  ret void\n", .{});
     try writer.print("}}\n\n", .{});
 }
@@ -241,7 +248,10 @@ fn emitMain(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
     try writer.print("  call void @llvm.memset.p0.i64(ptr align 1 %state_io_ptr, i8 0, i64 1024, i1 false)\n", .{});
     try writer.print("  call void @llvm.memset.p0.i64(ptr align 1 %state_palette_ptr, i8 0, i64 1024, i1 false)\n", .{});
     try writer.print("  call void @llvm.memset.p0.i64(ptr align 1 %state_vram_ptr, i8 0, i64 98304, i1 false)\n", .{});
-    try writer.print("  call void @guest_{x:0>8}(ptr %state)\n", .{program.entry_address});
+    try writer.print("  call void @guest_{s}_{x:0>8}(ptr %state)\n", .{
+        instructionSetName(program.entry.isa),
+        program.entry.address,
+    });
     try emitFinalOutput(writer, program.output_mode);
     try writer.print("  ret i32 0\n", .{});
     try writer.print("}}\n", .{});
@@ -253,7 +263,18 @@ fn emitInstructionBlock(writer: *Io.Writer, function: Function, node: Instructio
         .mov_imm => |mov| {
             try emitRegPtr(writer, "state", node.address, "rd", mov.rd);
             try writer.print("  store i32 {d}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ mov.imm, node.address });
-            try emitFallthrough(writer, function, node.address + 4);
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .mov_reg => |mov| {
+            if (mov.rd == 15 and mov.rm == 14) {
+                try emitFunctionReturn(writer, function.entry);
+                return;
+            }
+            try emitRegPtr(writer, "state", node.address, "rm", mov.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rd", mov.rd);
+            try writer.print("  store i32 %rm_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .orr_imm => |orr| {
             try emitRegPtr(writer, "state", node.address, "rn", orr.rn);
@@ -261,7 +282,7 @@ fn emitInstructionBlock(writer: *Io.Writer, function: Function, node: Instructio
             try writer.print("  %orr_val_{x:0>8} = or i32 %rn_val_{x:0>8}, {d}\n", .{ node.address, node.address, orr.imm });
             try emitRegPtr(writer, "state", node.address, "rd", orr.rd);
             try writer.print("  store i32 %orr_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
-            try emitFallthrough(writer, function, node.address + 4);
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .add_imm => |add| {
             try emitRegPtr(writer, "state", node.address, "rn", add.rn);
@@ -269,7 +290,7 @@ fn emitInstructionBlock(writer: *Io.Writer, function: Function, node: Instructio
             try writer.print("  %add_val_{x:0>8} = add i32 %rn_val_{x:0>8}, {d}\n", .{ node.address, node.address, add.imm });
             try emitRegPtr(writer, "state", node.address, "rd", add.rd);
             try writer.print("  store i32 %add_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
-            try emitFallthrough(writer, function, node.address + 4);
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .subs_imm => |sub| {
             try emitRegPtr(writer, "state", node.address, "rn", sub.rn);
@@ -280,7 +301,7 @@ fn emitInstructionBlock(writer: *Io.Writer, function: Function, node: Instructio
             try writer.print("  %z_val_{x:0>8} = icmp eq i32 %sub_val_{x:0>8}, 0\n", .{ node.address, node.address });
             try emitFlagZPtr(writer, "state", node.address);
             try writer.print("  store i1 %z_val_{x:0>8}, ptr %flag_z_ptr_{x:0>8}, align 1\n", .{ node.address, node.address });
-            try emitFallthrough(writer, function, node.address + 4);
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .store => |store| {
             try emitRegPtr(writer, "state", node.address, "base", store.base);
@@ -306,49 +327,59 @@ fn emitInstructionBlock(writer: *Io.Writer, function: Function, node: Instructio
                 "  call void @hmn_store{d}(ptr %state, i32 %addr_{x:0>8}, i32 %src_val_{x:0>8})\n",
                 .{ helper_bits, node.address, node.address },
             );
-            try emitFallthrough(writer, function, node.address + 4);
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .branch => |branch| {
             if (branch.cond == .al) {
                 if (branch.target == node.address)
-                    try emitFunctionReturn(writer, function.entry_address)
+                    try emitFunctionReturn(writer, function.entry)
                 else if (hasAddress(function, branch.target))
                     try emitBranchTo(writer, branch.target)
                 else
-                    try emitFunctionReturn(writer, function.entry_address);
+                    try emitFunctionReturn(writer, function.entry);
                 return;
             }
 
             try emitBranchCondition(writer, "state", node.address, branch.cond);
-            const has_fallthrough = hasAddress(function, node.address + 4);
+            const has_fallthrough = hasAddress(function, node.address + node.size_bytes);
             const has_target = hasAddress(function, branch.target);
             if (has_fallthrough and has_target) {
                 try writer.print(
                     "  br i1 %branch_cond_{x:0>8}, label %pc_{x:0>8}, label %pc_{x:0>8}\n",
-                    .{ node.address, branch.target, node.address + 4 },
+                    .{ node.address, branch.target, node.address + node.size_bytes },
                 );
             } else if (has_fallthrough) {
                 try writer.print(
-                    "  br i1 %branch_cond_{x:0>8}, label %guest_return_{x:0>8}, label %pc_{x:0>8}\n",
-                    .{ node.address, function.entry_address, node.address + 4 },
+                    "  br i1 %branch_cond_{x:0>8}, label %guest_return_{s}_{x:0>8}, label %pc_{x:0>8}\n",
+                    .{ node.address, instructionSetName(function.entry.isa), function.entry.address, node.address + node.size_bytes },
                 );
             } else if (has_target) {
                 try writer.print(
-                    "  br i1 %branch_cond_{x:0>8}, label %pc_{x:0>8}, label %guest_return_{x:0>8}\n",
-                    .{ node.address, branch.target, function.entry_address },
+                    "  br i1 %branch_cond_{x:0>8}, label %pc_{x:0>8}, label %guest_return_{s}_{x:0>8}\n",
+                    .{ node.address, branch.target, instructionSetName(function.entry.isa), function.entry.address },
                 );
             } else {
-                try emitFunctionReturn(writer, function.entry_address);
+                try emitFunctionReturn(writer, function.entry);
             }
         },
         .bl => |bl| {
             try emitRegPtr(writer, "state", node.address, "lr", 14);
             try writer.print("  store i32 {d}, ptr %lr_ptr_{x:0>8}, align 4\n", .{ node.address + 4, node.address });
-            try writer.print("  call void @guest_{x:0>8}(ptr %state)\n", .{bl.target});
-            try emitFallthrough(writer, function, node.address + 4);
+            try writer.print("  call void @guest_{s}_{x:0>8}(ptr %state)\n", .{
+                instructionSetName(function.entry.isa),
+                bl.target,
+            });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .bx_target => |target| {
+            try writer.print("  call void @guest_{s}_{x:0>8}(ptr %state)\n", .{
+                instructionSetName(target.isa),
+                target.address,
+            });
+            try emitFunctionReturn(writer, function.entry);
         },
         .bx_lr => {
-            try emitFunctionReturn(writer, function.entry_address);
+            try emitFunctionReturn(writer, function.entry);
         },
         .msr_cpsr_f_imm => |flags| {
             try emitFlagPtr(writer, "state", node.address, .n);
@@ -359,12 +390,15 @@ fn emitInstructionBlock(writer: *Io.Writer, function: Function, node: Instructio
             try writer.print("  store i1 {s}, ptr %flag_c_ptr_{x:0>8}, align 1\n", .{ boolLiteral(flags.c), node.address });
             try emitFlagPtr(writer, "state", node.address, .v);
             try writer.print("  store i1 {s}, ptr %flag_v_ptr_{x:0>8}, align 1\n", .{ boolLiteral(flags.v), node.address });
-            try emitFallthrough(writer, function, node.address + 4);
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .swi => |swi| {
             _ = swi;
             try writer.print("  call i32 @shim_gba_Div(ptr %state)\n", .{});
-            try emitFallthrough(writer, function, node.address + 4);
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .bx_reg => {
+            unreachable;
         },
     }
 }
@@ -560,6 +594,13 @@ fn boolLiteral(value: bool) []const u8 {
     return if (value) "true" else "false";
 }
 
+fn instructionSetName(isa: armv4t_decode.InstructionSet) []const u8 {
+    return switch (isa) {
+        .arm => "arm",
+        .thumb => "thumb",
+    };
+}
+
 fn flagFieldIndex(flag: Flag) u8 {
     return switch (flag) {
         .n => guest_state_flag_n_field,
@@ -582,7 +623,7 @@ fn emitFallthrough(writer: *Io.Writer, function: Function, address: u32) Io.Writ
     if (hasAddress(function, address)) {
         try emitBranchTo(writer, address);
     } else {
-        try emitFunctionReturn(writer, function.entry_address);
+        try emitFunctionReturn(writer, function.entry);
     }
 }
 
@@ -590,8 +631,11 @@ fn emitBranchTo(writer: *Io.Writer, address: u32) Io.Writer.Error!void {
     try writer.print("  br label %pc_{x:0>8}\n", .{address});
 }
 
-fn emitFunctionReturn(writer: *Io.Writer, entry_address: u32) Io.Writer.Error!void {
-    try writer.print("  br label %guest_return_{x:0>8}\n", .{entry_address});
+fn emitFunctionReturn(writer: *Io.Writer, entry: armv4t_decode.CodeAddress) Io.Writer.Error!void {
+    try writer.print("  br label %guest_return_{s}_{x:0>8}\n", .{
+        instructionSetName(entry.isa),
+        entry.address,
+    });
 }
 
 fn hasAddress(function: Function, address: u32) bool {
@@ -606,14 +650,14 @@ test "llvm emission includes guest state and a lifted guest entry function" {
     defer output.deinit();
 
     const program = Program{
-        .entry_address = 0x08000000,
+        .entry = .{ .address = 0x08000000, .isa = .arm },
         .functions = &.{
             .{
-                .entry_address = 0x08000000,
+                .entry = .{ .address = 0x08000000, .isa = .arm },
                 .instructions = &.{
-                    .{ .address = 0x08000000, .instruction = .{ .mov_imm = .{ .rd = 0, .imm = 10 } } },
-                    .{ .address = 0x08000004, .instruction = .{ .mov_imm = .{ .rd = 1, .imm = 2 } } },
-                    .{ .address = 0x08000008, .instruction = .{ .swi = .{ .imm24 = 0x000006 } } },
+                    .{ .address = 0x08000000, .size_bytes = 4, .instruction = .{ .mov_imm = .{ .rd = 0, .imm = 10 } } },
+                    .{ .address = 0x08000004, .size_bytes = 4, .instruction = .{ .mov_imm = .{ .rd = 1, .imm = 2 } } },
+                    .{ .address = 0x08000008, .size_bytes = 4, .instruction = .{ .swi = .{ .imm24 = 0x000006 } } },
                 },
             },
         },
@@ -623,6 +667,6 @@ test "llvm emission includes guest state and a lifted guest entry function" {
 
     try std.testing.expectStringStartsWith(output.writer.buffered(), "; generated by hmncli phase1 slice\n");
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "%GuestState = type") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "define void @guest_08000000(ptr %state)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "call void @guest_08000000(ptr %state)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "define void @guest_arm_08000000(ptr %state)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "call void @guest_arm_08000000(ptr %state)") != null);
 }

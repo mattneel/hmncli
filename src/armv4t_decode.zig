@@ -6,6 +6,16 @@ pub const DecodeError = error{
     UnsupportedOpcode,
 } || capstone_api.DisassembleError;
 
+pub const InstructionSet = enum {
+    arm,
+    thumb,
+};
+
+pub const CodeAddress = struct {
+    address: u32,
+    isa: InstructionSet,
+};
+
 pub const Cond = enum {
     eq,
     ne,
@@ -47,6 +57,10 @@ pub const DecodedInstruction = union(enum) {
         rd: u4,
         imm: u32,
     },
+    mov_reg: struct {
+        rd: u4,
+        rm: u4,
+    },
     orr_imm: struct {
         rd: u4,
         rn: u4,
@@ -75,6 +89,10 @@ pub const DecodedInstruction = union(enum) {
     bl: struct {
         target: u32,
     },
+    bx_reg: struct {
+        reg: u4,
+    },
+    bx_target: CodeAddress,
     bx_lr,
     msr_cpsr_f_imm: StatusFlags,
     swi: struct {
@@ -84,9 +102,18 @@ pub const DecodedInstruction = union(enum) {
 
 pub fn decode(word: u32, address: u32) DecodeError!DecodedInstruction {
     const insn = try capstone_api.disassembleOneArm32(word, address);
+    return decodeInstruction(word, insn);
+}
 
+pub fn decodeThumb(halfword: u16, address: u32) DecodeError!DecodedInstruction {
+    const insn = try capstone_api.disassembleOneThumb16(halfword, address);
+    return decodeInstruction(halfword, insn);
+}
+
+fn decodeInstruction(raw_word: u32, insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
     return switch (insn.id) {
         c.ARM_INS_MOV => parseMov(insn),
+        c.ARM_INS_ADR => parseAdr(insn),
         c.ARM_INS_ORR => parseAlu3(.orr_imm, insn),
         c.ARM_INS_ADD => parseAlu3(.add_imm, insn),
         c.ARM_INS_SUB, c.ARM_INS_SUBS => if (insn.update_flags)
@@ -97,9 +124,9 @@ pub fn decode(word: u32, address: u32) DecodeError!DecodedInstruction {
         c.ARM_INS_STRB => parseStore(insn, .byte),
         c.ARM_INS_STRH => parseStore(insn, .halfword),
         c.ARM_INS_B => parseBranch(insn),
-        c.ARM_INS_BL => parseBl(word, insn),
+        c.ARM_INS_BL => parseBl(raw_word, insn),
         c.ARM_INS_BX => parseBx(insn),
-        c.ARM_INS_MSR => parseMsr(word),
+        c.ARM_INS_MSR => parseMsr(raw_word),
         c.ARM_INS_SVC => parseSwi(insn),
         else => error.UnsupportedOpcode,
     };
@@ -109,12 +136,27 @@ pub fn readWord(bytes: []const u8, offset: usize) u32 {
     return std.mem.readInt(u32, bytes[offset..][0..4], .little);
 }
 
+pub fn readHalfword(bytes: []const u8, offset: usize) u16 {
+    return std.mem.readInt(u16, bytes[offset..][0..2], .little);
+}
+
 fn parseMov(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
     if (insn.operand_count != 2) return error.UnsupportedOpcode;
-    return .{ .mov_imm = .{
-        .rd = try operandRegister(insn, 0),
-        .imm = try operandImmediateU32(insn, 1),
-    } };
+    const rd = try operandRegister(insn, 0);
+    const source = operandAt(insn, 1);
+    if (source.subtracted) return error.UnsupportedOpcode;
+
+    return switch (source.value) {
+        .imm => |imm| .{ .mov_imm = .{
+            .rd = rd,
+            .imm = try parseU32Immediate(imm),
+        } },
+        .reg => |reg| .{ .mov_reg = .{
+            .rd = rd,
+            .rm = try parseRegisterId(reg),
+        } },
+        else => error.UnsupportedOpcode,
+    };
 }
 
 fn parseAlu3(
@@ -131,6 +173,15 @@ fn parseAlu3(
         .add_imm => .{ .add_imm = .{ .rd = rd, .rn = rn, .imm = imm } },
         .subs_imm => .{ .subs_imm = .{ .rd = rd, .rn = rn, .imm = imm } },
     };
+}
+
+fn parseAdr(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+    if (insn.operand_count != 2) return error.UnsupportedOpcode;
+    const imm = try operandImmediateU32(insn, 1);
+    return .{ .mov_imm = .{
+        .rd = try operandRegister(insn, 0),
+        .imm = adrTargetAddress(insn.address, insn.size, imm),
+    } };
 }
 
 fn parseStore(insn: capstone_api.ArmInstruction, size: StoreSize) DecodeError!DecodedInstruction {
@@ -201,8 +252,8 @@ fn parseBl(word: u32, insn: capstone_api.ArmInstruction) DecodeError!DecodedInst
 fn parseBx(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
     if (insn.operand_count != 1) return error.UnsupportedOpcode;
     const reg = try operandRegister(insn, 0);
-    if (reg != 14) return error.UnsupportedOpcode;
-    return .bx_lr;
+    if (reg == 14) return .bx_lr;
+    return .{ .bx_reg = .{ .reg = reg } };
 }
 
 fn parseMsr(word: u32) DecodeError!DecodedInstruction {
@@ -282,6 +333,16 @@ fn unpackStatusFlags(value: u32) StatusFlags {
     };
 }
 
+fn adrTargetAddress(address: u64, size: u16, imm: u32) u32 {
+    const base_address: u32 = @intCast(address);
+    const pc_value = switch (size) {
+        2 => (base_address + 4) & ~@as(u32, 3),
+        4 => base_address + 8,
+        else => unreachable,
+    };
+    return pc_value + imm;
+}
+
 test "decode reads mov immediate" {
     const decoded = try decode(0xE3A0000A, 0x08000000);
     try std.testing.expectEqualDeep(
@@ -359,6 +420,14 @@ test "decode reads bx lr" {
     try std.testing.expectEqualDeep(DecodedInstruction.bx_lr, decoded);
 }
 
+test "decode reads bx r0 for later target resolution" {
+    const decoded = try decode(0xE12FFF10, 0x08000004);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
+        decoded,
+    );
+}
+
 test "decode reads msr cpsr_f immediate" {
     const decoded = try decode(0xE328F101, 0x080000F8);
     try std.testing.expectEqualDeep(
@@ -393,6 +462,41 @@ test "decode reads subs immediate" {
             .rn = 2,
             .imm = 4,
         } },
+        decoded,
+    );
+}
+
+test "decode reads thumb mov immediate" {
+    const decoded = try decodeThumb(0x2007, 0x08000008);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .mov_imm = .{ .rd = 0, .imm = 7 } },
+        decoded,
+    );
+}
+
+test "decode reads thumb mov register" {
+    const decoded = try decodeThumb(0x4684, 0x0800000A);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .mov_reg = .{ .rd = 12, .rm = 0 } },
+        decoded,
+    );
+}
+
+test "decode reads thumb add pc immediate" {
+    const decoded = try decodeThumb(0xA101, 0x0800000A);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .mov_imm = .{
+            .rd = 1,
+            .imm = 0x08000010,
+        } },
+        decoded,
+    );
+}
+
+test "decode reads thumb bx r1" {
+    const decoded = try decodeThumb(0x4708, 0x0800000C);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
         decoded,
     );
 }
