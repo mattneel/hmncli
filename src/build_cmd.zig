@@ -463,10 +463,17 @@ fn resolveDecodedInstruction(
     address: u32,
     decoded: armv4t_decode.DecodedInstruction,
 ) BuildError!armv4t_decode.DecodedInstruction {
-    return switch (decoded) {
+    const resolved = switch (decoded) {
         .bx_reg => |bx| try resolveBxTarget(image, isa, address, bx.reg),
+        .mov_reg => |mov| if (mov.rd == 15 and mov.rm != 14)
+            try resolveMovPcTarget(image, isa, address, mov.rm)
+        else
+            decoded,
         else => decoded,
     };
+
+    if (writesUnsupportedPcDestination(resolved)) return error.UnsupportedOpcode;
+    return resolved;
 }
 
 fn resolveBxTarget(
@@ -475,6 +482,29 @@ fn resolveBxTarget(
     address: u32,
     reg: u4,
 ) BuildError!armv4t_decode.DecodedInstruction {
+    return .{ .bx_target = normalizeCodeTarget(try resolvePreviousRegisterValue(image, isa, address, reg)) };
+}
+
+fn resolveMovPcTarget(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+    reg: u4,
+) BuildError!armv4t_decode.DecodedInstruction {
+    const target = normalizePcWriteTarget(try resolvePreviousRegisterValue(image, isa, address, reg), isa);
+    if (offsetForAddress(image, target, isa) == null) return error.UnsupportedOpcode;
+    return .{ .branch = .{
+        .cond = .al,
+        .target = target,
+    } };
+}
+
+fn resolvePreviousRegisterValue(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+    reg: u4,
+) BuildError!u32 {
     const previous_size = instructionSizeBytes(isa);
     if (address < image.base_address + previous_size) return error.UnsupportedOpcode;
     const previous_address = address - previous_size;
@@ -487,12 +517,11 @@ fn resolveBxTarget(
     return switch (previous_decoded) {
         .add_imm => |add| blk: {
             if (add.rd != reg or add.rn != 15) return error.UnsupportedOpcode;
-            const target_value = pcValueForInstruction(isa, previous_address) + add.imm;
-            break :blk .{ .bx_target = normalizeCodeTarget(target_value) };
+            break :blk pcValueForInstruction(isa, previous_address) + add.imm;
         },
         .mov_imm => |mov| blk: {
             if (mov.rd != reg) return error.UnsupportedOpcode;
-            break :blk .{ .bx_target = normalizeCodeTarget(mov.imm) };
+            break :blk mov.imm;
         },
         else => error.UnsupportedOpcode,
     };
@@ -503,6 +532,64 @@ fn normalizeCodeTarget(raw_target: u32) armv4t_decode.CodeAddress {
         .address = raw_target & ~@as(u32, 1),
         .isa = if ((raw_target & 1) == 0) .arm else .thumb,
     };
+}
+
+fn normalizePcWriteTarget(raw_target: u32, isa: armv4t_decode.InstructionSet) u32 {
+    return switch (isa) {
+        .arm => raw_target & ~@as(u32, 3),
+        .thumb => raw_target & ~@as(u32, 1),
+    };
+}
+
+fn writesUnsupportedPcDestination(decoded: armv4t_decode.DecodedInstruction) bool {
+    return switch (decoded) {
+        .mov_imm => |mov| mov.rd == 15,
+        .mov_reg => |mov| mov.rd == 15 and mov.rm != 14,
+        .movs_imm => |mov| mov.rd == 15,
+        .mvn_imm => |mvn| mvn.rd == 15,
+        .movs_reg => |mov| mov.rd == 15,
+        .orr_imm => |orr| orr.rd == 15,
+        .eor_imm => |eor| eor.rd == 15,
+        .bic_imm => |bic| bic.rd == 15,
+        .orr_shift_reg => |orr| orr.rd == 15,
+        .and_imm => |and_op| and_op.rd == 15,
+        .add_imm => |add| add.rd == 15,
+        .adds_imm => |add| add.rd == 15,
+        .adcs_imm => |add| add.rd == 15,
+        .adc_imm => |add| add.rd == 15,
+        .sbcs_imm => |sub| sub.rd == 15,
+        .sbc_imm => |sub| sub.rd == 15,
+        .add_reg => |add| add.rd == 15,
+        .rsb_imm => |sub| sub.rd == 15,
+        .rsc_imm => |sub| sub.rd == 15,
+        .sub_imm => |sub| sub.rd == 15,
+        .subs_imm => |sub| sub.rd == 15,
+        .lsl_imm => |shift| shift.rd == 15,
+        .lsl_reg => |shift| shift.rd == 15,
+        .asr_imm => |shift| shift.rd == 15,
+        .asr_reg => |shift| shift.rd == 15,
+        .lsls_imm => |shift| shift.rd == 15,
+        .lsls_reg => |shift| shift.rd == 15,
+        .lsr_imm => |shift| shift.rd == 15,
+        .lsrs_imm => |shift| shift.rd == 15,
+        .lsr_reg => |shift| shift.rd == 15,
+        .lsrs_reg => |shift| shift.rd == 15,
+        .asrs_imm => |shift| shift.rd == 15,
+        .asrs_reg => |shift| shift.rd == 15,
+        .ror_imm => |shift| shift.rd == 15,
+        .ror_reg => |shift| shift.rd == 15,
+        .rors_imm => |shift| shift.rd == 15,
+        .rors_reg => |shift| shift.rd == 15,
+        .rrxs => |rrx| rrx.rd == 15,
+        .mla => |mla| mla.rd == 15,
+        .ldr_word_imm => |load| load.rd == 15,
+        .ldm => |ldm| registerMaskIncludesPc(ldm.mask),
+        else => false,
+    };
+}
+
+fn registerMaskIncludesPc(mask: u16) bool {
+    return (mask & (@as(u16, 1) << 15)) != 0;
 }
 
 fn pcValueForInstruction(isa: armv4t_decode.InstructionSet, address: u32) u32 {
@@ -785,7 +872,7 @@ test "build executes the real jsmolka stripes rom and produces the expected memo
     );
 }
 
-test "lifted real arm rom reaches the report block" {
+test "lifted real arm rom reports the first honest pc-state failure" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -805,14 +892,48 @@ test "lifted real arm rom reaches the report block" {
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
 
-    const program = try liftRom(std.testing.allocator, &output.writer, image);
-    defer program.deinit(std.testing.allocator);
-
-    try std.testing.expect(hasInstructionAddress(program.functions, 0x0800_1D4C));
-    try std.testing.expectEqual(llvm_codegen.OutputMode.arm_report, program.output_mode);
+    try std.testing.expectError(
+        error.UnsupportedOpcode,
+        liftRom(std.testing.allocator, &output.writer, image),
+    );
+    try std.testing.expectStringStartsWith(
+        output.writer.buffered(),
+        "Unsupported opcode 0xE329F011 at 0x08000AE4 for armv4t\n",
+    );
 }
 
-test "build uses the real jsmolka arm rom and reports the rom verdict" {
+test "build reports a structured diagnostic for unsupported subs pc immediate" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = [_]u8{ 0x04, 0xF0, 0x5F, 0xE2 };
+    try tmp.dir.writeFile(io, .{ .sub_path = "subs-pc.gba", .data = &rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(
+        error.UnsupportedOpcode,
+        run(
+            io,
+            std.testing.allocator,
+            tmp.dir,
+            &output.writer,
+            .{
+                .rom_path = "subs-pc.gba",
+                .machine_name = "gba",
+                .output_path = "should-not-exist",
+            },
+        ),
+    );
+    try std.testing.expectStringStartsWith(
+        output.writer.buffered(),
+        "Unsupported opcode 0xE25FF004 at 0x08000000 for armv4t\n",
+    );
+}
+
+test "build reports the first honest arm.gba pc-state failure" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -829,28 +950,23 @@ test "build uses the real jsmolka arm rom and reports the rom verdict" {
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
 
-    try run(
-        io,
-        std.testing.allocator,
-        tmp.dir,
-        &output.writer,
-        .{
-            .rom_path = "arm.gba",
-            .machine_name = "gba",
-            .target = "x86_64-linux",
-            .output_path = "arm-native",
-        },
+    try std.testing.expectError(
+        error.UnsupportedOpcode,
+        run(
+            io,
+            std.testing.allocator,
+            tmp.dir,
+            &output.writer,
+            .{
+                .rom_path = "arm.gba",
+                .machine_name = "gba",
+                .target = "x86_64-linux",
+                .output_path = "arm-native",
+            },
+        ),
     );
-
-    const result = try std.process.run(std.testing.allocator, io, .{
-        .argv = &.{"./arm-native"},
-        .cwd = .{ .dir = tmp.dir },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(1024),
-    });
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
-
-    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings("PASS\n", result.stdout);
+    try std.testing.expectStringStartsWith(
+        output.writer.buffered(),
+        "Unsupported opcode 0xE329F011 at 0x08000AE4 for armv4t\n",
+    );
 }

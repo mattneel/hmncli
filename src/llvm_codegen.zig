@@ -426,12 +426,9 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
                 try emitFunctionReturn(writer, function.entry);
                 return;
             }
+            if (mov.rd == 15) unreachable;
             try emitRegPtr(writer, "state", node.address, "rm", mov.rm);
             try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
-            if (mov.rd == 15) {
-                try emitPcDispatch(writer, function, node.address, "rm_val");
-                return;
-            }
             try emitRegPtr(writer, "state", node.address, "rd", mov.rd);
             try writer.print("  store i32 %rm_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
@@ -441,6 +438,7 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
                 try emitFunctionReturn(writer, function.entry);
                 return;
             }
+            if (mov.rd == 15) unreachable;
             try emitRegPtr(writer, "state", node.address, "rm", mov.rm);
             try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitRegPtr(writer, "state", node.address, "rd", mov.rd);
