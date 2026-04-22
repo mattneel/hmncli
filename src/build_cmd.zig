@@ -2212,17 +2212,19 @@ test "build optimization levels map to toolchain flags" {
     try std.testing.expectEqualStrings("ReleaseSmall", zigOptimizeModeArg(.small));
 }
 
-test "build executes a self-loop slice and reports retired instruction count" {
+test "build executes the synthetic tight-loop benchmark rom and reports retired instruction count" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const rom = [_]u8{
-        0x00, 0x00, 0xA0, 0xE3, // mov r0, #0
-        0x01, 0x00, 0x80, 0xE2, // add r0, r0, #1
-        0xFD, 0xFF, 0xFF, 0xEA, // b   0x08000004
-    };
-    try tmp.dir.writeFile(io, .{ .sub_path = "loop.gba", .data = &rom });
+    const rom = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/bench/arm-tight-loop.gba",
+        std.testing.allocator,
+        .limited(1024),
+    );
+    defer std.testing.allocator.free(rom);
+    try tmp.dir.writeFile(io, .{ .sub_path = "arm-tight-loop.gba", .data = rom });
 
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
@@ -2233,17 +2235,17 @@ test "build executes a self-loop slice and reports retired instruction count" {
         tmp.dir,
         &output.writer,
         .{
-            .rom_path = "loop.gba",
+            .rom_path = "arm-tight-loop.gba",
             .machine_name = "gba",
             .target = "x86_64-linux",
             .output_mode = .retired_count,
             .max_instructions = 7,
-            .output_path = "loop-retired-native",
+            .output_path = "arm-tight-loop-native",
         },
     );
 
     const result = try std.process.run(std.testing.allocator, io, .{
-        .argv = &.{"./loop-retired-native"},
+        .argv = &.{"./arm-tight-loop-native"},
         .cwd = .{ .dir = tmp.dir },
         .stdout_limit = .limited(1024),
         .stderr_limit = .limited(1024),
