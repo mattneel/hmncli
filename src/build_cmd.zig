@@ -791,6 +791,10 @@ fn resolveDecodedInstruction(
             try resolveLdrPcPostImmTarget(image, isa, address, load)
         else
             decoded,
+        .bl => |bl| if (try resolveDevkitArmCrt0StartupThumbBlxR3Target(image, isa, address, bl.target)) |resolved_target|
+            armv4t_decode.DecodedInstruction{ .bl = .{ .target = resolved_target } }
+        else
+            decoded,
         else => decoded,
     };
 
@@ -811,6 +815,31 @@ fn resolveBxTarget(
         }
     }
     return .{ .bx_target = normalizeCodeTarget(try resolvePreviousRegisterValue(image, isa, address, reg)) };
+}
+
+fn resolveDevkitArmCrt0StartupThumbBlxR3Target(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    bl_address: u32,
+    target_address: u32,
+) BuildError!?u32 {
+    if (isa != .thumb) return null;
+
+    const startup_limit = image.base_address + 0x200;
+    if (bl_address >= startup_limit or target_address >= startup_limit) return null;
+
+    const target = decodeImageInstructionUnchecked(image, .thumb, target_address) catch return null;
+    const bx = switch (target.instruction) {
+        .bx_reg => |bx| bx,
+        else => return null,
+    };
+    if (bx.reg != 3) return null;
+
+    const raw_target = try resolvePreviousRegisterValue(image, isa, bl_address, 3);
+    const code_target = normalizeCodeTarget(raw_target);
+    if (code_target.isa != .thumb) return error.UnsupportedOpcode;
+    if (offsetForAddress(image, code_target.address, code_target.isa) == null) return error.UnsupportedOpcode;
+    return code_target.address;
 }
 
 fn resolveStartupThumbBxR6TargetValue(
@@ -1645,7 +1674,8 @@ test "tonc fixtures stop at the shared arm decode blocker after startup pruning"
         try std.testing.expect(result.failed);
         try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x00004730 at 0x08000124 for armv4t") == null);
         try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported control flow target 0x02000000 for gba") == null);
-        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x00004718 at 0x0800019A for armv4t") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0xF80FF000 at 0x08000178 for armv4t") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x00004718 at 0x0800019A for armv4t") == null);
     }
 }
 
