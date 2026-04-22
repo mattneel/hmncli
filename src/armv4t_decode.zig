@@ -1721,8 +1721,14 @@ fn parseStm(
     insn: capstone_api.ArmInstruction,
     mode: BlockTransferMode,
 ) DecodeError!DecodedInstruction {
-    const base_reg: u4 = @truncate((word >> 16) & 0xF);
-    const register_mask: u16 = @truncate(word & 0xFFFF);
+    const base_reg: u4 = if (insn.size == 2)
+        @truncate((word >> 8) & 0x7)
+    else
+        @truncate((word >> 16) & 0xF);
+    const register_mask: u16 = if (insn.size == 2)
+        @truncate(word & 0xFF)
+    else
+        @truncate(word & 0xFFFF);
 
     if (register_mask == 0) return error.UnsupportedOpcode;
 
@@ -1739,8 +1745,14 @@ fn parseLdm(
     insn: capstone_api.ArmInstruction,
     mode: BlockTransferMode,
 ) DecodeError!DecodedInstruction {
-    const base_reg: u4 = @truncate((word >> 16) & 0xF);
-    const register_mask: u16 = @truncate(word & 0xFFFF);
+    const base_reg: u4 = if (insn.size == 2)
+        @truncate((word >> 8) & 0x7)
+    else
+        @truncate((word >> 16) & 0xF);
+    const register_mask: u16 = if (insn.size == 2)
+        @truncate(word & 0xFF)
+    else
+        @truncate(word & 0xFFFF);
 
     if (register_mask == 0) return error.UnsupportedOpcode;
     if (mode == .ia and base_reg == 13 and insn.writeback) {
@@ -3233,6 +3245,32 @@ test "decode reads thumb bx r1" {
     const decoded = try decodeThumb(0x4708, 0x0800000C);
     try std.testing.expectEqualDeep(
         DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        decoded,
+    );
+}
+
+test "decode reads thumb ldmia register list" {
+    const decoded = try decodeThumb(0xC901, 0x080001A6);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .ldm = .{
+            .base = 1,
+            .mask = 0x0001,
+            .writeback = true,
+            .mode = .ia,
+        } },
+        decoded,
+    );
+}
+
+test "decode reads thumb stmia register list" {
+    const decoded = try decodeThumb(0xC201, 0x080001A8);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .stm = .{
+            .base = 2,
+            .mask = 0x0001,
+            .writeback = true,
+            .mode = .ia,
+        } },
         decoded,
     );
 }

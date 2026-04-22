@@ -1645,7 +1645,7 @@ test "tonc fixtures stop at the shared arm decode blocker after startup pruning"
         try std.testing.expect(result.failed);
         try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x00004730 at 0x08000124 for armv4t") == null);
         try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported control flow target 0x02000000 for gba") == null);
-        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x0000C901 at 0x080001A6 for armv4t") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x00004718 at 0x0800019A for armv4t") != null);
     }
 }
 
