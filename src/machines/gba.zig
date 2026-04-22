@@ -128,6 +128,20 @@ pub const shims: []const shim_mod.ShimDecl = &.{
         },
         .notes = &.{"Pure arithmetic BIOS helper for the next jsmolka BIOS test slice."},
     },
+    .{
+        .id = .{
+            .kind = .shim,
+            .namespace = "gba",
+            .name = "VBlankIntrWait",
+        },
+        .state = .implemented,
+        .args = &.{},
+        .returns = .i32,
+        .effects = .device_io,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Minimal tonc bring-up wait shim: advance the synthetic VBlank count, refresh KEYINPUT, optionally fire VBlank-side effects, then return."},
+    },
 };
 
 pub const instructions: []const instruction_mod.InstructionDecl = &.{

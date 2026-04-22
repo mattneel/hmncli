@@ -61,6 +61,23 @@ pub export fn hm_runtime_max_instructions(default_limit: u64) u64 {
     return std.fmt.parseUnsigned(u64, std.mem.span(value), 10) catch default_limit;
 }
 
+pub export fn hmgba_sample_keyinput_for_frame(frame_index: u64) u16 {
+    const script = getenv("HOMONCULI_KEYINPUT_SCRIPT") orelse return 0x03FF;
+    return hmgbaSampleKeyinput(std.mem.span(script), frame_index);
+}
+
+pub fn hmgbaSampleKeyinput(script: []const u8, frame_index: u64) u16 {
+    var iter = std.mem.tokenizeScalar(u8, script, ',');
+    var current: u16 = 0x03FF;
+    var index: u64 = 0;
+    while (iter.next()) |token| {
+        current = std.fmt.parseUnsigned(u16, token, 16) catch 0x03FF;
+        if (index == frame_index) return current;
+        index += 1;
+    }
+    return current;
+}
+
 pub export fn hmgba_dump_frame_raw(
     io: [*]const u8,
     palette: [*]const u8,
@@ -107,4 +124,10 @@ test "mode4 renderer rejects unsupported display mode" {
 
     io[0] = 3;
     try std.testing.expectError(error.UnsupportedVideoMode, dumpMode4Rgba(&io, &palette, &vram, &rgba));
+}
+
+test "gba keyinput helper replays comma-separated active-low samples" {
+    try std.testing.expectEqual(@as(u16, 0x03FF), hmgbaSampleKeyinput("03ff,03fe", 0));
+    try std.testing.expectEqual(@as(u16, 0x03FE), hmgbaSampleKeyinput("03ff,03fe", 1));
+    try std.testing.expectEqual(@as(u16, 0x03FE), hmgbaSampleKeyinput("03ff,03fe", 9));
 }

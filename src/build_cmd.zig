@@ -78,10 +78,7 @@ pub fn run(
     defer allocator.free(llvm_path);
     try ensureParentDir(io, cwd, llvm_path);
     try writeLlvmFile(io, allocator, cwd, llvm_path, program);
-    const runtime_helper_obj = if (options.output_mode == .frame_raw or options.output_mode == .retired_count)
-        try compileRuntimeHelper(io, allocator, cwd, writer, options)
-    else
-        null;
+    const runtime_helper_obj = try compileRuntimeHelper(io, allocator, cwd, writer, options);
     defer if (runtime_helper_obj) |helper_path| allocator.free(helper_path);
     try compileLlvm(io, allocator, cwd, writer, llvm_path, runtime_helper_obj, options);
     try writer.print("Built {s}\n", .{options.output_path});
@@ -1455,12 +1452,17 @@ fn isDivSwi(imm24: u24) bool {
     return imm24 == 0x000006 or imm24 == 0x060000;
 }
 
+fn isVBlankIntrWaitSwi(imm24: u24) bool {
+    return imm24 == 0x000005 or imm24 == 0x050000;
+}
+
 fn isSqrtSwi(imm24: u24) bool {
     return imm24 == 0x000008 or imm24 == 0x080000;
 }
 
 fn swiShimName(imm24: u24) ?[]const u8 {
     if (imm24 == 0x000000) return "SoftReset";
+    if (isVBlankIntrWaitSwi(imm24)) return "VBlankIntrWait";
     if (isDivSwi(imm24)) return "Div";
     if (isSqrtSwi(imm24)) return "Sqrt";
     return null;
@@ -2025,7 +2027,7 @@ test "thumb saved-lr return epilogue rejects local tail near-misses" {
     }
 }
 
-test "tonc fixtures advance the sbb_reg slice and keep irq_demo deferred" {
+test "tonc fixtures advance past VBlankIntrWait and keep irq_demo deferred" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2039,7 +2041,7 @@ test "tonc fixtures advance the sbb_reg slice and keep irq_demo deferred" {
         .{
             .rom_path = "tests/fixtures/real/tonc/sbb_reg.gba",
             .old_blocker = "Unsupported opcode 0x00004700 at 0x08000456 for armv4t",
-            .next_blocker = "Unsupported SWI 0x000005 at 0x08000820 for gba",
+            .next_blocker = "Unsupported opcode 0x00004700 at 0x08000316 for armv4t",
             .still_blocked_here = false,
         },
         .{
@@ -2051,7 +2053,7 @@ test "tonc fixtures advance the sbb_reg slice and keep irq_demo deferred" {
         .{
             .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
             .old_blocker = "Unsupported opcode 0x00000021 at 0x080002F6 for armv4t",
-            .next_blocker = "Unsupported SWI 0x000005 at 0x08000768 for gba",
+            .next_blocker = "Unsupported opcode 0x00004718 at 0x0800081C for armv4t",
             .still_blocked_here = false,
         },
         .{
@@ -2072,6 +2074,26 @@ test "tonc fixtures advance the sbb_reg slice and keep irq_demo deferred" {
             try std.testing.expect(std.mem.indexOf(u8, result.stderr, fixture.old_blocker) == null);
         }
         try std.testing.expect(std.mem.indexOf(u8, result.stderr, fixture.next_blocker) != null);
+    }
+}
+
+test "tonc sbb_reg and key_demo no longer stop at VBlankIntrWait swi" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom_paths = [_][]const u8{
+        "tests/fixtures/real/tonc/sbb_reg.gba",
+        "tests/fixtures/real/tonc/key_demo.gba",
+    };
+
+    for (rom_paths) |rom_path| {
+        const result = try buildFixtureCaptureOutput(std.testing.allocator, io, tmp.dir, rom_path);
+        defer std.testing.allocator.free(result.stderr);
+
+        try std.testing.expect(result.failed);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported SWI 0x000005") == null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported SWI 0x050000") == null);
     }
 }
 
