@@ -97,6 +97,12 @@ pub fn disassembleOneThumb16(halfword: u16, address: u64) DisassembleError!ArmIn
     return disassembleOne(&halfword_bytes, address, c.CS_MODE_THUMB);
 }
 
+pub fn disassembleOneThumb32(word: u32, address: u64) DisassembleError!ArmInstruction {
+    var word_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &word_bytes, word, .little);
+    return disassembleOne(&word_bytes, address, c.CS_MODE_THUMB);
+}
+
 fn disassembleOne(bytes: []const u8, address: u64, mode: u32) DisassembleError!ArmInstruction {
     var handle: usize = 0;
     if (c.cs_open(c.CS_ARCH_ARM, mode, &handle) != c.CS_ERR_OK) return error.OpenFailed;
@@ -202,6 +208,19 @@ test "capstone exposes structured thumb detail" {
     }
     switch (actual.operands[1].value) {
         .imm => |imm| try std.testing.expectEqual(@as(i64, 7), imm),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "capstone exposes structured thumb bl detail" {
+    const actual = try disassembleOneThumb32(0xFC11F000, 0x0800010A);
+    try std.testing.expectEqual(@as(u32, c.ARM_INS_BL), actual.id);
+    try std.testing.expectEqual(@as(u64, 0x0800010A), actual.address);
+    try std.testing.expectEqual(@as(u16, 4), actual.size);
+    try std.testing.expectEqual(@as(u32, c.ARMCC_AL), actual.cc);
+    try std.testing.expectEqual(@as(u8, 1), actual.operand_count);
+    switch (actual.operands[0].value) {
+        .imm => |imm| try std.testing.expectEqual(@as(i64, 0x08000930), imm),
         else => return error.TestUnexpectedResult,
     }
 }

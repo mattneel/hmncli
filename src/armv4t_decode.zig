@@ -16,6 +16,12 @@ pub const CodeAddress = struct {
     isa: InstructionSet,
 };
 
+pub const DecodedOpcode = struct {
+    raw_opcode: u32,
+    size_bytes: u8,
+    instruction: DecodedInstruction,
+};
+
 pub const Cond = enum {
     eq,
     ne,
@@ -117,6 +123,11 @@ pub const DecodedInstruction = union(enum) {
         rd: u4,
         imm: u32,
     },
+    mvn_reg: struct {
+        rd: u4,
+        rm: u4,
+        update_flags: bool,
+    },
     movs_reg: struct {
         rd: u4,
         rm: u4,
@@ -126,15 +137,33 @@ pub const DecodedInstruction = union(enum) {
         rn: u4,
         imm: u32,
     },
+    orr_reg: struct {
+        rd: u4,
+        rn: u4,
+        rm: u4,
+        update_flags: bool,
+    },
     eor_imm: struct {
         rd: u4,
         rn: u4,
         imm: u32,
     },
+    eor_reg: struct {
+        rd: u4,
+        rn: u4,
+        rm: u4,
+        update_flags: bool,
+    },
     bic_imm: struct {
         rd: u4,
         rn: u4,
         imm: u32,
+    },
+    bic_reg: struct {
+        rd: u4,
+        rn: u4,
+        rm: u4,
+        update_flags: bool,
     },
     orr_shift_reg: struct {
         rd: u4,
@@ -146,6 +175,12 @@ pub const DecodedInstruction = union(enum) {
         rd: u4,
         rn: u4,
         imm: u32,
+    },
+    and_reg: struct {
+        rd: u4,
+        rn: u4,
+        rm: u4,
+        update_flags: bool,
     },
     add_imm: struct {
         rd: u4,
@@ -178,6 +213,11 @@ pub const DecodedInstruction = union(enum) {
         rn: u4,
         imm: u32,
     },
+    sbcs_reg: struct {
+        rd: u4,
+        rn: u4,
+        rm: u4,
+    },
     sbc_imm: struct {
         rd: u4,
         rn: u4,
@@ -188,6 +228,9 @@ pub const DecodedInstruction = union(enum) {
         rn: u4,
         rm: u4,
     },
+    add_reg_pc_target: struct {
+        target: u32,
+    },
     add_shift_reg: struct {
         rd: u4,
         rn: u4,
@@ -195,6 +238,11 @@ pub const DecodedInstruction = union(enum) {
         shift: ShiftOperand,
     },
     rsb_imm: struct {
+        rd: u4,
+        rn: u4,
+        imm: u32,
+    },
+    rsbs_imm: struct {
         rd: u4,
         rn: u4,
         imm: u32,
@@ -213,6 +261,11 @@ pub const DecodedInstruction = union(enum) {
         rd: u4,
         rn: u4,
         imm: u32,
+    },
+    subs_reg: struct {
+        rd: u4,
+        rn: u4,
+        rm: u4,
     },
     lsl_imm: struct {
         rd: u4,
@@ -364,6 +417,11 @@ pub const DecodedInstruction = union(enum) {
         base: u4,
         offset: u32,
     },
+    ldr_byte_reg: struct {
+        rd: u4,
+        base: u4,
+        rm: u4,
+    },
     ldr_halfword_imm: struct {
         rd: u4,
         base: u4,
@@ -374,6 +432,7 @@ pub const DecodedInstruction = union(enum) {
         base: u4,
         rm: u4,
         subtract: bool,
+        writeback: bool,
     },
     ldr_halfword_pre_index_imm: struct {
         rd: u4,
@@ -392,10 +451,20 @@ pub const DecodedInstruction = union(enum) {
         base: u4,
         offset: u32,
     },
+    ldr_signed_halfword_reg: struct {
+        rd: u4,
+        base: u4,
+        rm: u4,
+    },
     ldr_signed_byte_imm: struct {
         rd: u4,
         base: u4,
         offset: u32,
+    },
+    ldr_signed_byte_reg: struct {
+        rd: u4,
+        base: u4,
+        rm: u4,
     },
     ldr_word_pre_index_reg_shift: struct {
         rd: u4,
@@ -403,6 +472,7 @@ pub const DecodedInstruction = union(enum) {
         rm: u4,
         shift: ShiftImm,
         subtract: bool,
+        writeback: bool,
     },
     ldr_word_pre_index_imm: struct {
         rd: u4,
@@ -463,6 +533,10 @@ pub const DecodedInstruction = union(enum) {
         rn: u4,
         imm: u32,
         carry: ?bool,
+    },
+    tst_reg: struct {
+        rn: u4,
+        rm: u4,
     },
     cmp_imm: struct {
         rn: u4,
@@ -530,6 +604,49 @@ pub fn decodeThumb(halfword: u16, address: u32) DecodeError!DecodedInstruction {
     return decodeInstruction(halfword, insn);
 }
 
+pub fn decodeAt(bytes: []const u8, isa: InstructionSet, address: u32) DecodeError!DecodedOpcode {
+    return switch (isa) {
+        .arm => decodeArmAt(bytes, address),
+        .thumb => decodeThumbAt(bytes, address),
+    };
+}
+
+fn decodeArmAt(bytes: []const u8, address: u32) DecodeError!DecodedOpcode {
+    if (bytes.len < 4) return error.UnsupportedOpcode;
+    const word = readWord(bytes, 0);
+    return .{
+        .raw_opcode = word,
+        .size_bytes = 4,
+        .instruction = try decode(word, address),
+    };
+}
+
+fn decodeThumbAt(bytes: []const u8, address: u32) DecodeError!DecodedOpcode {
+    if (bytes.len < 2) return error.UnsupportedOpcode;
+    const halfword = readHalfword(bytes, 0);
+    if (isThumbLongInstructionPrefix(halfword)) {
+        if (bytes.len < 4) return error.UnsupportedOpcode;
+        const word = readWord(bytes, 0);
+        const insn = try capstone_api.disassembleOneThumb32(word, address);
+        return .{
+            .raw_opcode = word,
+            .size_bytes = @intCast(insn.size),
+            .instruction = try decodeInstruction(word, insn),
+        };
+    }
+
+    const insn = try capstone_api.disassembleOneThumb16(halfword, address);
+    return .{
+        .raw_opcode = halfword,
+        .size_bytes = @intCast(insn.size),
+        .instruction = try decodeInstruction(halfword, insn),
+    };
+}
+
+fn isThumbLongInstructionPrefix(halfword: u16) bool {
+    return (halfword & 0xF800) == 0xF000;
+}
+
 fn decodeInstruction(raw_word: u32, insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
     if (raw_word == 0xE320F000) return .nop;
     return switch (insn.id) {
@@ -574,6 +691,8 @@ fn decodeInstruction(raw_word: u32, insn: capstone_api.ArmInstruction) DecodeErr
         c.ARM_INS_LDMDA => parseLdm(raw_word, insn, .da),
         c.ARM_INS_LDMDB => parseLdm(raw_word, insn, .db),
         c.ARM_INS_LDMIB => parseLdm(raw_word, insn, .ib),
+        c.ARM_INS_PUSH => parseStackTransfer(raw_word, insn, .push),
+        c.ARM_INS_POP => parseStackTransfer(raw_word, insn, .pop),
         c.ARM_INS_TST => parseTst(raw_word, insn),
         c.ARM_INS_CMP => parseCmp(insn),
         c.ARM_INS_CMN => parseCmn(insn),
@@ -803,10 +922,14 @@ fn parseAlu3(
     comptime tag: enum { orr_imm, and_imm, eor_imm, bic_imm, subs_imm },
     insn: capstone_api.ArmInstruction,
 ) DecodeError!DecodedInstruction {
-    if (insn.operand_count != 3) return error.UnsupportedOpcode;
-    const rd = try operandRegister(insn, 0);
-    const rn = try operandRegister(insn, 1);
-    const source = operandAt(insn, 2);
+    const rd, const rn, const source = switch (insn.operand_count) {
+        2 => blk: {
+            const dest = try operandRegister(insn, 0);
+            break :blk .{ dest, dest, operandAt(insn, 1) };
+        },
+        3 => .{ try operandRegister(insn, 0), try operandRegister(insn, 1), operandAt(insn, 2) },
+        else => return error.UnsupportedOpcode,
+    };
     if (source.subtracted) return error.UnsupportedOpcode;
 
     return switch (tag) {
@@ -816,42 +939,101 @@ fn parseAlu3(
                 .rn = rn,
                 .imm = try parseU32Immediate(imm),
             } },
-            .reg => |reg| .{ .orr_shift_reg = .{
-                .rd = rd,
-                .rn = rn,
-                .rm = try parseRegisterId(reg),
-                .shift = try parseShiftImm(source),
-            } },
+            .reg => |reg| if (source.shift_type == c.ARM_SFT_INVALID)
+                .{ .orr_reg = .{
+                    .rd = rd,
+                    .rn = rn,
+                    .rm = try parseRegisterId(reg),
+                    .update_flags = insn.update_flags,
+                } }
+            else
+                .{ .orr_shift_reg = .{
+                    .rd = rd,
+                    .rn = rn,
+                    .rm = try parseRegisterId(reg),
+                    .shift = try parseShiftImm(source),
+                } },
             else => error.UnsupportedOpcode,
         },
-        .eor_imm => .{ .eor_imm = .{
-            .rd = rd,
-            .rn = rn,
-            .imm = try operandImmediateU32(insn, 2),
-        } },
-        .bic_imm => .{ .bic_imm = .{
-            .rd = rd,
-            .rn = rn,
-            .imm = try operandImmediateU32(insn, 2),
-        } },
-        .and_imm => .{ .and_imm = .{
-            .rd = rd,
-            .rn = rn,
-            .imm = try operandImmediateU32(insn, 2),
-        } },
-        .subs_imm => .{ .subs_imm = .{
-            .rd = rd,
-            .rn = rn,
-            .imm = try operandImmediateU32(insn, 2),
-        } },
+        .eor_imm => switch (source.value) {
+            .imm => |imm| .{ .eor_imm = .{
+                .rd = rd,
+                .rn = rn,
+                .imm = try parseU32Immediate(imm),
+            } },
+            .reg => |reg| if (source.shift_type == c.ARM_SFT_INVALID)
+                .{ .eor_reg = .{
+                    .rd = rd,
+                    .rn = rn,
+                    .rm = try parseRegisterId(reg),
+                    .update_flags = insn.update_flags,
+                } }
+            else
+                error.UnsupportedOpcode,
+            else => error.UnsupportedOpcode,
+        },
+        .bic_imm => switch (source.value) {
+            .imm => |imm| .{ .bic_imm = .{
+                .rd = rd,
+                .rn = rn,
+                .imm = try parseU32Immediate(imm),
+            } },
+            .reg => |reg| if (source.shift_type == c.ARM_SFT_INVALID)
+                .{ .bic_reg = .{
+                    .rd = rd,
+                    .rn = rn,
+                    .rm = try parseRegisterId(reg),
+                    .update_flags = insn.update_flags,
+                } }
+            else
+                error.UnsupportedOpcode,
+            else => error.UnsupportedOpcode,
+        },
+        .and_imm => switch (source.value) {
+            .imm => |imm| .{ .and_imm = .{
+                .rd = rd,
+                .rn = rn,
+                .imm = try parseU32Immediate(imm),
+            } },
+            .reg => |reg| if (source.shift_type == c.ARM_SFT_INVALID)
+                .{ .and_reg = .{
+                    .rd = rd,
+                    .rn = rn,
+                    .rm = try parseRegisterId(reg),
+                    .update_flags = insn.update_flags,
+                } }
+            else
+                error.UnsupportedOpcode,
+            else => error.UnsupportedOpcode,
+        },
+        .subs_imm => switch (source.value) {
+            .imm => |imm| .{ .subs_imm = .{
+                .rd = rd,
+                .rn = rn,
+                .imm = try parseU32Immediate(imm),
+            } },
+            .reg => |reg| if (source.shift_type == c.ARM_SFT_INVALID)
+                .{ .subs_reg = .{
+                    .rd = rd,
+                    .rn = rn,
+                    .rm = try parseRegisterId(reg),
+                } }
+            else
+                error.UnsupportedOpcode,
+            else => error.UnsupportedOpcode,
+        },
     };
 }
 
 fn parseAdd(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
-    if (insn.operand_count != 3) return error.UnsupportedOpcode;
-    const rd = try operandRegister(insn, 0);
-    const rn = try operandRegister(insn, 1);
-    const source = operandAt(insn, 2);
+    const rd, const rn, const source = switch (insn.operand_count) {
+        2 => blk: {
+            const dest = try operandRegister(insn, 0);
+            break :blk .{ dest, dest, operandAt(insn, 1) };
+        },
+        3 => .{ try operandRegister(insn, 0), try operandRegister(insn, 1), operandAt(insn, 2) },
+        else => return error.UnsupportedOpcode,
+    };
     if (source.subtracted) return error.UnsupportedOpcode;
 
     return switch (source.value) {
@@ -889,64 +1071,114 @@ fn parseAdd(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
 
 fn parseMvn(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
     if (insn.operand_count != 2) return error.UnsupportedOpcode;
-    return .{ .mvn_imm = .{
-        .rd = try operandRegister(insn, 0),
-        .imm = try operandImmediateU32(insn, 1),
-    } };
+    const rd = try operandRegister(insn, 0);
+    const source = operandAt(insn, 1);
+    if (source.subtracted) return error.UnsupportedOpcode;
+    return switch (source.value) {
+        .imm => |imm| .{ .mvn_imm = .{
+            .rd = rd,
+            .imm = try parseU32Immediate(imm),
+        } },
+        .reg => |reg| if (source.shift_type == c.ARM_SFT_INVALID)
+            .{ .mvn_reg = .{
+                .rd = rd,
+                .rm = try parseRegisterId(reg),
+                .update_flags = insn.update_flags,
+            } }
+        else
+            error.UnsupportedOpcode,
+        else => error.UnsupportedOpcode,
+    };
 }
 
 fn parseAdc(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
-    if (insn.operand_count != 3) return error.UnsupportedOpcode;
-    const source = operandAt(insn, 2);
+    const rd, const rn, const source = switch (insn.operand_count) {
+        2 => blk: {
+            const dest = try operandRegister(insn, 0);
+            break :blk .{ dest, dest, operandAt(insn, 1) };
+        },
+        3 => .{ try operandRegister(insn, 0), try operandRegister(insn, 1), operandAt(insn, 2) },
+        else => return error.UnsupportedOpcode,
+    };
     if (source.subtracted) return error.UnsupportedOpcode;
 
     if (insn.update_flags and source.value == .reg) {
+        const shift: ShiftOperand = if (source.shift_type == c.ARM_SFT_INVALID)
+            .{ .imm = .{ .kind = .lsl, .amount = 0 } }
+        else
+            try parseShiftOperand(source);
         return .{ .adcs_shift_reg = .{
-            .rd = try operandRegister(insn, 0),
-            .rn = try operandRegister(insn, 1),
-            .rm = try operandRegister(insn, 2),
-            .shift = try parseShiftOperand(source),
+            .rd = rd,
+            .rn = rn,
+            .rm = try operandRegister(insn, insn.operand_count - 1),
+            .shift = shift,
         } };
     }
 
     return if (insn.update_flags)
         .{ .adcs_imm = .{
-            .rd = try operandRegister(insn, 0),
-            .rn = try operandRegister(insn, 1),
-            .imm = try operandImmediateU32(insn, 2),
+            .rd = rd,
+            .rn = rn,
+            .imm = try operandImmediateU32(insn, insn.operand_count - 1),
         } }
     else
         .{ .adc_imm = .{
-            .rd = try operandRegister(insn, 0),
-            .rn = try operandRegister(insn, 1),
-            .imm = try operandImmediateU32(insn, 2),
+            .rd = rd,
+            .rn = rn,
+            .imm = try operandImmediateU32(insn, insn.operand_count - 1),
         } };
 }
 
 fn parseSbc(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+    const rd, const rn, const source = switch (insn.operand_count) {
+        2 => blk: {
+            const dest = try operandRegister(insn, 0);
+            break :blk .{ dest, dest, operandAt(insn, 1) };
+        },
+        3 => .{ try operandRegister(insn, 0), try operandRegister(insn, 1), operandAt(insn, 2) },
+        else => return error.UnsupportedOpcode,
+    };
+    if (source.subtracted) return error.UnsupportedOpcode;
+
+    return switch (source.value) {
+        .imm => |imm| if (insn.update_flags)
+            .{ .sbcs_imm = .{
+                .rd = rd,
+                .rn = rn,
+                .imm = try parseU32Immediate(imm),
+            } }
+        else
+            .{ .sbc_imm = .{
+                .rd = rd,
+                .rn = rn,
+                .imm = try parseU32Immediate(imm),
+            } },
+        .reg => |reg| if (insn.update_flags and source.shift_type == c.ARM_SFT_INVALID)
+            .{ .sbcs_reg = .{
+                .rd = rd,
+                .rn = rn,
+                .rm = try parseRegisterId(reg),
+            } }
+        else
+            error.UnsupportedOpcode,
+        else => error.UnsupportedOpcode,
+    };
+}
+
+fn parseRsb(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
     if (insn.operand_count != 3) return error.UnsupportedOpcode;
     return if (insn.update_flags)
-        .{ .sbcs_imm = .{
+        .{ .rsbs_imm = .{
             .rd = try operandRegister(insn, 0),
             .rn = try operandRegister(insn, 1),
             .imm = try operandImmediateU32(insn, 2),
         } }
     else
-        .{ .sbc_imm = .{
+        .{ .rsb_imm = .{
             .rd = try operandRegister(insn, 0),
             .rn = try operandRegister(insn, 1),
             .imm = try operandImmediateU32(insn, 2),
         } };
-}
-
-fn parseRsb(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
-    if (insn.update_flags) return error.UnsupportedOpcode;
-    if (insn.operand_count != 3) return error.UnsupportedOpcode;
-    return .{ .rsb_imm = .{
-        .rd = try operandRegister(insn, 0),
-        .rn = try operandRegister(insn, 1),
-        .imm = try operandImmediateU32(insn, 2),
-    } };
 }
 
 fn parseRsc(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
@@ -960,19 +1192,30 @@ fn parseRsc(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
 }
 
 fn parseSub(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
-    if (insn.operand_count != 3) return error.UnsupportedOpcode;
+    const rd, const rn = switch (insn.operand_count) {
+        2 => blk: {
+            const dest = try operandRegister(insn, 0);
+            break :blk .{ dest, dest };
+        },
+        3 => .{ try operandRegister(insn, 0), try operandRegister(insn, 1) },
+        else => return error.UnsupportedOpcode,
+    };
     return .{ .sub_imm = .{
-        .rd = try operandRegister(insn, 0),
-        .rn = try operandRegister(insn, 1),
-        .imm = try operandImmediateU32(insn, 2),
+        .rd = rd,
+        .rn = rn,
+        .imm = try operandImmediateU32(insn, insn.operand_count - 1),
     } };
 }
 
 fn parseShift(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
-    if (insn.operand_count != 3) return error.UnsupportedOpcode;
-    const rd = try operandRegister(insn, 0);
-    const rm = try operandRegister(insn, 1);
-    const amount = operandAt(insn, 2);
+    const rd, const rm, const amount = switch (insn.operand_count) {
+        2 => blk: {
+            const dest = try operandRegister(insn, 0);
+            break :blk .{ dest, dest, operandAt(insn, 1) };
+        },
+        3 => .{ try operandRegister(insn, 0), try operandRegister(insn, 1), operandAt(insn, 2) },
+        else => return error.UnsupportedOpcode,
+    };
     if (amount.subtracted) return error.UnsupportedOpcode;
 
     return switch (amount.value) {
@@ -1183,7 +1426,7 @@ fn parseStore(raw_word: u32, insn: capstone_api.ArmInstruction, size: StoreSize)
 
     const src = try operandRegister(insn, 0);
     const mem_op = operandAt(insn, 1);
-    const subtract = ((raw_word >> 23) & 1) == 0;
+    const subtract = if (insn.size == 2) false else ((raw_word >> 23) & 1) == 0;
 
     const mem = switch (mem_op.value) {
         .mem => |value| value,
@@ -1210,7 +1453,7 @@ fn parseLoad(raw_word: u32, insn: capstone_api.ArmInstruction) DecodeError!Decod
 
     const rd = try operandRegister(insn, 0);
     const mem_op = operandAt(insn, 1);
-    const subtract = ((raw_word >> 23) & 1) == 0;
+    const subtract = if (insn.size == 2) false else ((raw_word >> 23) & 1) == 0;
 
     const mem = switch (mem_op.value) {
         .mem => |value| value,
@@ -1219,13 +1462,17 @@ fn parseLoad(raw_word: u32, insn: capstone_api.ArmInstruction) DecodeError!Decod
 
     if (mem.index != c.ARM_REG_INVALID) {
         if (mem.disp != 0) return error.UnsupportedOpcode;
-        if (insn.post_index or !insn.writeback) return error.UnsupportedOpcode;
+        if (insn.post_index) return error.UnsupportedOpcode;
         return .{ .ldr_word_pre_index_reg_shift = .{
             .rd = rd,
             .base = try parseRegisterId(mem.base),
             .rm = try parseRegisterId(mem.index),
-            .shift = try parseShiftImm(mem_op),
+            .shift = if (mem_op.shift_type == c.ARM_SFT_INVALID)
+                .{ .kind = .lsl, .amount = 0 }
+            else
+                try parseShiftImm(mem_op),
             .subtract = subtract,
+            .writeback = insn.writeback,
         } };
     }
 
@@ -1278,8 +1525,16 @@ fn parseByteLoad(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstructi
         else => return error.UnsupportedOpcode,
     };
 
+    if (mem.index != c.ARM_REG_INVALID) {
+        if (mem.disp != 0) return error.UnsupportedOpcode;
+        if (insn.post_index or insn.writeback) return error.UnsupportedOpcode;
+        return .{ .ldr_byte_reg = .{
+            .rd = rd,
+            .base = try parseRegisterId(mem.base),
+            .rm = try parseRegisterId(mem.index),
+        } };
+    }
     if (mem.disp < 0) return error.UnsupportedOpcode;
-    if (mem.index != c.ARM_REG_INVALID) return error.UnsupportedOpcode;
     if (mem.scale != 0 and mem.scale != 1) return error.UnsupportedOpcode;
 
     return .{ .ldr_byte_imm = .{
@@ -1294,7 +1549,7 @@ fn parseHalfwordLoad(raw_word: u32, insn: capstone_api.ArmInstruction) DecodeErr
 
     const rd = try operandRegister(insn, 0);
     const mem_op = operandAt(insn, 1);
-    const subtract = ((raw_word >> 23) & 1) == 0;
+    const subtract = if (insn.size == 2) false else ((raw_word >> 23) & 1) == 0;
 
     const mem = switch (mem_op.value) {
         .mem => |value| value,
@@ -1303,12 +1558,13 @@ fn parseHalfwordLoad(raw_word: u32, insn: capstone_api.ArmInstruction) DecodeErr
 
     if (mem.index != c.ARM_REG_INVALID) {
         if (mem.disp != 0) return error.UnsupportedOpcode;
-        if (insn.post_index or !insn.writeback) return error.UnsupportedOpcode;
+        if (insn.post_index) return error.UnsupportedOpcode;
         return .{ .ldr_halfword_pre_index_reg = .{
             .rd = rd,
             .base = try parseRegisterId(mem.base),
             .rm = try parseRegisterId(mem.index),
             .subtract = subtract,
+            .writeback = insn.writeback,
         } };
     }
 
@@ -1354,8 +1610,16 @@ fn parseSignedHalfwordLoad(insn: capstone_api.ArmInstruction) DecodeError!Decode
         else => return error.UnsupportedOpcode,
     };
 
+    if (mem.index != c.ARM_REG_INVALID) {
+        if (mem.disp != 0) return error.UnsupportedOpcode;
+        if (insn.post_index or insn.writeback) return error.UnsupportedOpcode;
+        return .{ .ldr_signed_halfword_reg = .{
+            .rd = rd,
+            .base = try parseRegisterId(mem.base),
+            .rm = try parseRegisterId(mem.index),
+        } };
+    }
     if (mem.disp < 0) return error.UnsupportedOpcode;
-    if (mem.index != c.ARM_REG_INVALID) return error.UnsupportedOpcode;
     if (mem.scale != 0 and mem.scale != 1) return error.UnsupportedOpcode;
     if (insn.post_index or insn.writeback) return error.UnsupportedOpcode;
 
@@ -1378,8 +1642,16 @@ fn parseSignedByteLoad(insn: capstone_api.ArmInstruction) DecodeError!DecodedIns
         else => return error.UnsupportedOpcode,
     };
 
+    if (mem.index != c.ARM_REG_INVALID) {
+        if (mem.disp != 0) return error.UnsupportedOpcode;
+        if (insn.post_index or insn.writeback) return error.UnsupportedOpcode;
+        return .{ .ldr_signed_byte_reg = .{
+            .rd = rd,
+            .base = try parseRegisterId(mem.base),
+            .rm = try parseRegisterId(mem.index),
+        } };
+    }
     if (mem.disp < 0) return error.UnsupportedOpcode;
-    if (mem.index != c.ARM_REG_INVALID) return error.UnsupportedOpcode;
     if (mem.scale != 0 and mem.scale != 1) return error.UnsupportedOpcode;
     if (insn.post_index or insn.writeback) return error.UnsupportedOpcode;
 
@@ -1395,6 +1667,22 @@ fn parseStackTransfer(
     insn: capstone_api.ArmInstruction,
     comptime kind: enum { push, pop },
 ) DecodeError!DecodedInstruction {
+    if (insn.size == 2) {
+        var register_mask: u16 = @truncate(word & 0xFF);
+        const extra_reg = ((word >> 8) & 0x1) == 1;
+        if (extra_reg) {
+            register_mask |= @as(u16, 1) << switch (kind) {
+                .push => 14,
+                .pop => 15,
+            };
+        }
+        if (register_mask == 0) return error.UnsupportedOpcode;
+        return switch (kind) {
+            .push => .{ .push = register_mask },
+            .pop => .{ .pop = register_mask },
+        };
+    }
+
     const base_reg: u4 = @truncate((word >> 16) & 0xF);
     const register_mask: u16 = @truncate(word & 0xFFFF);
 
@@ -1490,11 +1778,27 @@ fn parseSwi(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
 
 fn parseTst(word: u32, insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
     if (insn.operand_count != 2) return error.UnsupportedOpcode;
-    return .{ .tst_imm = .{
-        .rn = try operandRegister(insn, 0),
-        .imm = try operandImmediateU32(insn, 1),
-        .carry = armImmediateCarryOut(word, try operandImmediateU32(insn, 1)),
-    } };
+    const rn = try operandRegister(insn, 0);
+    const source = operandAt(insn, 1);
+    if (source.subtracted) return error.UnsupportedOpcode;
+    return switch (source.value) {
+        .imm => |imm| blk: {
+            const parsed_imm = try parseU32Immediate(imm);
+            break :blk .{ .tst_imm = .{
+                .rn = rn,
+                .imm = parsed_imm,
+                .carry = armImmediateCarryOut(word, parsed_imm),
+            } };
+        },
+        .reg => |reg| if (source.shift_type == c.ARM_SFT_INVALID)
+            .{ .tst_reg = .{
+                .rn = rn,
+                .rm = try parseRegisterId(reg),
+            } }
+        else
+            error.UnsupportedOpcode,
+        else => error.UnsupportedOpcode,
+    };
 }
 
 fn parseCmp(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
@@ -1542,9 +1846,8 @@ fn parseTeq(word: u32, insn: capstone_api.ArmInstruction) DecodeError!DecodedIns
     } };
 }
 
-fn parseBl(word: u32, insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+fn parseBl(_: u32, insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
     if (insn.operand_count != 1) return error.UnsupportedOpcode;
-    if ((word >> 28) != 0xE) return error.UnsupportedOpcode;
     return .{ .bl = .{
         .target = try operandImmediateU32(insn, 0),
     } };
@@ -1763,6 +2066,18 @@ test "decode reads mvn immediate" {
     );
 }
 
+test "decode reads thumb mvns register" {
+    const decoded = try decodeThumb(0x43C0, 0x08000156);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .mvn_reg = .{
+            .rd = 0,
+            .rm = 0,
+            .update_flags = true,
+        } },
+        decoded,
+    );
+}
+
 test "decode reads sub immediate without flag updates" {
     const decoded = try decode(0xE2422020, 0x08001F58);
     try std.testing.expectEqualDeep(
@@ -1770,6 +2085,18 @@ test "decode reads sub immediate without flag updates" {
             .rd = 2,
             .rn = 2,
             .imm = 32,
+        } },
+        decoded,
+    );
+}
+
+test "decode reads thumb adds immediate with implicit source register" {
+    const decoded = try decodeThumb(0x3001, 0x08000158);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .adds_imm = .{
+            .rd = 0,
+            .rn = 0,
+            .imm = 1,
         } },
         decoded,
     );
@@ -2196,6 +2523,7 @@ test "decode reads ldr halfword pre-index register" {
             .base = 2,
             .rm = 1,
             .subtract = true,
+            .writeback = true,
         } },
         decoded,
     );
@@ -2263,6 +2591,7 @@ test "decode reads ldr word pre-index register shift" {
                 .amount = 2,
             },
             .subtract = true,
+            .writeback = true,
         } },
         decoded,
     );
@@ -2306,6 +2635,75 @@ test "decode reads ldr word pre-index register rrx shift" {
                 .amount = 0,
             },
             .subtract = false,
+            .writeback = true,
+        } },
+        decoded,
+    );
+}
+
+test "decode reads thumb ldr word register offset without writeback" {
+    const decoded = try decodeThumb(0x5872, 0x08000606);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .ldr_word_pre_index_reg_shift = .{
+            .rd = 2,
+            .base = 6,
+            .rm = 1,
+            .shift = .{
+                .kind = .lsl,
+                .amount = 0,
+            },
+            .subtract = false,
+            .writeback = false,
+        } },
+        decoded,
+    );
+}
+
+test "decode reads thumb ldr byte register offset" {
+    const decoded = try decodeThumb(0x5C72, 0x08000636);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .ldr_byte_reg = .{
+            .rd = 2,
+            .base = 6,
+            .rm = 1,
+        } },
+        decoded,
+    );
+}
+
+test "decode reads thumb ldr halfword register offset" {
+    const decoded = try decodeThumb(0x5AB3, 0x08000686);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .ldr_halfword_pre_index_reg = .{
+            .rd = 3,
+            .base = 6,
+            .rm = 2,
+            .subtract = false,
+            .writeback = false,
+        } },
+        decoded,
+    );
+}
+
+test "decode reads thumb ldrsb register offset" {
+    const decoded = try decodeThumb(0x5672, 0x0800069C);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .ldr_signed_byte_reg = .{
+            .rd = 2,
+            .base = 6,
+            .rm = 1,
+        } },
+        decoded,
+    );
+}
+
+test "decode reads thumb ldrsh register offset" {
+    const decoded = try decodeThumb(0x5E72, 0x080006CE);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .ldr_signed_halfword_reg = .{
+            .rd = 2,
+            .base = 6,
+            .rm = 1,
         } },
         decoded,
     );
@@ -2810,6 +3208,17 @@ test "decode reads thumb bx r1" {
     try std.testing.expectEqualDeep(
         DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
         decoded,
+    );
+}
+
+test "decode reads thumb bl with 32-bit width" {
+    const bytes = [_]u8{ 0x00, 0xF0, 0x11, 0xFC };
+    const decoded = try decodeAt(&bytes, .thumb, 0x0800010A);
+    try std.testing.expectEqual(@as(u32, 0xFC11F000), decoded.raw_opcode);
+    try std.testing.expectEqual(@as(u8, 4), decoded.size_bytes);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .bl = .{ .target = 0x08000930 } },
+        decoded.instruction,
     );
 }
 

@@ -771,6 +771,16 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             try writer.print("  store i32 %mvn_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
+        .mvn_reg => |mvn| {
+            try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rm", mvn.rm);
+            try emitRegPtr(writer, "state", node.address, "rd", mvn.rd);
+            try writer.print("  %mvn_reg_val_{x:0>8} = xor i32 %rm_val_{x:0>8}, -1\n", .{ node.address, node.address });
+            try writer.print("  store i32 %mvn_reg_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            if (mvn.update_flags) {
+                try emitUpdateNzFlags(writer, "state", node.address, "mvn_reg_val");
+            }
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
         .mov_reg => |mov| {
             if (mov.rd == 15 and mov.rm == 14) {
                 try emitFunctionReturn(writer, function.entry);
@@ -802,11 +812,33 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             try writer.print("  store i32 %orr_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
+        .orr_reg => |orr| {
+            try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rn", orr.rn);
+            try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rm", orr.rm);
+            try writer.print("  %orr_reg_val_{x:0>8} = or i32 %rn_val_{x:0>8}, %rm_val_{x:0>8}\n", .{ node.address, node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rd", orr.rd);
+            try writer.print("  store i32 %orr_reg_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            if (orr.update_flags) {
+                try emitUpdateNzFlags(writer, "state", node.address, "orr_reg_val");
+            }
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
         .eor_imm => |eor| {
             try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rn", eor.rn);
             try writer.print("  %eor_val_{x:0>8} = xor i32 %rn_val_{x:0>8}, {d}\n", .{ node.address, node.address, eor.imm });
             try emitRegPtr(writer, "state", node.address, "rd", eor.rd);
             try writer.print("  store i32 %eor_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .eor_reg => |eor| {
+            try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rn", eor.rn);
+            try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rm", eor.rm);
+            try writer.print("  %eor_reg_val_{x:0>8} = xor i32 %rn_val_{x:0>8}, %rm_val_{x:0>8}\n", .{ node.address, node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rd", eor.rd);
+            try writer.print("  store i32 %eor_reg_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            if (eor.update_flags) {
+                try emitUpdateNzFlags(writer, "state", node.address, "eor_reg_val");
+            }
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .bic_imm => |bic| {
@@ -815,6 +847,18 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             try writer.print("  %bic_val_{x:0>8} = and i32 %rn_val_{x:0>8}, %bic_mask_{x:0>8}\n", .{ node.address, node.address, node.address });
             try emitRegPtr(writer, "state", node.address, "rd", bic.rd);
             try writer.print("  store i32 %bic_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .bic_reg => |bic| {
+            try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rn", bic.rn);
+            try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rm", bic.rm);
+            try writer.print("  %bic_reg_mask_{x:0>8} = xor i32 %rm_val_{x:0>8}, -1\n", .{ node.address, node.address });
+            try writer.print("  %bic_reg_val_{x:0>8} = and i32 %rn_val_{x:0>8}, %bic_reg_mask_{x:0>8}\n", .{ node.address, node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rd", bic.rd);
+            try writer.print("  store i32 %bic_reg_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            if (bic.update_flags) {
+                try emitUpdateNzFlags(writer, "state", node.address, "bic_reg_val");
+            }
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .orr_shift_reg => |orr| {
@@ -834,6 +878,17 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             try writer.print("  %and_val_{x:0>8} = and i32 %rn_val_{x:0>8}, {d}\n", .{ node.address, node.address, and_op.imm });
             try emitRegPtr(writer, "state", node.address, "rd", and_op.rd);
             try writer.print("  store i32 %and_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .and_reg => |and_op| {
+            try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rn", and_op.rn);
+            try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rm", and_op.rm);
+            try writer.print("  %and_reg_val_{x:0>8} = and i32 %rn_val_{x:0>8}, %rm_val_{x:0>8}\n", .{ node.address, node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rd", and_op.rd);
+            try writer.print("  store i32 %and_reg_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            if (and_op.update_flags) {
+                try emitUpdateNzFlags(writer, "state", node.address, "and_reg_val");
+            }
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
         .add_imm => |add| {
@@ -880,6 +935,14 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             try writer.print("  store i32 %sbcs_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
+        .sbcs_reg => |sub| {
+            try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rn", sub.rn);
+            try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rm", sub.rm);
+            try emitSbcRegWithFlags(writer, "state", node.address, "rn_val", "rm_val", "sbcs_val");
+            try emitRegPtr(writer, "state", node.address, "rd", sub.rd);
+            try writer.print("  store i32 %sbcs_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
         .sbc_imm => |sub| {
             try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rn", sub.rn);
             try emitSbcImmValue(writer, "state", node.address, "rn_val", sub.imm, "sbc_val");
@@ -911,6 +974,14 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             try writer.print("  store i32 %rsb_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
+        .rsbs_imm => |sub| {
+            try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rn", sub.rn);
+            try writer.print("  %rsbs_lhs_{x:0>8} = or i32 {d}, 0\n", .{ node.address, sub.imm });
+            try emitSubRegWithFlags(writer, "state", node.address, "rsbs_lhs", "rn_val", "rsb_val");
+            try emitRegPtr(writer, "state", node.address, "rd", sub.rd);
+            try writer.print("  store i32 %rsb_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
         .rsc_imm => |sub| {
             try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rn", sub.rn);
             try emitRscImmValue(writer, "state", node.address, sub.imm, "rn_val", "rsc_val");
@@ -928,6 +999,14 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
         .subs_imm => |sub| {
             try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rn", sub.rn);
             try emitSubImmWithFlags(writer, "state", node.address, "rn_val", sub.imm, "sub_val");
+            try emitRegPtr(writer, "state", node.address, "rd", sub.rd);
+            try writer.print("  store i32 %sub_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .subs_reg => |sub| {
+            try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rn", sub.rn);
+            try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rm", sub.rm);
+            try emitSubRegWithFlags(writer, "state", node.address, "rn_val", "rm_val", "sub_val");
             try emitRegPtr(writer, "state", node.address, "rd", sub.rd);
             try writer.print("  store i32 %sub_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
@@ -1213,6 +1292,17 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             try writer.print("  store i32 %load8_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
+        .ldr_byte_reg => |load| {
+            try emitRegPtr(writer, "state", node.address, "base", load.base);
+            try writer.print("  %base_val_{x:0>8} = load i32, ptr %base_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rm", load.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try writer.print("  %addr_{x:0>8} = add i32 %base_val_{x:0>8}, %rm_val_{x:0>8}\n", .{ node.address, node.address, node.address });
+            try writer.print("  %load8_val_{x:0>8} = call i32 @hmn_load8(ptr %state, i32 %addr_{x:0>8})\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rd", load.rd);
+            try writer.print("  store i32 %load8_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
         .ldr_halfword_imm => |load| {
             try emitRegPtr(writer, "state", node.address, "base", load.base);
             try writer.print("  %base_val_{x:0>8} = load i32, ptr %base_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
@@ -1231,8 +1321,10 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
                 "  %addr_{x:0>8} = {s} i32 %base_val_{x:0>8}, %rm_val_{x:0>8}\n",
                 .{ node.address, if (load.subtract) "sub" else "add", node.address, node.address },
             );
+            if (load.writeback) {
+                try writer.print("  store i32 %addr_{x:0>8}, ptr %base_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            }
             try writer.print("  %load16_val_{x:0>8} = call i32 @hmn_load16(ptr %state, i32 %addr_{x:0>8})\n", .{ node.address, node.address });
-            try writer.print("  store i32 %addr_{x:0>8}, ptr %base_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitRegPtr(writer, "state", node.address, "rd", load.rd);
             try writer.print("  store i32 %load16_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
@@ -1273,10 +1365,32 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             try writer.print("  store i32 %load16s_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
+        .ldr_signed_halfword_reg => |load| {
+            try emitRegPtr(writer, "state", node.address, "base", load.base);
+            try writer.print("  %base_val_{x:0>8} = load i32, ptr %base_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rm", load.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try writer.print("  %addr_{x:0>8} = add i32 %base_val_{x:0>8}, %rm_val_{x:0>8}\n", .{ node.address, node.address, node.address });
+            try writer.print("  %load16s_val_{x:0>8} = call i32 @hmn_load16s(ptr %state, i32 %addr_{x:0>8})\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rd", load.rd);
+            try writer.print("  store i32 %load16s_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
         .ldr_signed_byte_imm => |load| {
             try emitRegPtr(writer, "state", node.address, "base", load.base);
             try writer.print("  %base_val_{x:0>8} = load i32, ptr %base_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try writer.print("  %addr_{x:0>8} = add i32 %base_val_{x:0>8}, {d}\n", .{ node.address, node.address, load.offset });
+            try writer.print("  %load8s_val_{x:0>8} = call i32 @hmn_load8s(ptr %state, i32 %addr_{x:0>8})\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rd", load.rd);
+            try writer.print("  store i32 %load8s_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .ldr_signed_byte_reg => |load| {
+            try emitRegPtr(writer, "state", node.address, "base", load.base);
+            try writer.print("  %base_val_{x:0>8} = load i32, ptr %base_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try emitRegPtr(writer, "state", node.address, "rm", load.rm);
+            try writer.print("  %rm_val_{x:0>8} = load i32, ptr %rm_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            try writer.print("  %addr_{x:0>8} = add i32 %base_val_{x:0>8}, %rm_val_{x:0>8}\n", .{ node.address, node.address, node.address });
             try writer.print("  %load8s_val_{x:0>8} = call i32 @hmn_load8s(ptr %state, i32 %addr_{x:0>8})\n", .{ node.address, node.address });
             try emitRegPtr(writer, "state", node.address, "rd", load.rd);
             try writer.print("  store i32 %load8s_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
@@ -1292,7 +1406,9 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
                 "  %addr_{x:0>8} = {s} i32 %base_val_{x:0>8}, %load_offset_{x:0>8}\n",
                 .{ node.address, if (load.subtract) "sub" else "add", node.address, node.address },
             );
-            try writer.print("  store i32 %addr_{x:0>8}, ptr %base_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            if (load.writeback) {
+                try writer.print("  store i32 %addr_{x:0>8}, ptr %base_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
+            }
             try writer.print("  %load_val_{x:0>8} = call i32 @hmn_load32(ptr %state, i32 %addr_{x:0>8})\n", .{ node.address, node.address });
             try emitRegPtr(writer, "state", node.address, "rd", load.rd);
             try writer.print("  store i32 %load_val_{x:0>8}, ptr %rd_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
@@ -1393,6 +1509,13 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
             }
             try emitFallthrough(writer, function, node.address + node.size_bytes);
         },
+        .tst_reg => |tst| {
+            try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rn", tst.rn);
+            try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rm", tst.rm);
+            try writer.print("  %tst_reg_val_{x:0>8} = and i32 %rn_val_{x:0>8}, %rm_val_{x:0>8}\n", .{ node.address, node.address, node.address });
+            try emitUpdateNzFlags(writer, "state", node.address, "tst_reg_val");
+            try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
         .cmp_imm => |cmp| {
             try emitReadAluRegValue(writer, function.entry.isa, "state", node.address, "rn", cmp.rn);
             try emitSubImmWithFlags(writer, "state", node.address, "rn_val", cmp.imm, "cmp_val");
@@ -1463,6 +1586,14 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
                 ),
             }
             try emitFallthrough(writer, function, node.address + node.size_bytes);
+        },
+        .add_reg_pc_target => |add| {
+            if (add.target == node.address)
+                try emitFunctionReturn(writer, function.entry)
+            else if (hasAddress(function, add.target))
+                try emitBranchTo(writer, add.target)
+            else
+                try emitFunctionReturn(writer, function.entry);
         },
         .branch => |branch| {
             if (branch.cond == .al) {
@@ -1926,6 +2057,60 @@ fn emitAdcImmValue(
     try writer.print("  %adc_carry_in_{x:0>8} = zext i1 %flag_c_val_{x:0>8} to i32\n", .{ address, address });
     try writer.print("  %adc_sum_0_{x:0>8} = add i32 %{s}_{x:0>8}, {d}\n", .{ address, lhs_prefix, address, imm });
     try writer.print("  %{s}_{x:0>8} = add i32 %adc_sum_0_{x:0>8}, %adc_carry_in_{x:0>8}\n", .{ result_prefix, address, address, address });
+}
+
+fn emitSbcRegWithFlags(
+    writer: *Io.Writer,
+    state_name: []const u8,
+    address: u32,
+    lhs_prefix: []const u8,
+    rhs_prefix: []const u8,
+    result_prefix: []const u8,
+) Io.Writer.Error!void {
+    try emitFlagLoad(writer, state_name, address, .c);
+    try writer.print("  %sbc_reg_borrow_in_{x:0>8} = xor i1 %flag_c_val_{x:0>8}, true\n", .{ address, address });
+    try writer.print("  %sbc_reg_borrow_i32_{x:0>8} = zext i1 %sbc_reg_borrow_in_{x:0>8} to i32\n", .{ address, address });
+    try writer.print(
+        "  %sbc_reg_ssub_pair_0_{x:0>8} = call {{ i32, i1 }} @llvm.ssub.with.overflow.i32(i32 %{s}_{x:0>8}, i32 %{s}_{x:0>8})\n",
+        .{ address, lhs_prefix, address, rhs_prefix, address },
+    );
+    try writer.print(
+        "  %sbc_reg_usub_pair_0_{x:0>8} = call {{ i32, i1 }} @llvm.usub.with.overflow.i32(i32 %{s}_{x:0>8}, i32 %{s}_{x:0>8})\n",
+        .{ address, lhs_prefix, address, rhs_prefix, address },
+    );
+    try writer.print(
+        "  %sbc_reg_sum_0_{x:0>8} = extractvalue {{ i32, i1 }} %sbc_reg_ssub_pair_0_{x:0>8}, 0\n",
+        .{ address, address },
+    );
+    try writer.print("  %sbc_reg_signed_overflow_0_{x:0>8} = extractvalue {{ i32, i1 }} %sbc_reg_ssub_pair_0_{x:0>8}, 1\n", .{ address, address });
+    try writer.print("  %sbc_reg_unsigned_overflow_0_{x:0>8} = extractvalue {{ i32, i1 }} %sbc_reg_usub_pair_0_{x:0>8}, 1\n", .{ address, address });
+    try writer.print(
+        "  %sbc_reg_ssub_pair_1_{x:0>8} = call {{ i32, i1 }} @llvm.ssub.with.overflow.i32(i32 %sbc_reg_sum_0_{x:0>8}, i32 %sbc_reg_borrow_i32_{x:0>8})\n",
+        .{ address, address, address },
+    );
+    try writer.print(
+        "  %sbc_reg_usub_pair_1_{x:0>8} = call {{ i32, i1 }} @llvm.usub.with.overflow.i32(i32 %sbc_reg_sum_0_{x:0>8}, i32 %sbc_reg_borrow_i32_{x:0>8})\n",
+        .{ address, address, address },
+    );
+    try writer.print(
+        "  %{s}_{x:0>8} = extractvalue {{ i32, i1 }} %sbc_reg_ssub_pair_1_{x:0>8}, 0\n",
+        .{ result_prefix, address, address },
+    );
+    try writer.print("  %sbc_reg_signed_overflow_1_{x:0>8} = extractvalue {{ i32, i1 }} %sbc_reg_ssub_pair_1_{x:0>8}, 1\n", .{ address, address });
+    try writer.print("  %sbc_reg_unsigned_overflow_1_{x:0>8} = extractvalue {{ i32, i1 }} %sbc_reg_usub_pair_1_{x:0>8}, 1\n", .{ address, address });
+    try emitUpdateNzFlags(writer, state_name, address, result_prefix);
+    try writer.print(
+        "  %sbc_reg_borrow_{x:0>8} = or i1 %sbc_reg_unsigned_overflow_0_{x:0>8}, %sbc_reg_unsigned_overflow_1_{x:0>8}\n",
+        .{ address, address, address },
+    );
+    try writer.print(
+        "  %sbc_reg_overflow_{x:0>8} = or i1 %sbc_reg_signed_overflow_0_{x:0>8}, %sbc_reg_signed_overflow_1_{x:0>8}\n",
+        .{ address, address, address },
+    );
+    try writer.print("  %sbc_reg_carry_{x:0>8} = xor i1 %sbc_reg_borrow_{x:0>8}, true\n", .{ address, address });
+    try writer.print("  store i1 %sbc_reg_carry_{x:0>8}, ptr %flag_c_ptr_{x:0>8}, align 1\n", .{ address, address });
+    try emitFlagPtr(writer, state_name, address, .v);
+    try writer.print("  store i1 %sbc_reg_overflow_{x:0>8}, ptr %flag_v_ptr_{x:0>8}, align 1\n", .{ address, address });
 }
 
 fn emitSbcImmWithFlags(

@@ -103,7 +103,7 @@ fn liftRom(
     }
 
     sortFunctions(functions.items);
-    const output_mode: llvm_codegen.OutputMode = if (hasInstructionAddress(functions.items, 0x0800_1D4C))
+    const output_mode: llvm_codegen.OutputMode = if (hasArmReportRoutine(functions.items))
         .arm_report
     else if (has_store and has_self_loop)
         .memory_summary
@@ -145,34 +145,13 @@ fn liftFunction(
         pending_blocks.items.len -= 1;
 
         if (containsAddress(nodes.items, address)) continue;
-        const offset = offsetForAddress(image, address, function_entry.isa) orelse {
-            try writer.print("Unsupported control flow target 0x{X:0>8} for gba\n", .{address});
-            return error.UnsupportedOpcode;
+        const decoded_opcode = decodeImageInstruction(writer, image, function_entry.isa, address) catch |err| return switch (err) {
+            error.UnsupportedOpcode => err,
+            else => |other| return other,
         };
-
-        const size_bytes = instructionSizeBytes(function_entry.isa);
-        const raw_opcode, const decoded_initial = switch (function_entry.isa) {
-            .arm => blk: {
-                const word = armv4t_decode.readWord(image.bytes, offset);
-                break :blk .{ word, armv4t_decode.decode(word, address) catch |err| return switch (err) {
-                    error.UnsupportedOpcode => {
-                        try renderUnsupportedOpcode(writer, word, address);
-                        return error.UnsupportedOpcode;
-                    },
-                    else => |other| return other,
-                } };
-            },
-            .thumb => blk: {
-                const halfword = armv4t_decode.readHalfword(image.bytes, offset);
-                break :blk .{ @as(u32, halfword), armv4t_decode.decodeThumb(halfword, address) catch |err| return switch (err) {
-                    error.UnsupportedOpcode => {
-                        try renderUnsupportedOpcode(writer, halfword, address);
-                        return error.UnsupportedOpcode;
-                    },
-                    else => |other| return other,
-                } };
-            },
-        };
+        const raw_opcode = decoded_opcode.raw_opcode;
+        const size_bytes = decoded_opcode.size_bytes;
+        const decoded_initial = decoded_opcode.instruction;
         const decoded = resolveDecodedInstruction(image, function_entry.isa, address, decoded_initial) catch {
             try renderUnsupportedOpcode(writer, raw_opcode, address);
             return error.UnsupportedOpcode;
@@ -210,6 +189,77 @@ fn liftFunction(
     };
 }
 
+const DecodedNode = struct {
+    address: u32,
+    raw_opcode: u32,
+    size_bytes: u8,
+    instruction: armv4t_decode.DecodedInstruction,
+};
+
+fn decodeImageInstruction(
+    writer: *Io.Writer,
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+) BuildError!DecodedNode {
+    const offset = offsetForAddress(image, address, isa) orelse return error.UnsupportedOpcode;
+    const decoded = armv4t_decode.decodeAt(image.bytes[offset..], isa, address) catch |err| return switch (err) {
+        error.UnsupportedOpcode => {
+            const raw_opcode = switch (isa) {
+                .arm => if (offset + 4 <= image.bytes.len) armv4t_decode.readWord(image.bytes, offset) else 0,
+                .thumb => if (offset + 2 <= image.bytes.len) armv4t_decode.readHalfword(image.bytes, offset) else 0,
+            };
+            try renderUnsupportedOpcode(writer, raw_opcode, address);
+            return error.UnsupportedOpcode;
+        },
+        else => |other| return other,
+    };
+
+    return .{
+        .address = address,
+        .raw_opcode = decoded.raw_opcode,
+        .size_bytes = decoded.size_bytes,
+        .instruction = decoded.instruction,
+    };
+}
+
+fn decodeImageInstructionUnchecked(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+) BuildError!DecodedNode {
+    const offset = offsetForAddress(image, address, isa) orelse return error.UnsupportedOpcode;
+    const decoded = try armv4t_decode.decodeAt(image.bytes[offset..], isa, address);
+    return .{
+        .address = address,
+        .raw_opcode = decoded.raw_opcode,
+        .size_bytes = decoded.size_bytes,
+        .instruction = decoded.instruction,
+    };
+}
+
+fn previousInstruction(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+) BuildError!DecodedNode {
+    switch (isa) {
+        .arm => {
+            if (address < image.base_address + 4) return error.UnsupportedOpcode;
+            return decodeImageInstructionUnchecked(image, isa, address - 4);
+        },
+        .thumb => {
+            for ([_]u8{ 4, 2 }) |candidate_size| {
+                if (address < image.base_address + candidate_size) continue;
+                const candidate_address = address - candidate_size;
+                const decoded = decodeImageInstructionUnchecked(image, isa, candidate_address) catch continue;
+                if (candidate_address + decoded.size_bytes == address) return decoded;
+            }
+            return error.UnsupportedOpcode;
+        },
+    }
+}
+
 fn ensureDeclared(
     writer: *Io.Writer,
     decoded: armv4t_decode.DecodedInstruction,
@@ -221,25 +271,34 @@ fn ensureDeclared(
         .mov_reg => _ = try catalog.lookupInstruction("armv4t", "mov_reg"),
         .movs_imm => _ = try catalog.lookupInstruction("armv4t", "movs_imm"),
         .mvn_imm => _ = try catalog.lookupInstruction("armv4t", "mvn_imm"),
+        .mvn_reg => _ = try catalog.lookupInstruction("armv4t", "mvn_reg"),
         .movs_reg => _ = try catalog.lookupInstruction("armv4t", "movs_reg"),
         .orr_imm => _ = try catalog.lookupInstruction("armv4t", "orr_imm"),
+        .orr_reg => _ = try catalog.lookupInstruction("armv4t", "orr_reg"),
         .eor_imm => _ = try catalog.lookupInstruction("armv4t", "eor_imm"),
+        .eor_reg => _ = try catalog.lookupInstruction("armv4t", "eor_reg"),
         .bic_imm => _ = try catalog.lookupInstruction("armv4t", "bic_imm"),
+        .bic_reg => _ = try catalog.lookupInstruction("armv4t", "bic_reg"),
         .orr_shift_reg => _ = try catalog.lookupInstruction("armv4t", "orr_reg_shift"),
         .and_imm => _ = try catalog.lookupInstruction("armv4t", "and_imm"),
+        .and_reg => _ = try catalog.lookupInstruction("armv4t", "and_reg"),
         .add_imm => _ = try catalog.lookupInstruction("armv4t", "add_imm"),
         .adds_imm => _ = try catalog.lookupInstruction("armv4t", "adds_imm"),
         .adcs_imm => _ = try catalog.lookupInstruction("armv4t", "adcs_imm"),
         .adcs_shift_reg => _ = try catalog.lookupInstruction("armv4t", "adcs_reg_shift"),
         .adc_imm => _ = try catalog.lookupInstruction("armv4t", "adc_imm"),
         .sbcs_imm => _ = try catalog.lookupInstruction("armv4t", "sbcs_imm"),
+        .sbcs_reg => _ = try catalog.lookupInstruction("armv4t", "sbcs_reg"),
         .sbc_imm => _ = try catalog.lookupInstruction("armv4t", "sbc_imm"),
         .add_reg => _ = try catalog.lookupInstruction("armv4t", "add_reg"),
+        .add_reg_pc_target => _ = try catalog.lookupInstruction("armv4t", "add_reg"),
         .add_shift_reg => _ = try catalog.lookupInstruction("armv4t", "add_reg_shift"),
         .rsb_imm => _ = try catalog.lookupInstruction("armv4t", "rsb_imm"),
+        .rsbs_imm => _ = try catalog.lookupInstruction("armv4t", "rsbs_imm"),
         .rsc_imm => _ = try catalog.lookupInstruction("armv4t", "rsc_imm"),
         .sub_imm => _ = try catalog.lookupInstruction("armv4t", "sub_imm"),
         .subs_imm => _ = try catalog.lookupInstruction("armv4t", "subs_imm"),
+        .subs_reg => _ = try catalog.lookupInstruction("armv4t", "subs_reg"),
         .lsl_imm => _ = try catalog.lookupInstruction("armv4t", "lsl_imm"),
         .lsl_reg => _ = try catalog.lookupInstruction("armv4t", "lsl_reg"),
         .asr_imm => _ = try catalog.lookupInstruction("armv4t", "asr_imm"),
@@ -268,12 +327,15 @@ fn ensureDeclared(
         .ldr_word_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_word_imm"),
         .ldr_word_imm_signed => _ = try catalog.lookupInstruction("armv4t", "ldr_word_imm_signed"),
         .ldr_byte_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_byte_imm"),
+        .ldr_byte_reg => _ = try catalog.lookupInstruction("armv4t", "ldr_byte_reg"),
         .ldr_halfword_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_halfword_imm"),
         .ldr_halfword_pre_index_reg => _ = try catalog.lookupInstruction("armv4t", "ldr_halfword_pre_reg"),
         .ldr_halfword_pre_index_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_halfword_pre_imm"),
         .ldr_halfword_post_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_halfword_post_imm"),
         .ldr_signed_halfword_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_signed_halfword_imm"),
+        .ldr_signed_halfword_reg => _ = try catalog.lookupInstruction("armv4t", "ldr_signed_halfword_reg"),
         .ldr_signed_byte_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_signed_byte_imm"),
+        .ldr_signed_byte_reg => _ = try catalog.lookupInstruction("armv4t", "ldr_signed_byte_reg"),
         .ldr_word_pre_index_reg_shift => _ = try catalog.lookupInstruction("armv4t", "ldr_word_pre_reg_shift"),
         .ldr_word_pre_index_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_word_pre_imm"),
         .ldr_word_post_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_word_post_imm"),
@@ -302,6 +364,7 @@ fn ensureDeclared(
         },
         .ldm_empty_pc_target => _ = try catalog.lookupInstruction("armv4t", "ldm_empty"),
         .tst_imm => _ = try catalog.lookupInstruction("armv4t", "tst_imm"),
+        .tst_reg => _ = try catalog.lookupInstruction("armv4t", "tst_reg"),
         .cmp_imm => _ = try catalog.lookupInstruction("armv4t", "cmp_imm"),
         .cmp_reg => _ = try catalog.lookupInstruction("armv4t", "cmp_reg"),
         .cmn_imm => _ = try catalog.lookupInstruction("armv4t", "cmn_imm"),
@@ -391,6 +454,13 @@ fn enqueueSuccessors(
                 .isa = isa,
             });
             try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
+        },
+        .add_reg_pc_target => |add| {
+            if (add.target == address) {
+                has_self_loop.* = true;
+                return;
+            }
+            try enqueueBlockAddress(allocator, writer, pending_blocks, image, isa, add.target);
         },
         .bx_target => |target| {
             try enqueueFunctionAddress(allocator, writer, pending_functions, image, target);
@@ -511,6 +581,46 @@ fn hasInstructionAddress(functions: []const llvm_codegen.Function, address: u32)
     return false;
 }
 
+fn hasArmReportRoutine(functions: []const llvm_codegen.Function) bool {
+    for (functions) |function| {
+        if (function.entry.isa != .arm) continue;
+        if (functionHasArmReportRoutine(function.instructions)) return true;
+    }
+    return false;
+}
+
+fn functionHasArmReportRoutine(nodes: []const llvm_codegen.InstructionNode) bool {
+    var saw_wait_loop_push = false;
+    var saw_wait_loop_pop = false;
+
+    for (nodes, 0..) |node, index| {
+        switch (node.instruction) {
+            .push => |mask| {
+                if (mask == 0x0003) {
+                    saw_wait_loop_push = true;
+                    continue;
+                }
+
+                if (!saw_wait_loop_pop or mask != 0x1FFF) continue;
+                if (index + 1 >= nodes.len) continue;
+
+                switch (nodes[index + 1].instruction) {
+                    .movs_reg => |mov| if (mov.rd == 12) return true,
+                    else => {},
+                }
+            },
+            .pop => |mask| {
+                if (saw_wait_loop_push and mask == 0x0003) {
+                    saw_wait_loop_pop = true;
+                }
+            },
+            else => {},
+        }
+    }
+
+    return false;
+}
+
 fn sortNodes(nodes: []llvm_codegen.InstructionNode) void {
     var i: usize = 0;
     while (i < nodes.len) : (i += 1) {
@@ -550,6 +660,10 @@ fn resolveDecodedInstruction(
                     .target = target,
                 } };
             }
+        else
+            decoded,
+        .add_reg => |add| if (add.rd == 15)
+            try resolveAddRegPcTarget(image, isa, address, add)
         else
             decoded,
         .bx_reg => |bx| try resolveBxTarget(image, isa, address, bx.reg),
@@ -594,6 +708,25 @@ fn resolveMovPcTarget(
         .cond = .al,
         .target = target,
     } };
+}
+
+fn resolveAddRegPcTarget(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+    add: @FieldType(armv4t_decode.DecodedInstruction, "add_reg"),
+) BuildError!armv4t_decode.DecodedInstruction {
+    const lhs = if (add.rn == 15)
+        pcValueForInstruction(isa, address)
+    else
+        try resolvePreviousRegisterValue(image, isa, address, add.rn);
+    const rhs = if (add.rm == 15)
+        pcValueForInstruction(isa, address)
+    else
+        try resolvePreviousRegisterValue(image, isa, address, add.rm);
+    const target = normalizePcWriteTarget(lhs + rhs, isa);
+    if (offsetForAddress(image, target, isa) == null) return error.UnsupportedOpcode;
+    return .{ .add_reg_pc_target = .{ .target = target } };
 }
 
 fn resolveLdrPcPostImmTarget(
@@ -655,16 +788,9 @@ fn resolvePreviousStoredWordValue(
     address: u32,
     base_reg: u4,
 ) BuildError!u32 {
-    const previous_size = instructionSizeBytes(isa);
-    if (address < image.base_address + previous_size) return error.UnsupportedOpcode;
-    const previous_address = address - previous_size;
-    const offset = offsetForAddress(image, previous_address, isa) orelse return error.UnsupportedOpcode;
-    const previous_decoded = switch (isa) {
-        .arm => try armv4t_decode.decode(armv4t_decode.readWord(image.bytes, offset), previous_address),
-        .thumb => try armv4t_decode.decodeThumb(armv4t_decode.readHalfword(image.bytes, offset), previous_address),
-    };
+    const previous = try previousInstruction(image, isa, address);
 
-    return switch (previous_decoded) {
+    return switch (previous.instruction) {
         .store => |store| blk: {
             if (store.size != .word) return error.UnsupportedOpcode;
             if (store.base != base_reg) return error.UnsupportedOpcode;
@@ -675,11 +801,11 @@ fn resolvePreviousStoredWordValue(
                 },
                 else => return error.UnsupportedOpcode,
             }
-            break :blk try resolvePreviousRegisterValue(image, isa, previous_address, store.src);
+            break :blk try resolvePreviousRegisterValue(image, isa, previous.address, store.src);
         },
         .mov_reg => |mov| blk: {
             if (mov.rd != base_reg or mov.rm == 15) return error.UnsupportedOpcode;
-            break :blk try resolvePreviousStoredWordValue(image, isa, previous_address, mov.rm);
+            break :blk try resolvePreviousStoredWordValue(image, isa, previous.address, mov.rm);
         },
         else => error.UnsupportedOpcode,
     };
@@ -694,31 +820,24 @@ fn resolvePreviousStoredBlockValue(
     load_mask: u16,
     target_reg: u4,
 ) BuildError!u32 {
-    const previous_size = instructionSizeBytes(isa);
-    if (address < image.base_address + previous_size) return error.UnsupportedOpcode;
-    const previous_address = address - previous_size;
-    const offset = offsetForAddress(image, previous_address, isa) orelse return error.UnsupportedOpcode;
-    const previous_decoded = switch (isa) {
-        .arm => try armv4t_decode.decode(armv4t_decode.readWord(image.bytes, offset), previous_address),
-        .thumb => try armv4t_decode.decodeThumb(armv4t_decode.readHalfword(image.bytes, offset), previous_address),
-    };
+    const previous = try previousInstruction(image, isa, address);
 
     const current_slot_index = registerMaskSlotIndex(load_mask, target_reg) orelse return error.UnsupportedOpcode;
     const current_relative = blockTransferRelativeOffset(load_mode, load_mask, current_slot_index);
 
-    return switch (previous_decoded) {
+    return switch (previous.instruction) {
         .stm => |stm| blk: {
             if (!stm.writeback) return error.UnsupportedOpcode;
             if (stm.base != base_reg) return error.UnsupportedOpcode;
             const previous_slot_index = findBlockTransferSlotIndexForRelative(stm.mode, stm.mask, current_relative, true) orelse return error.UnsupportedOpcode;
             const previous_reg = registerAtMaskSlot(stm.mask, previous_slot_index) orelse return error.UnsupportedOpcode;
-            break :blk try resolvePreviousRegisterValue(image, isa, previous_address, previous_reg);
+            break :blk try resolvePreviousRegisterValue(image, isa, previous.address, previous_reg);
         },
         .push => |mask| blk: {
             if (base_reg != 13) return error.UnsupportedOpcode;
             const previous_slot_index = findBlockTransferSlotIndexForRelative(.db, mask, current_relative, true) orelse return error.UnsupportedOpcode;
             const previous_reg = registerAtMaskSlot(mask, previous_slot_index) orelse return error.UnsupportedOpcode;
-            break :blk try resolvePreviousRegisterValue(image, isa, previous_address, previous_reg);
+            break :blk try resolvePreviousRegisterValue(image, isa, previous.address, previous_reg);
         },
         else => error.UnsupportedOpcode,
     };
@@ -730,23 +849,32 @@ fn resolvePreviousRegisterValue(
     address: u32,
     reg: u4,
 ) BuildError!u32 {
-    const previous_size = instructionSizeBytes(isa);
-    if (address < image.base_address + previous_size) return error.UnsupportedOpcode;
-    const previous_address = address - previous_size;
-    const offset = offsetForAddress(image, previous_address, isa) orelse return error.UnsupportedOpcode;
-    const previous_decoded = switch (isa) {
-        .arm => try armv4t_decode.decode(armv4t_decode.readWord(image.bytes, offset), previous_address),
-        .thumb => try armv4t_decode.decodeThumb(armv4t_decode.readHalfword(image.bytes, offset), previous_address),
-    };
+    const previous = try previousInstruction(image, isa, address);
 
-    return switch (previous_decoded) {
+    return switch (previous.instruction) {
         .add_imm => |add| blk: {
-            if (add.rd != reg or add.rn != 15) return error.UnsupportedOpcode;
-            break :blk pcValueForInstruction(isa, previous_address) + add.imm;
+            if (add.rd != reg) return error.UnsupportedOpcode;
+            if (add.rn == 15) break :blk pcValueForInstruction(isa, previous.address) + add.imm;
+            if (add.rn != reg) return error.UnsupportedOpcode;
+            break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg) + add.imm;
+        },
+        .adds_imm => |add| blk: {
+            if (add.rd != reg) return error.UnsupportedOpcode;
+            if (add.rn == 15) break :blk pcValueForInstruction(isa, previous.address) + add.imm;
+            if (add.rn != reg) return error.UnsupportedOpcode;
+            break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg) + add.imm;
         },
         .mov_imm => |mov| blk: {
             if (mov.rd != reg) return error.UnsupportedOpcode;
             break :blk mov.imm;
+        },
+        .movs_imm => |mov| blk: {
+            if (mov.rd != reg) return error.UnsupportedOpcode;
+            break :blk mov.imm;
+        },
+        .mov_reg => |mov| blk: {
+            if (mov.rd != reg or mov.rm == 15) return error.UnsupportedOpcode;
+            break :blk try resolvePreviousRegisterValue(image, isa, previous.address, mov.rm);
         },
         else => error.UnsupportedOpcode,
     };
@@ -840,25 +968,33 @@ fn writesUnsupportedPcDestination(decoded: armv4t_decode.DecodedInstruction) boo
         .mov_reg => |mov| mov.rd == 15 and mov.rm != 14,
         .movs_imm => |mov| mov.rd == 15,
         .mvn_imm => |mvn| mvn.rd == 15,
+        .mvn_reg => |mvn| mvn.rd == 15,
         .movs_reg => |mov| mov.rd == 15,
         .orr_imm => |orr| orr.rd == 15,
+        .orr_reg => |orr| orr.rd == 15,
         .eor_imm => |eor| eor.rd == 15,
+        .eor_reg => |eor| eor.rd == 15,
         .bic_imm => |bic| bic.rd == 15,
+        .bic_reg => |bic| bic.rd == 15,
         .orr_shift_reg => |orr| orr.rd == 15,
         .and_imm => |and_op| and_op.rd == 15,
+        .and_reg => |and_op| and_op.rd == 15,
         .add_imm => |add| add.rd == 15,
         .adds_imm => |add| add.rd == 15,
         .adcs_imm => |add| add.rd == 15,
         .adcs_shift_reg => |add| add.rd == 15,
         .adc_imm => |add| add.rd == 15,
         .sbcs_imm => |sub| sub.rd == 15,
+        .sbcs_reg => |sub| sub.rd == 15,
         .sbc_imm => |sub| sub.rd == 15,
         .add_reg => |add| add.rd == 15,
         .add_shift_reg => |add| add.rd == 15,
         .rsb_imm => |sub| sub.rd == 15,
+        .rsbs_imm => |sub| sub.rd == 15,
         .rsc_imm => |sub| sub.rd == 15,
         .sub_imm => |sub| sub.rd == 15,
         .subs_imm => |sub| sub.rd == 15,
+        .subs_reg => |sub| sub.rd == 15,
         .lsl_imm => |shift| shift.rd == 15,
         .lsl_reg => |shift| shift.rd == 15,
         .asr_imm => |shift| shift.rd == 15,
@@ -887,12 +1023,15 @@ fn writesUnsupportedPcDestination(decoded: armv4t_decode.DecodedInstruction) boo
         .ldr_word_imm => |load| load.rd == 15,
         .ldr_word_imm_signed => |load| load.rd == 15,
         .ldr_byte_imm => |load| load.rd == 15,
+        .ldr_byte_reg => |load| load.rd == 15,
         .ldr_halfword_imm => |load| load.rd == 15,
         .ldr_halfword_pre_index_reg => |load| load.rd == 15,
         .ldr_halfword_pre_index_imm => |load| load.rd == 15,
         .ldr_halfword_post_imm => |load| load.rd == 15,
         .ldr_signed_halfword_imm => |load| load.rd == 15,
+        .ldr_signed_halfword_reg => |load| load.rd == 15,
         .ldr_signed_byte_imm => |load| load.rd == 15,
+        .ldr_signed_byte_reg => |load| load.rd == 15,
         .ldr_word_pre_index_reg_shift => |load| load.rd == 15,
         .ldr_word_pre_index_imm => |load| load.rd == 15,
         .ldr_word_post_imm => |load| load.rd == 15,
@@ -1216,6 +1355,32 @@ test "lifted real arm rom reaches the report block" {
     try std.testing.expectEqual(llvm_codegen.OutputMode.arm_report, program.output_mode);
 }
 
+test "lifted real thumb rom reaches the report block" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/real/jsmolka/thumb.gba",
+        std.testing.allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer std.testing.allocator.free(rom);
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb.gba", .data = rom });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb.gba");
+    defer image.deinit(std.testing.allocator);
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const program = try liftRom(std.testing.allocator, &output.writer, image);
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(llvm_codegen.OutputMode.arm_report, program.output_mode);
+}
+
 test "build reports a structured diagnostic for unsupported subs pc immediate" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1279,6 +1444,49 @@ test "build uses the real jsmolka arm rom and reports the rom verdict" {
 
     const result = try std.process.run(std.testing.allocator, io, .{
         .argv = &.{"./arm-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("PASS\n", result.stdout);
+}
+
+test "build uses the real jsmolka thumb rom and reports the rom verdict" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/real/jsmolka/thumb.gba",
+        std.testing.allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer std.testing.allocator.free(rom);
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb.gba", .data = rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "thumb.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "thumb-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./thumb-native"},
         .cwd = .{ .dir = tmp.dir },
         .stdout_limit = .limited(1024),
         .stderr_limit = .limited(1024),

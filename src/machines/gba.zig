@@ -163,6 +163,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .id = .{
             .kind = .instruction,
             .namespace = "armv4t",
+            .name = "mvn_reg",
+        },
+        .isa = .armv4t,
+        .mnemonic = "mvn",
+        .encoding = .fixed16,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 Thumb logical-not surface for register inversion with NZ flag updates."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
             .name = "movs_reg",
         },
         .isa = .armv4t,
@@ -191,6 +205,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .id = .{
             .kind = .instruction,
             .namespace = "armv4t",
+            .name = "orr_reg",
+        },
+        .isa = .armv4t,
+        .mnemonic = "orr",
+        .encoding = .fixed16,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 Thumb logical surface for register OR with NZ flag updates."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
             .name = "eor_imm",
         },
         .isa = .armv4t,
@@ -205,6 +233,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .id = .{
             .kind = .instruction,
             .namespace = "armv4t",
+            .name = "eor_reg",
+        },
+        .isa = .armv4t,
+        .mnemonic = "eor",
+        .encoding = .fixed16,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 Thumb logical surface for register XOR with NZ flag updates."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
             .name = "bic_imm",
         },
         .isa = .armv4t,
@@ -214,6 +256,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .tests = &.{},
         .doc_refs = &.{},
         .notes = &.{"Phase 1 helper surface for immediate bit-clear operations in the ARM arithmetic test ROM."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "bic_reg",
+        },
+        .isa = .armv4t,
+        .mnemonic = "bic",
+        .encoding = .fixed16,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 Thumb logical surface for register bit-clear with NZ flag updates."},
     },
     .{
         .id = .{
@@ -242,6 +298,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .tests = &.{},
         .doc_refs = &.{},
         .notes = &.{"Phase 1 helper surface for immediate bit masking in tile-format helpers."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "and_reg",
+        },
+        .isa = .armv4t,
+        .mnemonic = "and",
+        .encoding = .fixed16,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 Thumb logical surface for register AND with NZ flag updates."},
     },
     .{
         .id = .{
@@ -331,6 +401,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .id = .{
             .kind = .instruction,
             .namespace = "armv4t",
+            .name = "sbcs_reg",
+        },
+        .isa = .armv4t,
+        .mnemonic = "sbcs",
+        .encoding = .fixed16,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 Thumb arithmetic surface for subtract-with-carry register arithmetic."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
             .name = "sbc_imm",
         },
         .isa = .armv4t,
@@ -387,6 +471,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .id = .{
             .kind = .instruction,
             .namespace = "armv4t",
+            .name = "rsbs_imm",
+        },
+        .isa = .armv4t,
+        .mnemonic = "rsbs",
+        .encoding = .fixed16,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 Thumb arithmetic surface for negate-style reverse-subtract with NZCV updates."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
             .name = "rsc_imm",
         },
         .isa = .armv4t,
@@ -424,6 +522,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .tests = &.{},
         .doc_refs = &.{},
         .notes = &.{"Phase 1 real-ROM surface for loop counters and Z-flag updates."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "subs_reg",
+        },
+        .isa = .armv4t,
+        .mnemonic = "subs",
+        .encoding = .fixed16,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 Thumb arithmetic surface for register subtract with NZCV updates."},
     },
     .{
         .id = .{
@@ -849,6 +961,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .id = .{
             .kind = .instruction,
             .namespace = "armv4t",
+            .name = "ldr_byte_reg",
+        },
+        .isa = .armv4t,
+        .mnemonic = "ldrb",
+        .encoding = .fixed16,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 Thumb memory surface for zero-extending byte loads with register offsets."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
             .name = "ldr_halfword_imm",
         },
         .isa = .armv4t,
@@ -919,6 +1045,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .id = .{
             .kind = .instruction,
             .namespace = "armv4t",
+            .name = "ldr_signed_halfword_reg",
+        },
+        .isa = .armv4t,
+        .mnemonic = "ldrsh",
+        .encoding = .fixed16,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 Thumb memory surface for sign-extending halfword loads with register offsets."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
             .name = "ldr_signed_byte_imm",
         },
         .isa = .armv4t,
@@ -928,6 +1068,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .tests = &.{},
         .doc_refs = &.{},
         .notes = &.{"Phase 1 memory surface for sign-extending byte loads with immediate offsets."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "ldr_signed_byte_reg",
+        },
+        .isa = .armv4t,
+        .mnemonic = "ldrsb",
+        .encoding = .fixed16,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 Thumb memory surface for sign-extending byte loads with register offsets."},
     },
     .{
         .id = .{
@@ -1334,6 +1488,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .tests = &.{},
         .doc_refs = &.{},
         .notes = &.{"Phase 1 wait-loop surface for immediate bit tests that only update flags."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "tst_reg",
+        },
+        .isa = .armv4t,
+        .mnemonic = "tst",
+        .encoding = .fixed16,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 Thumb logical surface for register bit tests that only update flags."},
     },
     .{
         .id = .{
