@@ -47,6 +47,7 @@ pub const machines = struct {
 };
 
 pub const catalog = @import("catalog.zig");
+pub const capstone_api = @import("capstone_api.zig");
 
 test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);

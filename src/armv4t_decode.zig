@@ -1,8 +1,9 @@
 const std = @import("std");
+const capstone_api = @import("capstone_api.zig");
 
 pub const DecodeError = error{
     UnsupportedOpcode,
-};
+} || capstone_api.DisassembleError;
 
 pub const Cond = enum {
     al,
@@ -56,11 +57,20 @@ pub const DecodedInstruction = union(enum) {
 };
 
 pub fn decode(word: u32, address: u32) DecodeError!DecodedInstruction {
-    if (decodeBranch(word, address)) |branch| return branch;
-    if (decodeStore(word)) |store| return store;
-    if (decodeHalfwordStore(word)) |store| return store;
-    if (decodeDataProcessingImmediate(word)) |instruction| return instruction;
-    if (decodeSwi(word)) |swi| return swi;
+    const text = try capstone_api.disassembleOneArm32(word, address);
+    const mnemonic = text.mnemonicSlice();
+    const operands = text.operandsSlice();
+
+    if (std.mem.eql(u8, mnemonic, "mov")) return parseMov(operands);
+    if (std.mem.eql(u8, mnemonic, "orr")) return parseAlu3(.orr_imm, operands);
+    if (std.mem.eql(u8, mnemonic, "add")) return parseAlu3(.add_imm, operands);
+    if (std.mem.eql(u8, mnemonic, "subs")) return parseAlu3(.subs_imm, operands);
+    if (std.mem.eql(u8, mnemonic, "str")) return parseStore(operands, .word);
+    if (std.mem.eql(u8, mnemonic, "strb")) return parseStore(operands, .byte);
+    if (std.mem.eql(u8, mnemonic, "strh")) return parseStore(operands, .halfword);
+    if (std.mem.eql(u8, mnemonic, "b")) return parseBranch(operands, .al);
+    if (std.mem.eql(u8, mnemonic, "bne")) return parseBranch(operands, .ne);
+    if (std.mem.eql(u8, mnemonic, "swi") or std.mem.eql(u8, mnemonic, "svc")) return parseSwi(operands);
     return error.UnsupportedOpcode;
 }
 
@@ -68,122 +78,135 @@ pub fn readWord(bytes: []const u8, offset: usize) u32 {
     return std.mem.readInt(u32, bytes[offset..][0..4], .little);
 }
 
-fn decodeDataProcessingImmediate(word: u32) ?DecodedInstruction {
-    if (decodeCond(word) != .al) return null;
-    if (((word >> 25) & 0x7) != 0b001) return null;
+fn parseMov(operands: []const u8) DecodeError!DecodedInstruction {
+    const split = try split3Operands(operands, 2);
+    return .{ .mov_imm = .{
+        .rd = try parseRegister(split.first),
+        .imm = try parseImmediate(split.second),
+    } };
+}
 
-    const opcode: u4 = @truncate((word >> 21) & 0xF);
-    const sets_flags = ((word >> 20) & 0x1) == 1;
-    const rn: u4 = @truncate((word >> 16) & 0xF);
-    const rd: u4 = @truncate((word >> 12) & 0xF);
-    const imm = decodeArmImmediate(word);
+fn parseAlu3(
+    comptime tag: enum { orr_imm, add_imm, subs_imm },
+    operands: []const u8,
+) DecodeError!DecodedInstruction {
+    const split = try split3Operands(operands, 3);
+    const rd = try parseRegister(split.first);
+    const rn = try parseRegister(split.second);
+    const imm = try parseImmediate(split.third.?);
 
-    return switch (opcode) {
-        0xD => if (!sets_flags and rn == 0) .{ .mov_imm = .{ .rd = rd, .imm = imm } } else null,
-        0xC => if (!sets_flags) .{ .orr_imm = .{ .rd = rd, .rn = rn, .imm = imm } } else null,
-        0x4 => if (!sets_flags) .{ .add_imm = .{ .rd = rd, .rn = rn, .imm = imm } } else null,
-        0x2 => if (sets_flags) .{ .subs_imm = .{ .rd = rd, .rn = rn, .imm = imm } } else null,
-        else => null,
+    return switch (tag) {
+        .orr_imm => .{ .orr_imm = .{ .rd = rd, .rn = rn, .imm = imm } },
+        .add_imm => .{ .add_imm = .{ .rd = rd, .rn = rn, .imm = imm } },
+        .subs_imm => .{ .subs_imm = .{ .rd = rd, .rn = rn, .imm = imm } },
     };
 }
 
-fn decodeStore(word: u32) ?DecodedInstruction {
-    if (decodeCond(word) != .al) return null;
-    if (((word >> 26) & 0x3) != 0b01) return null;
+fn parseStore(operands: []const u8, size: StoreSize) DecodeError!DecodedInstruction {
+    const comma_index = std.mem.indexOfScalar(u8, operands, ',') orelse return error.UnsupportedOpcode;
+    const src_text = trim(operands[0..comma_index]);
+    const memory_text = trim(operands[comma_index + 1 ..]);
+    const src = try parseRegister(src_text);
 
-    const pre_index = ((word >> 24) & 0x1) == 1;
-    const add_offset = ((word >> 23) & 0x1) == 1;
-    const is_byte = ((word >> 22) & 0x1) == 1;
-    const reg_offset = ((word >> 25) & 0x1) == 1;
-    const write_back = ((word >> 21) & 0x1) == 1;
-    const load = ((word >> 20) & 0x1) == 1;
-
-    if (!pre_index or !add_offset or write_back or load) return null;
-
-    const src: u4 = @truncate((word >> 12) & 0xF);
-    const base: u4 = @truncate((word >> 16) & 0xF);
-    const size: StoreSize = if (is_byte) .byte else .word;
-    const offset: Offset = if (reg_offset) blk: {
-        if (((word >> 4) & 0x1) != 0) return null;
-        if (((word >> 5) & 0x3) != 0) return null;
-        if (((word >> 7) & 0x1F) != 0) return null;
-        break :blk .{ .reg = @truncate(word & 0xF) };
-    } else .{ .imm = word & 0xFFF };
-
+    const memory = try parseMemoryOperand(memory_text);
     return .{ .store = .{
         .src = src,
-        .base = base,
-        .offset = offset,
+        .base = memory.base,
+        .offset = memory.offset,
         .size = size,
     } };
 }
 
-fn decodeHalfwordStore(word: u32) ?DecodedInstruction {
-    if (decodeCond(word) != .al) return null;
-    if (((word >> 25) & 0x7) != 0b000) return null;
-    if (((word >> 22) & 0x1) != 1) return null;
-    if (((word >> 20) & 0x1) != 0) return null;
-    if (((word >> 24) & 0x1) != 1) return null;
-    if (((word >> 23) & 0x1) != 1) return null;
-    if (((word >> 21) & 0x1) != 0) return null;
-    if (((word >> 4) & 0xF) != 0xB) return null;
-
-    const src: u4 = @truncate((word >> 12) & 0xF);
-    const base: u4 = @truncate((word >> 16) & 0xF);
-    const offset = (((word >> 8) & 0xF) << 4) | (word & 0xF);
-
-    return .{ .store = .{
-        .src = src,
-        .base = base,
-        .offset = .{ .imm = offset },
-        .size = .halfword,
-    } };
-}
-
-fn decodeBranch(word: u32, address: u32) ?DecodedInstruction {
-    const cond = decodeCond(word) orelse return null;
-    if (((word >> 25) & 0x7) != 0b101) return null;
-    if (((word >> 24) & 0x1) != 0) return null;
-
+fn parseBranch(operands: []const u8, cond: Cond) DecodeError!DecodedInstruction {
     return .{ .branch = .{
         .cond = cond,
-        .target = branchTarget(word, address),
+        .target = try parseImmediate(operands),
     } };
 }
 
-fn decodeSwi(word: u32) ?DecodedInstruction {
-    if (decodeCond(word) != .al) return null;
-    if (((word >> 24) & 0xF) != 0xF) return null;
+fn parseSwi(operands: []const u8) DecodeError!DecodedInstruction {
+    const imm = try parseImmediate(operands);
+    if (imm > 0x00FF_FFFF) return error.UnsupportedOpcode;
     return .{ .swi = .{
-        .imm24 = @truncate(word & 0x00FF_FFFF),
+        .imm24 = @truncate(imm),
     } };
 }
 
-fn decodeCond(word: u32) ?Cond {
-    return switch (word >> 28) {
-        0xE => .al,
-        0x1 => .ne,
-        else => null,
+const MemoryOperand = struct {
+    base: u4,
+    offset: Offset,
+};
+
+fn parseMemoryOperand(text: []const u8) DecodeError!MemoryOperand {
+    const trimmed = trim(text);
+    if (trimmed.len < 2 or trimmed[0] != '[' or trimmed[trimmed.len - 1] != ']') return error.UnsupportedOpcode;
+    const inner = trim(trimmed[1 .. trimmed.len - 1]);
+    const comma_index = std.mem.indexOfScalar(u8, inner, ',');
+    if (comma_index == null) {
+        return .{
+            .base = try parseRegister(inner),
+            .offset = .{ .imm = 0 },
+        };
+    }
+
+    const base_text = trim(inner[0..comma_index.?]);
+    const offset_text = trim(inner[comma_index.? + 1 ..]);
+    return .{
+        .base = try parseRegister(base_text),
+        .offset = try parseOffset(offset_text),
     };
 }
 
-fn decodeArmImmediate(word: u32) u32 {
-    const imm8: u32 = word & 0xFF;
-    const rotate_bits: u5 = @intCast(((word >> 8) & 0xF) * 2);
-    if (rotate_bits == 0) return imm8;
-    const inverse_rotate: u5 = @intCast(32 - @as(u6, rotate_bits));
-    return (imm8 >> rotate_bits) | (imm8 << inverse_rotate);
+fn parseOffset(text: []const u8) DecodeError!Offset {
+    const trimmed = trim(text);
+    if (trimmed.len == 0) return error.UnsupportedOpcode;
+    if (trimmed[0] == '#') return .{ .imm = try parseImmediate(trimmed) };
+    if (trimmed[0] == 'r') return .{ .reg = try parseRegister(trimmed) };
+    return error.UnsupportedOpcode;
 }
 
-fn branchTarget(word: u32, address: u32) u32 {
-    const imm24 = word & 0x00FF_FFFF;
-    const offset_bits = imm24 << 2;
-    const signed_offset: i32 = @bitCast(if ((imm24 & 0x0080_0000) != 0)
-        offset_bits | 0xFC00_0000
-    else
-        offset_bits);
-    const target: i64 = @as(i64, address) + 8 + signed_offset;
-    return @intCast(target);
+const SplitOperands = struct {
+    first: []const u8,
+    second: []const u8,
+    third: ?[]const u8,
+};
+
+fn split3Operands(text: []const u8, comptime expected_parts: comptime_int) DecodeError!SplitOperands {
+    const first_comma = std.mem.indexOfScalar(u8, text, ',') orelse return error.UnsupportedOpcode;
+    const first = trim(text[0..first_comma]);
+    const tail = trim(text[first_comma + 1 ..]);
+    if (expected_parts == 2) {
+        return .{
+            .first = first,
+            .second = tail,
+            .third = null,
+        };
+    }
+
+    const second_comma = std.mem.indexOfScalar(u8, tail, ',') orelse return error.UnsupportedOpcode;
+    return .{
+        .first = first,
+        .second = trim(tail[0..second_comma]),
+        .third = trim(tail[second_comma + 1 ..]),
+    };
+}
+
+fn parseRegister(text: []const u8) DecodeError!u4 {
+    const trimmed = trim(text);
+    if (trimmed.len < 2 or trimmed[0] != 'r') return error.UnsupportedOpcode;
+    const index = std.fmt.parseInt(u8, trimmed[1..], 10) catch return error.UnsupportedOpcode;
+    if (index > 15) return error.UnsupportedOpcode;
+    return @intCast(index);
+}
+
+fn parseImmediate(text: []const u8) DecodeError!u32 {
+    const trimmed = trim(text);
+    const bare = if (trimmed.len != 0 and trimmed[0] == '#') trimmed[1..] else trimmed;
+    return std.fmt.parseInt(u32, bare, 0) catch return error.UnsupportedOpcode;
+}
+
+fn trim(text: []const u8) []const u8 {
+    return std.mem.trim(u8, text, &std.ascii.whitespace);
 }
 
 test "decode reads mov immediate" {
