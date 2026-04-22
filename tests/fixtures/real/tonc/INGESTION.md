@@ -9,7 +9,7 @@
 
 ## First Homonculi Failure Surface
 
-- Re-measured after the startup trampoline veneer fix on 2026-04-22.
+- Re-measured after the Thumb `movs` alias fix on 2026-04-22.
 - The shared Thumb zero-shift `movs` alias blocker is gone.
 - The fixtures now diverge on their next blockers:
   - `sbb_reg`: `Unsupported opcode 0x00004700 at 0x08000456 for armv4t`
