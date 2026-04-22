@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const build_cmd = @import("build_cmd.zig");
 const doc = @import("cli/doc.zig");
 const parse = @import("cli/parse.zig");
 const status = @import("cli/status.zig");
@@ -16,6 +17,7 @@ pub fn main(init: std.process.Init) !void {
     const stdout_writer = &stdout_file_writer.interface;
 
     switch (command) {
+        .build => |build| try runBuildOrExit(io, arena, stdout_writer, build),
         .doc => |decl_id_text| try doc.render(stdout_writer, decl_id_text),
         .status => |maybe_trace_path| {
             const trace_path = maybe_trace_path orelse return error.TracePathRequired;
@@ -27,6 +29,30 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try stdout_writer.flush();
+}
+
+fn runBuildOrExit(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    writer: *Io.Writer,
+    build: parse.BuildCommand,
+) !void {
+    build_cmd.run(io, allocator, Io.Dir.cwd(), writer, build) catch |err| switch (err) {
+        error.UnsupportedMachine,
+        error.EmptyRom,
+        error.InvalidRomSize,
+        error.UnsupportedOpcode,
+        error.UnsupportedShim,
+        error.ToolFailed,
+        error.MachineNotFound,
+        error.ShimNotFound,
+        error.InstructionNotFound,
+        => {
+            try writer.flush();
+            std.process.exit(1);
+        },
+        else => return err,
+    };
 }
 
 test "simple test" {

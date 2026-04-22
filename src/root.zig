@@ -1,6 +1,7 @@
 //! By convention, root.zig is the root source file when making a package.
 const std = @import("std");
 const Io = std.Io;
+const build_module = @import("build_cmd.zig");
 const cli_doc = @import("cli/doc.zig");
 const cli_parse = @import("cli/parse.zig");
 const cli_status = @import("cli/status.zig");
@@ -18,6 +19,7 @@ pub fn add(a: i32, b: i32) i32 {
 }
 
 pub const cli = struct {
+    pub const build_cmd = build_module;
     pub const doc = cli_doc;
     pub const parse = cli_parse.parse;
     pub const status = cli_status;
