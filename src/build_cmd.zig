@@ -2208,7 +2208,7 @@ test "thumb saved-lr return epilogue rejects local tail near-misses" {
     }
 }
 
-test "tonc fixtures advance past VBlankIntrWait and keep irq_demo deferred" {
+test "tonc fixture frontiers reflect the expanded saved-lr return slice" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
