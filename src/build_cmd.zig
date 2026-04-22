@@ -752,7 +752,47 @@ fn resolveBxTarget(
     address: u32,
     reg: u4,
 ) BuildError!armv4t_decode.DecodedInstruction {
+    if (isa == .thumb and reg == 6) {
+        const previous = try previousInstruction(image, isa, address);
+        if (previous.instruction == .bl) {
+            return .{ .bx_target = normalizeCodeTarget(try resolveStartupBxTargetValue(image, isa, address, reg)) };
+        }
+    }
     return .{ .bx_target = normalizeCodeTarget(try resolvePreviousRegisterValue(image, isa, address, reg)) };
+}
+
+fn resolveStartupBxTargetValue(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+    reg: u4,
+) BuildError!u32 {
+    const previous = try previousInstruction(image, isa, address);
+
+    return switch (previous.instruction) {
+        .bl => try resolveStartupBxTargetValue(image, isa, previous.address, reg),
+        .add_imm => |add| blk: {
+            if (add.rd == reg and add.imm == 0) break :blk try resolveStartupBxTargetValue(image, isa, previous.address, add.rn);
+            break :blk try resolveStartupBxTargetValue(image, isa, previous.address, reg);
+        },
+        .adds_imm => |add| blk: {
+            if (add.rd == reg and add.imm == 0) break :blk try resolveStartupBxTargetValue(image, isa, previous.address, add.rn);
+            break :blk try resolveStartupBxTargetValue(image, isa, previous.address, reg);
+        },
+        .mov_imm => |mov| if (mov.rd == reg)
+            mov.imm
+        else
+            try resolveStartupBxTargetValue(image, isa, previous.address, reg),
+        .movs_imm => |mov| if (mov.rd == reg)
+            mov.imm
+        else
+            try resolveStartupBxTargetValue(image, isa, previous.address, reg),
+        .lsls_imm => |shift| if (shift.rd == reg)
+            try resolveStartupBxTargetValue(image, isa, previous.address, reg) << @as(u5, @intCast(shift.imm))
+        else
+            try resolveStartupBxTargetValue(image, isa, previous.address, reg),
+        else => try resolveStartupBxTargetValue(image, isa, previous.address, reg),
+    };
 }
 
 fn resolveMovPcTarget(
@@ -914,24 +954,14 @@ fn resolvePreviousRegisterValue(
         .add_imm => |add| blk: {
             if (add.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
             if (add.rn == 15) break :blk pcValueForInstruction(isa, previous.address) + add.imm;
-            if (add.imm == 0 and add.rn != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, add.rn);
             if (add.rn != reg) return error.UnsupportedOpcode;
             break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg) + add.imm;
         },
         .adds_imm => |add| blk: {
             if (add.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
             if (add.rn == 15) break :blk pcValueForInstruction(isa, previous.address) + add.imm;
-            if (add.imm == 0 and add.rn != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, add.rn);
             if (add.rn != reg) return error.UnsupportedOpcode;
             break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg) + add.imm;
-        },
-        .subs_reg => |sub| blk: {
-            if (sub.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
-            return error.UnsupportedOpcode;
-        },
-        .ldr_word_imm => |load| blk: {
-            if (load.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
-            return error.UnsupportedOpcode;
         },
         .mov_imm => |mov| blk: {
             if (mov.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
@@ -945,17 +975,6 @@ fn resolvePreviousRegisterValue(
             if (mov.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
             if (mov.rm == 15) return error.UnsupportedOpcode;
             break :blk try resolvePreviousRegisterValue(image, isa, previous.address, mov.rm);
-        },
-        .bl => try resolvePreviousRegisterValue(image, isa, previous.address, reg),
-        .lsl_imm => |shift| blk: {
-            if (shift.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
-            if (shift.rm != reg) return error.UnsupportedOpcode;
-            break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg) << @as(u5, @intCast(shift.imm));
-        },
-        .lsls_imm => |shift| blk: {
-            if (shift.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
-            if (shift.rm != reg) return error.UnsupportedOpcode;
-            break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg) << @as(u5, @intCast(shift.imm));
         },
         .orr_imm => |orr| blk: {
             if (orr.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
