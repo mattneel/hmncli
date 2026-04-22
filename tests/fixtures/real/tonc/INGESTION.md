@@ -9,7 +9,7 @@
 
 ## First Homonculi Failure Surface
 
-- `sbb_reg`: `Unsupported SWI 0x000000 at 0x08000186 for gba`
+- `sbb_reg`: `Unsupported opcode 0x00004730 at 0x08000124 for armv4t`
 - `obj_demo`: `Unsupported SWI 0x000000 at 0x08000186 for gba`
 - `key_demo`: `Unsupported SWI 0x000000 at 0x08000186 for gba`
 - `irq_demo`: `Unsupported SWI 0x000000 at 0x08000186 for gba`

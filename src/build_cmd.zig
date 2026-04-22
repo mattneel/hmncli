@@ -1221,6 +1221,7 @@ fn isSqrtSwi(imm24: u24) bool {
 }
 
 fn swiShimName(imm24: u24) ?[]const u8 {
+    if (imm24 == 0x000000) return "SoftReset";
     if (isDivSwi(imm24)) return "Div";
     if (isSqrtSwi(imm24)) return "Sqrt";
     return null;
@@ -1377,6 +1378,29 @@ fn compileRuntimeHelper(
     return helper_object_path;
 }
 
+fn buildFixtureExpectFailure(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    rom_path: []const u8,
+) ![]u8 {
+    var output: Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+
+    run(io, allocator, dir, &output.writer, .{
+        .rom_path = rom_path,
+        .machine_name = "gba",
+        .target = "x86_64-linux",
+        .output_mode = .frame_raw,
+        .max_instructions = 50_000,
+        .output_path = ".zig-cache/tonc/should-not-exist",
+        .optimize = .release,
+    }) catch {
+        return output.toOwnedSlice();
+    };
+    return error.ExpectedBuildFailure;
+}
+
 test "build emits a native executable for the first gba mov-plus-div slice" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1416,6 +1440,22 @@ test "build emits a native executable for the first gba mov-plus-div slice" {
 
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("5\n", result.stdout);
+}
+
+test "tonc sbb_reg no longer stops at startup soft reset swi" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const stderr = try buildFixtureExpectFailure(
+        std.testing.allocator,
+        io,
+        tmp.dir,
+        "tests/fixtures/real/tonc/sbb_reg.gba",
+    );
+    defer std.testing.allocator.free(stderr);
+
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "Unsupported SWI 0x000000") == null);
 }
 
 test "build reports a structured diagnostic for an unsupported opcode" {

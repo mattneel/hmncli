@@ -260,6 +260,15 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("declare {{ i32, i1 }} @llvm.uadd.with.overflow.i32(i32, i32)\n", .{});
     try writer.print("declare {{ i32, i1 }} @llvm.ssub.with.overflow.i32(i32, i32)\n", .{});
     try writer.print("declare {{ i32, i1 }} @llvm.usub.with.overflow.i32(i32, i32)\n\n", .{});
+    try writer.print("define i32 @shim_gba_SoftReset(ptr %state) {{\n", .{});
+    try writer.print("entry:\n", .{});
+    try writer.print(
+        "  %stop_flag_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+        .{guest_state_stop_flag_field},
+    );
+    try writer.print("  store i1 true, ptr %stop_flag_ptr, align 1\n", .{});
+    try writer.print("  ret i32 0\n", .{});
+    try writer.print("}}\n\n", .{});
     try writer.print("define i32 @shim_gba_Div(ptr %state) {{\n", .{});
     try writer.print("entry:\n", .{});
     try writer.print(
@@ -357,6 +366,10 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("irq_done:\n", .{});
     try writer.print("  ret void\n", .{});
     try writer.print("}}\n\n", .{});
+}
+
+pub fn emitPreamble(writer: *Io.Writer, _: anytype) Io.Writer.Error!void {
+    try emitPrelude(writer);
 }
 
 fn emitPsrHelpers(writer: *Io.Writer) Io.Writer.Error!void {
@@ -2813,6 +2826,7 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
         },
         .swi => |swi| {
             const shim_name = switch (swi.imm24) {
+                0x000000 => "SoftReset",
                 0x000006, 0x060000 => "Div",
                 0x000008, 0x080000 => "Sqrt",
                 else => unreachable,
@@ -4544,6 +4558,21 @@ test "llvm emission includes guest state and a lifted guest entry function" {
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "%GuestState = type") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "define void @guest_arm_08000000(ptr %state)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "call void @guest_arm_08000000(ptr %state)") != null);
+}
+
+test "llvm emission includes gba soft reset shim" {
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try emitPreamble(&output.writer, .{
+        .machine_name = "gba",
+        .output_mode = .retired_count,
+        .instruction_limit = 8,
+        .functions = &.{},
+        .entry = 0x08000000,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "@shim_gba_SoftReset") != null);
 }
 
 test "llvm emission prepays retired counts for straight-line blocks" {

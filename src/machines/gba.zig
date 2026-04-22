@@ -68,6 +68,20 @@ pub const shims: []const shim_mod.ShimDecl = &.{
         .id = .{
             .kind = .shim,
             .namespace = "gba",
+            .name = "SoftReset",
+        },
+        .state = .implemented,
+        .args = &.{},
+        .returns = .i32,
+        .effects = .memory_write,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Minimal devkitARM startup epilogue shim: stop the generated binary cleanly when main returns."},
+    },
+    .{
+        .id = .{
+            .kind = .shim,
+            .namespace = "gba",
             .name = "Div",
         },
         .state = .verified,
