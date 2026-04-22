@@ -158,6 +158,15 @@ fn liftFunction(
         };
 
         try ensureDeclared(writer, decoded, address);
+        try maybeEnqueueVectorTarget(
+            allocator,
+            writer,
+            pending_functions,
+            image,
+            function_entry.isa,
+            address,
+            decoded,
+        );
         if (isStore(decoded)) has_store.* = true;
 
         try nodes.append(allocator, .{
@@ -400,11 +409,11 @@ fn ensureDeclared(
         .msr_psr_reg => _ = try catalog.lookupInstruction("armv4t", "msr_psr_reg"),
         .exception_return => _ = try catalog.lookupInstruction("armv4t", "exception_return"),
         .swi => |swi| {
-            if (!isDivSwi(swi.imm24)) {
+            const shim_name = swiShimName(swi.imm24) orelse {
                 try renderUnsupportedShim(writer, address, swi.imm24);
                 return error.UnsupportedShim;
-            }
-            _ = try catalog.lookupShim("gba", "Div");
+            };
+            _ = try catalog.lookupShim("gba", shim_name);
         },
     }
 }
@@ -853,28 +862,35 @@ fn resolvePreviousRegisterValue(
 
     return switch (previous.instruction) {
         .add_imm => |add| blk: {
-            if (add.rd != reg) return error.UnsupportedOpcode;
+            if (add.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
             if (add.rn == 15) break :blk pcValueForInstruction(isa, previous.address) + add.imm;
             if (add.rn != reg) return error.UnsupportedOpcode;
             break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg) + add.imm;
         },
         .adds_imm => |add| blk: {
-            if (add.rd != reg) return error.UnsupportedOpcode;
+            if (add.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
             if (add.rn == 15) break :blk pcValueForInstruction(isa, previous.address) + add.imm;
             if (add.rn != reg) return error.UnsupportedOpcode;
             break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg) + add.imm;
         },
         .mov_imm => |mov| blk: {
-            if (mov.rd != reg) return error.UnsupportedOpcode;
+            if (mov.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
             break :blk mov.imm;
         },
         .movs_imm => |mov| blk: {
-            if (mov.rd != reg) return error.UnsupportedOpcode;
+            if (mov.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
             break :blk mov.imm;
         },
         .mov_reg => |mov| blk: {
-            if (mov.rd != reg or mov.rm == 15) return error.UnsupportedOpcode;
+            if (mov.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
+            if (mov.rm == 15) return error.UnsupportedOpcode;
             break :blk try resolvePreviousRegisterValue(image, isa, previous.address, mov.rm);
+        },
+        .orr_imm => |orr| blk: {
+            if (orr.rd != reg) break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg);
+            if (orr.rn == 15) break :blk pcValueForInstruction(isa, previous.address) | orr.imm;
+            if (orr.rn != reg) return error.UnsupportedOpcode;
+            break :blk try resolvePreviousRegisterValue(image, isa, previous.address, reg) | orr.imm;
         },
         else => error.UnsupportedOpcode,
     };
@@ -892,6 +908,40 @@ fn normalizePcWriteTarget(raw_target: u32, isa: armv4t_decode.InstructionSet) u3
         .arm => raw_target & ~@as(u32, 3),
         .thumb => raw_target & ~@as(u32, 1),
     };
+}
+
+fn maybeEnqueueVectorTarget(
+    allocator: std.mem.Allocator,
+    writer: *Io.Writer,
+    pending_functions: *std.ArrayList(armv4t_decode.CodeAddress),
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+    decoded: armv4t_decode.DecodedInstruction,
+) BuildError!void {
+    const store = switch (decoded) {
+        .store => |store| store,
+        else => return,
+    };
+
+    if (store.size != .word) return;
+
+    const absolute_address = switch (store.addressing) {
+        .offset => |offset_value| switch (offset_value.offset) {
+            .imm => |imm| blk: {
+                const base = resolvePreviousRegisterValue(image, isa, address, store.base) catch return;
+                const offset = if (offset_value.subtract) -@as(i64, imm) else @as(i64, imm);
+                break :blk @as(u32, @intCast(@as(i64, base) + offset));
+            },
+            else => return,
+        },
+        else => return,
+    };
+
+    if (absolute_address != 0x0300_7FFC) return;
+
+    const raw_target = resolvePreviousRegisterValue(image, isa, address, store.src) catch return;
+    try enqueueFunctionAddress(allocator, writer, pending_functions, image, normalizeCodeTarget(raw_target));
 }
 
 fn blockTransferRelativeOffset(
@@ -1113,6 +1163,16 @@ fn branchInstructionName(cond: armv4t_decode.Cond) []const u8 {
 
 fn isDivSwi(imm24: u24) bool {
     return imm24 == 0x000006 or imm24 == 0x060000;
+}
+
+fn isSqrtSwi(imm24: u24) bool {
+    return imm24 == 0x000008 or imm24 == 0x080000;
+}
+
+fn swiShimName(imm24: u24) ?[]const u8 {
+    if (isDivSwi(imm24)) return "Div";
+    if (isSqrtSwi(imm24)) return "Sqrt";
+    return null;
 }
 
 fn isStore(decoded: armv4t_decode.DecodedInstruction) bool {
@@ -1530,6 +1590,49 @@ test "build uses the real jsmolka memory rom and reports the rom verdict" {
 
     const result = try std.process.run(std.testing.allocator, io, .{
         .argv = &.{"./memory-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("PASS\n", result.stdout);
+}
+
+test "build uses the real jsmolka bios rom and reports the rom verdict" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/real/jsmolka/bios.gba",
+        std.testing.allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer std.testing.allocator.free(rom);
+    try tmp.dir.writeFile(io, .{ .sub_path = "bios.gba", .data = rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "bios.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "bios-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./bios-native"},
         .cwd = .{ .dir = tmp.dir },
         .stdout_limit = .limited(1024),
         .stderr_limit = .limited(1024),

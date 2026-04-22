@@ -54,7 +54,16 @@ fn splitSelector(selector: []const u8) RunError!SelectorParts {
 
 fn evalShim(selector: []const u8, input: []const i32) i32 {
     if (std.mem.eql(u8, selector, "gba/Div")) return @divTrunc(input[0], input[1]);
+    if (std.mem.eql(u8, selector, "gba/Sqrt")) return @bitCast(integerSqrt(@bitCast(input[0])));
     unreachable;
+}
+
+fn integerSqrt(value: u32) u32 {
+    if (value == 0) return 0;
+
+    var candidate: u32 = 1;
+    while (candidate <= value / candidate) : (candidate += 1) {}
+    return candidate - 1;
 }
 
 fn evalInstruction(selector: []const u8, input: []const u32) [1]u32 {
@@ -70,6 +79,18 @@ test "test command runs shim vectors for gba div" {
 
     try std.testing.expectEqualStrings(
         "PASS 2/2 shim tests for gba/Div\n",
+        output.writer.buffered(),
+    );
+}
+
+test "test command runs shim vectors for gba sqrt" {
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try runShim(&output.writer, "gba/Sqrt");
+
+    try std.testing.expectEqualStrings(
+        "PASS 3/3 shim tests for gba/Sqrt\n",
         output.writer.buffered(),
     );
 }

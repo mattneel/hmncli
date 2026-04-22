@@ -89,6 +89,31 @@ pub const shims: []const shim_mod.ShimDecl = &.{
         },
         .notes = &.{"Pure arithmetic BIOS helper used as the first shim test surface."},
     },
+    .{
+        .id = .{
+            .kind = .shim,
+            .namespace = "gba",
+            .name = "Sqrt",
+        },
+        .state = .implemented,
+        .args = &.{
+            .{ .name = "value", .ty = .i32 },
+        },
+        .returns = .i32,
+        .effects = .pure,
+        .tests = &.{
+            .{ .name = "sqrt zero", .input = &.{0}, .expected = 0 },
+            .{ .name = "sqrt perfect square", .input = &.{81}, .expected = 9 },
+            .{ .name = "sqrt truncates down", .input = &.{15}, .expected = 3 },
+        },
+        .doc_refs = &.{
+            .{
+                .label = "GBATEK BIOS Sqrt",
+                .url = "https://problemkaputt.de/gbatek.htm#biosarithmeticfunctions",
+            },
+        },
+        .notes = &.{"Pure arithmetic BIOS helper for the next jsmolka BIOS test slice."},
+    },
 };
 
 pub const instructions: []const instruction_mod.InstructionDecl = &.{
