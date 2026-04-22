@@ -755,47 +755,52 @@ fn resolveBxTarget(
     if (isa == .thumb and reg == 6) {
         const previous = try previousInstruction(image, isa, address);
         if (previous.instruction == .bl) {
-            return .{ .bx_target = normalizeCodeTarget(try resolveStartupBxTargetValue(image, isa, address, reg)) };
+            return .{ .bx_target = normalizeCodeTarget(try resolveStartupThumbBxR6TargetValue(image, isa, address)) };
         }
     }
     return .{ .bx_target = normalizeCodeTarget(try resolvePreviousRegisterValue(image, isa, address, reg)) };
 }
 
-fn resolveStartupBxTargetValue(
+fn resolveStartupThumbBxR6TargetValue(
     image: gba_loader.RomImage,
     isa: armv4t_decode.InstructionSet,
     address: u32,
-    reg: u4,
 ) BuildError!u32 {
     const previous = try previousInstruction(image, isa, address);
 
     return switch (previous.instruction) {
-        .bl => try resolveStartupBxTargetValue(image, isa, previous.address, reg),
-        .store => try resolveStartupBxTargetValue(image, isa, previous.address, reg),
-        .ldr_word_imm => |load| if (load.rd != reg)
-            try resolveStartupBxTargetValue(image, isa, previous.address, reg)
+        .bl => try resolveStartupThumbBxR6TargetValue(image, isa, previous.address),
+        .store => try resolveStartupThumbBxR6TargetValue(image, isa, previous.address),
+        .ldr_word_imm => |load| if (load.rd != 6)
+            try resolveStartupThumbBxR6TargetValue(image, isa, previous.address)
         else
             return error.UnsupportedOpcode,
-        .subs_reg => |sub| if (sub.rd != reg)
-            try resolveStartupBxTargetValue(image, isa, previous.address, reg)
+        .subs_reg => |sub| if (sub.rd != 6)
+            try resolveStartupThumbBxR6TargetValue(image, isa, previous.address)
         else
             return error.UnsupportedOpcode,
         .add_imm => |add| blk: {
-            if (add.rd != reg or add.imm != 0) return error.UnsupportedOpcode;
-            break :blk try resolveStartupBxTargetValue(image, isa, previous.address, add.rn);
+            if (add.rd != 6 or add.imm != 0) return error.UnsupportedOpcode;
+            break :blk switch (add.rn) {
+                2 => try resolveStartupThumbBxR6TargetValue(image, isa, previous.address),
+                else => return error.UnsupportedOpcode,
+            };
         },
         .adds_imm => |add| blk: {
-            if (add.rd != reg or add.imm != 0) return error.UnsupportedOpcode;
-            break :blk try resolveStartupBxTargetValue(image, isa, previous.address, add.rn);
+            if (add.rd != 6 or add.imm != 0) return error.UnsupportedOpcode;
+            break :blk switch (add.rn) {
+                2 => try resolveStartupThumbBxR6TargetValue(image, isa, previous.address),
+                else => return error.UnsupportedOpcode,
+            };
         },
-        .movs_imm => |mov| if (mov.rd == reg)
+        .movs_imm => |mov| if (mov.rd == 2)
             mov.imm
         else
             return error.UnsupportedOpcode,
-        .lsls_imm => |shift| if (shift.rd != reg)
-            try resolveStartupBxTargetValue(image, isa, previous.address, reg)
-        else if (shift.rm == reg)
-            try resolveStartupBxTargetValue(image, isa, previous.address, reg) << @as(u5, @intCast(shift.imm))
+        .lsls_imm => |shift| if (shift.rd == 2 and shift.rm == 2 and shift.imm == 24)
+            try resolveStartupThumbBxR6TargetValue(image, isa, previous.address) << @as(u5, @intCast(shift.imm))
+        else if (shift.rd != 6)
+            try resolveStartupThumbBxR6TargetValue(image, isa, previous.address)
         else
             return error.UnsupportedOpcode,
         else => return error.UnsupportedOpcode,
@@ -1425,12 +1430,17 @@ fn compileRuntimeHelper(
     return helper_object_path;
 }
 
+const FixtureBuildResult = struct {
+    failed: bool,
+    stderr: []u8,
+};
+
 fn buildFixtureCaptureOutput(
     allocator: std.mem.Allocator,
     io: std.Io,
     dir: std.Io.Dir,
     rom_path: []const u8,
-) ![]u8 {
+) !FixtureBuildResult {
     const fixture_bytes = try Io.Dir.cwd().readFileAlloc(
         io,
         rom_path,
@@ -1454,9 +1464,15 @@ fn buildFixtureCaptureOutput(
         .output_path = ".zig-cache/tonc/should-not-exist",
         .optimize = .release,
     }) catch {
-        return output.toOwnedSlice();
+        return .{
+            .failed = true,
+            .stderr = try output.toOwnedSlice(),
+        };
     };
-    return output.toOwnedSlice();
+    return .{
+        .failed = false,
+        .stderr = try output.toOwnedSlice(),
+    };
 }
 
 test "build emits a native executable for the first gba mov-plus-div slice" {
@@ -1500,21 +1516,25 @@ test "build emits a native executable for the first gba mov-plus-div slice" {
     try std.testing.expectEqualStrings("5\n", result.stdout);
 }
 
-test "tonc sbb_reg gets past the startup bx r6 trampoline" {
+test "tonc fixtures get past the startup bx r6 trampoline" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const stderr = try buildFixtureCaptureOutput(
-        std.testing.allocator,
-        io,
-        tmp.dir,
+    const fixtures = [_][]const u8{
         "tests/fixtures/real/tonc/sbb_reg.gba",
-    );
-    defer std.testing.allocator.free(stderr);
+        "tests/fixtures/real/tonc/obj_demo.gba",
+        "tests/fixtures/real/tonc/key_demo.gba",
+        "tests/fixtures/real/tonc/irq_demo.gba",
+    };
+    for (fixtures) |fixture| {
+        const result = try buildFixtureCaptureOutput(std.testing.allocator, io, tmp.dir, fixture);
+        defer std.testing.allocator.free(result.stderr);
 
-    try std.testing.expect(std.mem.indexOf(u8, stderr, "Unsupported SWI 0x000000") == null);
-    try std.testing.expect(std.mem.indexOf(u8, stderr, "Unsupported opcode 0x00004730 at 0x08000124 for armv4t") == null);
+        try std.testing.expect(result.failed);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x00004730 at 0x08000124 for armv4t") == null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported control flow target 0x02000000 for gba") != null);
+    }
 }
 
 test "build reports a structured diagnostic for an unsupported opcode" {
