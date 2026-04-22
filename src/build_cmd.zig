@@ -614,7 +614,7 @@ fn previousThumbInstruction(
     image: gba_loader.RomImage,
     address: u32,
 ) BuildError!DecodedNode {
-    for ([_]u8{ 2, 4 }) |candidate_size| {
+    for ([_]u8{ 4, 2 }) |candidate_size| {
         if (address < image.base_address + candidate_size) continue;
         const candidate_address = address - candidate_size;
         const decoded = decodeImageInstructionUnchecked(image, .thumb, candidate_address) catch continue;
