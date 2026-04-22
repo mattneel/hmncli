@@ -1890,7 +1890,7 @@ test "tonc fixtures advance past the Thumb return epilogue surface" {
     }{
         .{
             .rom_path = "tests/fixtures/real/tonc/sbb_reg.gba",
-            .old_blocker = "Unsupported opcode 0x0000001E at 0x080003FA for armv4t",
+            .old_blocker = "Unsupported opcode 0x00004700 at 0x08000456 for armv4t",
             .next_blocker = "Unsupported SWI 0x000005 at 0x08000820 for gba",
         },
         .{
@@ -1905,7 +1905,7 @@ test "tonc fixtures advance past the Thumb return epilogue surface" {
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/irq_demo.gba",
-            .old_blocker = "Unsupported opcode 0x00000017 at 0x08000374 for armv4t",
+            .old_blocker = "Unsupported opcode 0x00004708 at 0x080006C6 for armv4t",
             .next_blocker = "Unsupported opcode 0x00004718 at 0x08003078 for armv4t",
         },
     };
