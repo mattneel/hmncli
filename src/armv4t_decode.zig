@@ -22,6 +22,13 @@ pub const StoreSize = enum {
     word,
 };
 
+pub const StatusFlags = struct {
+    n: bool,
+    z: bool,
+    c: bool,
+    v: bool,
+};
+
 pub const DecodedInstruction = union(enum) {
     mov_imm: struct {
         rd: u4,
@@ -56,6 +63,7 @@ pub const DecodedInstruction = union(enum) {
         target: u32,
     },
     bx_lr,
+    msr_cpsr_f_imm: StatusFlags,
     swi: struct {
         imm24: u24,
     },
@@ -78,6 +86,7 @@ pub fn decode(word: u32, address: u32) DecodeError!DecodedInstruction {
         c.ARM_INS_B => parseBranch(insn),
         c.ARM_INS_BL => parseBl(word, insn),
         c.ARM_INS_BX => parseBx(insn),
+        c.ARM_INS_MSR => parseMsr(word),
         c.ARM_INS_SVC => parseSwi(insn),
         else => error.UnsupportedOpcode,
     };
@@ -170,6 +179,17 @@ fn parseBx(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
     return .bx_lr;
 }
 
+fn parseMsr(word: u32) DecodeError!DecodedInstruction {
+    const is_immediate = ((word >> 25) & 0x1) == 1;
+    const writes_spsr = ((word >> 22) & 0x1) == 1;
+    const field_mask: u4 = @truncate((word >> 16) & 0xF);
+
+    if (!is_immediate or writes_spsr) return error.UnsupportedOpcode;
+    if (field_mask != 0x8) return error.UnsupportedOpcode;
+
+    return .{ .msr_cpsr_f_imm = unpackStatusFlags(decodeArmImmediate(word)) };
+}
+
 fn operandAt(insn: capstone_api.ArmInstruction, index: usize) capstone_api.ArmOperand {
     return insn.operands[index];
 }
@@ -221,6 +241,21 @@ fn parseU32Immediate(imm: i64) DecodeError!u32 {
     return @intCast(imm);
 }
 
+fn decodeArmImmediate(word: u32) u32 {
+    const imm8 = word & 0xFF;
+    const rotate = ((word >> 8) & 0xF) * 2;
+    return std.math.rotr(u32, imm8, rotate);
+}
+
+fn unpackStatusFlags(value: u32) StatusFlags {
+    return .{
+        .n = (value & 0x8000_0000) != 0,
+        .z = (value & 0x4000_0000) != 0,
+        .c = (value & 0x2000_0000) != 0,
+        .v = (value & 0x1000_0000) != 0,
+    };
+}
+
 test "decode reads mov immediate" {
     const decoded = try decode(0xE3A0000A, 0x08000000);
     try std.testing.expectEqualDeep(
@@ -261,6 +296,19 @@ test "decode reads direct bl target" {
 test "decode reads bx lr" {
     const decoded = try decode(0xE12FFF1E, 0x08000014);
     try std.testing.expectEqualDeep(DecodedInstruction.bx_lr, decoded);
+}
+
+test "decode reads msr cpsr_f immediate" {
+    const decoded = try decode(0xE328F101, 0x080000F8);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .msr_cpsr_f_imm = .{
+            .n = false,
+            .z = true,
+            .c = false,
+            .v = false,
+        } },
+        decoded,
+    );
 }
 
 test "decode reads halfword store with immediate offset" {

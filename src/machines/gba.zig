@@ -271,6 +271,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .doc_refs = &.{},
         .notes = &.{"Phase 1 return surface for direct bx lr leaves."},
     },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "msr_cpsr_f_imm",
+        },
+        .isa = .armv4t,
+        .mnemonic = "msr",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Phase 1 flag-surface for direct CPSR_f immediate writes."},
+    },
 };
 
 test "gba machine validates against the shared schema" {

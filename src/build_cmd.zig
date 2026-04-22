@@ -192,6 +192,7 @@ fn ensureDeclared(
         },
         .bl => _ = try catalog.lookupInstruction("armv4t", "bl"),
         .bx_lr => _ = try catalog.lookupInstruction("armv4t", "bx_lr"),
+        .msr_cpsr_f_imm => _ = try catalog.lookupInstruction("armv4t", "msr_cpsr_f_imm"),
         .swi => |swi| {
             if (swi.imm24 != 0x000006) {
                 try renderUnsupportedShim(writer, address, swi.imm24);
@@ -557,6 +558,6 @@ test "build uses the real jsmolka arm rom and reports the next unsupported surfa
     );
     try std.testing.expectStringStartsWith(
         output.writer.buffered(),
-        "Unsupported opcode 0xE328F101 at 0x080000F8 for armv4t\n",
+        "Unsupported opcode 0x0A000002 at 0x080000FC for armv4t\n",
     );
 }
