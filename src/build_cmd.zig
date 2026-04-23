@@ -3759,8 +3759,11 @@ test "minimal vblank model rejects byte writes to interrupt MMIO" {
         address: u32,
     }{
         .{ .rom_path = "ie-byte.gba", .native_path = "ie-byte-native", .address = 0x0400_0200 },
+        .{ .rom_path = "ie-byte-hi.gba", .native_path = "ie-byte-hi-native", .address = 0x0400_0201 },
         .{ .rom_path = "if-byte.gba", .native_path = "if-byte-native", .address = 0x0400_0202 },
+        .{ .rom_path = "if-byte-hi.gba", .native_path = "if-byte-hi-native", .address = 0x0400_0203 },
         .{ .rom_path = "ime-byte.gba", .native_path = "ime-byte-native", .address = 0x0400_0208 },
+        .{ .rom_path = "ime-byte-hi.gba", .native_path = "ime-byte-hi-native", .address = 0x0400_0209 },
     };
 
     for (cases) |case| {

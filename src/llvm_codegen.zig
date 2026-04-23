@@ -1539,12 +1539,26 @@ fn emitRegionDispatch(
                     index,
                     io_ie_offset,
                 });
+                try writer.print("  %io_byte_special_ie_hi_{d}_{d} = icmp eq i32 %{s}_offset_{d}, {d}\n", .{
+                    bits,
+                    index,
+                    store_name,
+                    index,
+                    io_ie_offset + 1,
+                });
                 try writer.print("  %io_byte_special_if_{d}_{d} = icmp eq i32 %{s}_offset_{d}, {d}\n", .{
                     bits,
                     index,
                     store_name,
                     index,
                     io_if_offset,
+                });
+                try writer.print("  %io_byte_special_if_hi_{d}_{d} = icmp eq i32 %{s}_offset_{d}, {d}\n", .{
+                    bits,
+                    index,
+                    store_name,
+                    index,
+                    io_if_offset + 1,
                 });
                 try writer.print("  %io_byte_special_ime_{d}_{d} = icmp eq i32 %{s}_offset_{d}, {d}\n", .{
                     bits,
@@ -1553,7 +1567,14 @@ fn emitRegionDispatch(
                     index,
                     io_ime_offset,
                 });
-                try writer.print("  %io_byte_special_any0_{d}_{d} = or i1 %io_byte_special_ie_{d}_{d}, %io_byte_special_if_{d}_{d}\n", .{
+                try writer.print("  %io_byte_special_ime_hi_{d}_{d} = icmp eq i32 %{s}_offset_{d}, {d}\n", .{
+                    bits,
+                    index,
+                    store_name,
+                    index,
+                    io_ime_offset + 1,
+                });
+                try writer.print("  %io_byte_special_ie_any_{d}_{d} = or i1 %io_byte_special_ie_{d}_{d}, %io_byte_special_ie_hi_{d}_{d}\n", .{
                     bits,
                     index,
                     bits,
@@ -1561,7 +1582,31 @@ fn emitRegionDispatch(
                     bits,
                     index,
                 });
-                try writer.print("  %io_byte_special_any_{d}_{d} = or i1 %io_byte_special_any0_{d}_{d}, %io_byte_special_ime_{d}_{d}\n", .{
+                try writer.print("  %io_byte_special_if_any_{d}_{d} = or i1 %io_byte_special_if_{d}_{d}, %io_byte_special_if_hi_{d}_{d}\n", .{
+                    bits,
+                    index,
+                    bits,
+                    index,
+                    bits,
+                    index,
+                });
+                try writer.print("  %io_byte_special_ime_any_{d}_{d} = or i1 %io_byte_special_ime_{d}_{d}, %io_byte_special_ime_hi_{d}_{d}\n", .{
+                    bits,
+                    index,
+                    bits,
+                    index,
+                    bits,
+                    index,
+                });
+                try writer.print("  %io_byte_special_any0_{d}_{d} = or i1 %io_byte_special_ie_any_{d}_{d}, %io_byte_special_if_any_{d}_{d}\n", .{
+                    bits,
+                    index,
+                    bits,
+                    index,
+                    bits,
+                    index,
+                });
+                try writer.print("  %io_byte_special_any_{d}_{d} = or i1 %io_byte_special_any0_{d}_{d}, %io_byte_special_ime_any_{d}_{d}\n", .{
                     bits,
                     index,
                     bits,
