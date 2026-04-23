@@ -569,7 +569,7 @@ pub const DecodedInstruction = union(enum) {
         target: u32,
     },
     bl: struct {
-        target: u32,
+        target: CodeAddress,
     },
     bx_reg: struct {
         reg: u4,
@@ -602,12 +602,12 @@ pub const DecodedInstruction = union(enum) {
 pub fn decode(word: u32, address: u32) DecodeError!DecodedInstruction {
     if (isEmptyBlockTransfer(word)) return parseEmptyBlockTransfer(word);
     const insn = try capstone_api.disassembleOneArm32(word, address);
-    return decodeInstruction(word, insn);
+    return decodeInstruction(word, insn, .arm);
 }
 
 pub fn decodeThumb(halfword: u16, address: u32) DecodeError!DecodedInstruction {
     const insn = try capstone_api.disassembleOneThumb16(halfword, address);
-    return decodeInstruction(halfword, insn);
+    return decodeInstruction(halfword, insn, .thumb);
 }
 
 pub fn decodeAt(bytes: []const u8, isa: InstructionSet, address: u32) DecodeError!DecodedOpcode {
@@ -637,7 +637,7 @@ fn decodeThumbAt(bytes: []const u8, address: u32) DecodeError!DecodedOpcode {
         return .{
             .raw_opcode = word,
             .size_bytes = @intCast(insn.size),
-            .instruction = try decodeInstruction(word, insn),
+            .instruction = try decodeInstruction(word, insn, .thumb),
         };
     }
 
@@ -645,7 +645,7 @@ fn decodeThumbAt(bytes: []const u8, address: u32) DecodeError!DecodedOpcode {
     return .{
         .raw_opcode = halfword,
         .size_bytes = @intCast(insn.size),
-        .instruction = try decodeInstruction(halfword, insn),
+        .instruction = try decodeInstruction(halfword, insn, .thumb),
     };
 }
 
@@ -653,7 +653,7 @@ fn isThumbLongInstructionPrefix(halfword: u16) bool {
     return (halfword & 0xF800) == 0xF000;
 }
 
-fn decodeInstruction(raw_word: u32, insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+fn decodeInstruction(raw_word: u32, insn: capstone_api.ArmInstruction, isa: InstructionSet) DecodeError!DecodedInstruction {
     if (raw_word == 0xE320F000) return .nop;
     return switch (insn.id) {
         c.ARM_INS_MOV => parseMov(raw_word, insn),
@@ -705,7 +705,7 @@ fn decodeInstruction(raw_word: u32, insn: capstone_api.ArmInstruction) DecodeErr
         c.ARM_INS_CMN => parseCmn(insn),
         c.ARM_INS_TEQ => parseTeq(raw_word, insn),
         c.ARM_INS_B => parseBranch(insn),
-        c.ARM_INS_BL => parseBl(raw_word, insn),
+        c.ARM_INS_BL => parseBl(isa, insn),
         c.ARM_INS_BX => parseBx(insn),
         c.ARM_INS_MRS => parseMrs(raw_word),
         c.ARM_INS_MSR => parseMsr(raw_word),
@@ -1874,10 +1874,13 @@ fn parseTeq(word: u32, insn: capstone_api.ArmInstruction) DecodeError!DecodedIns
     } };
 }
 
-fn parseBl(_: u32, insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
+fn parseBl(isa: InstructionSet, insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
     if (insn.operand_count != 1) return error.UnsupportedOpcode;
     return .{ .bl = .{
-        .target = try operandImmediateU32(insn, 0),
+        .target = .{
+            .address = try operandImmediateU32(insn, 0),
+            .isa = isa,
+        },
     } };
 }
 
@@ -2192,7 +2195,7 @@ test "decode reads word store with register offset" {
 test "decode reads direct bl target" {
     const decoded = try decode(0xEB000001, 0x08000004);
     try std.testing.expectEqualDeep(
-        DecodedInstruction{ .bl = .{ .target = 0x08000010 } },
+        DecodedInstruction{ .bl = .{ .target = .{ .address = 0x08000010, .isa = .arm } } },
         decoded,
     );
 }
@@ -3291,7 +3294,7 @@ test "decode reads thumb bl with 32-bit width" {
     try std.testing.expectEqual(@as(u32, 0xFC11F000), decoded.raw_opcode);
     try std.testing.expectEqual(@as(u8, 4), decoded.size_bytes);
     try std.testing.expectEqualDeep(
-        DecodedInstruction{ .bl = .{ .target = 0x08000930 } },
+        DecodedInstruction{ .bl = .{ .target = .{ .address = 0x08000930, .isa = .thumb } } },
         decoded.instruction,
     );
 }

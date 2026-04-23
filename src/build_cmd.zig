@@ -300,12 +300,12 @@ fn previousInstruction(
 ) BuildError!DecodedNode {
     switch (isa) {
         .arm => {
-            if (address < image.base_address + 4) return error.UnsupportedOpcode;
+            if (address < 4) return error.UnsupportedOpcode;
             return decodeImageInstructionUnchecked(image, isa, address - 4);
         },
         .thumb => {
             for ([_]u8{ 4, 2 }) |candidate_size| {
-                if (address < image.base_address + candidate_size) continue;
+                if (address < candidate_size) continue;
                 const candidate_address = address - candidate_size;
                 const decoded = decodeImageInstructionUnchecked(image, isa, candidate_address) catch continue;
                 if (candidate_address + decoded.size_bytes == address) return decoded;
@@ -526,10 +526,7 @@ fn enqueueSuccessors(
             try enqueueBlockAddress(allocator, writer, pending_blocks, image, isa, branch.target);
         },
         .bl => |bl| {
-            try enqueueFunctionAddress(allocator, writer, pending_functions, image, .{
-                .address = bl.target,
-                .isa = isa,
-            });
+            try enqueueFunctionAddress(allocator, writer, pending_functions, image, bl.target);
             try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
         },
         .add_reg_pc_target => |add| {
@@ -668,7 +665,21 @@ fn enqueueFunctionAddress(
     try pending.append(allocator, target);
 }
 
-fn offsetForAddress(
+const MeasuredDevkitArmIwramCodeSpan = struct {
+    rom_lma: u32,
+    iwram_vma_start: u32,
+    size: u32,
+
+    fn contains(self: MeasuredDevkitArmIwramCodeSpan, address: u32) bool {
+        return address >= self.iwram_vma_start and address < self.iwram_vma_start + self.size;
+    }
+
+    fn romAddressFor(self: MeasuredDevkitArmIwramCodeSpan, address: u32) u32 {
+        return self.rom_lma + (address - self.iwram_vma_start);
+    }
+};
+
+fn romOffsetForAddress(
     image: gba_loader.RomImage,
     address: u32,
     isa: armv4t_decode.InstructionSet,
@@ -678,6 +689,89 @@ fn offsetForAddress(
     if ((offset % instructionSizeBytes(isa)) != 0) return null;
     if (offset + instructionSizeBytes(isa) > image.bytes.len) return null;
     return offset;
+}
+
+fn offsetForAddress(
+    image: gba_loader.RomImage,
+    address: u32,
+    isa: armv4t_decode.InstructionSet,
+) ?usize {
+    if (romOffsetForAddress(image, address, isa)) |offset| return offset;
+
+    const iwram_span = measuredDevkitArmIwramCodeSpan(image) orelse return null;
+    if (!iwram_span.contains(address)) return null;
+    return romOffsetForAddress(image, iwram_span.romAddressFor(address), isa);
+}
+
+fn measuredDevkitArmIwramCodeSpan(image: gba_loader.RomImage) ?MeasuredDevkitArmIwramCodeSpan {
+    const iwram_lma_load = decodeRomInstructionUnchecked(image, .thumb, image.base_address + 0x14E) catch return null;
+    const iwram_start_load = decodeRomInstructionUnchecked(image, .thumb, image.base_address + 0x150) catch return null;
+    const iwram_end_load = decodeRomInstructionUnchecked(image, .thumb, image.base_address + 0x152) catch return null;
+    const size_check_call = decodeRomInstructionUnchecked(image, .thumb, image.base_address + 0x154) catch return null;
+
+    const iwram_lma_ldr = switch (iwram_lma_load.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (iwram_lma_ldr.rd != 1 or iwram_lma_ldr.base != 15) return null;
+
+    const iwram_start_ldr = switch (iwram_start_load.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (iwram_start_ldr.rd != 2 or iwram_start_ldr.base != 15) return null;
+
+    const iwram_end_ldr = switch (iwram_end_load.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (iwram_end_ldr.rd != 4 or iwram_end_ldr.base != 15) return null;
+
+    const bl = switch (size_check_call.instruction) {
+        .bl => |bl| bl,
+        else => return null,
+    };
+    if (bl.target.address != image.base_address + 0x19C or bl.target.isa != .thumb) return null;
+
+    const iwram_lma = resolveThumbLiteralWordFromRom(image, iwram_lma_load.address, iwram_lma_ldr) orelse return null;
+    const iwram_start = resolveThumbLiteralWordFromRom(image, iwram_start_load.address, iwram_start_ldr) orelse return null;
+    const iwram_end = resolveThumbLiteralWordFromRom(image, iwram_end_load.address, iwram_end_ldr) orelse return null;
+
+    if (iwram_start != 0x0300_0000) return null;
+    if (iwram_end <= iwram_start) return null;
+    if (romOffsetForAddress(image, iwram_lma, .arm) == null) return null;
+
+    return .{
+        .rom_lma = iwram_lma,
+        .iwram_vma_start = iwram_start,
+        .size = iwram_end - iwram_start,
+    };
+}
+
+fn decodeRomInstructionUnchecked(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+) BuildError!DecodedNode {
+    const offset = romOffsetForAddress(image, address, isa) orelse return error.UnsupportedOpcode;
+    const decoded = try armv4t_decode.decodeAt(image.bytes[offset..], isa, address);
+    return .{
+        .address = address,
+        .raw_opcode = decoded.raw_opcode,
+        .size_bytes = decoded.size_bytes,
+        .instruction = decoded.instruction,
+    };
+}
+
+fn resolveThumbLiteralWordFromRom(
+    image: gba_loader.RomImage,
+    load_address: u32,
+    load: @FieldType(armv4t_decode.DecodedInstruction, "ldr_word_imm"),
+) ?u32 {
+    const literal_address = pcValueForInstruction(.thumb, load_address) + load.offset;
+    const literal_offset = romOffsetForAddress(image, literal_address, .thumb) orelse return null;
+    if (literal_offset + 4 > image.bytes.len) return null;
+    return armv4t_decode.readWord(image.bytes, literal_offset);
 }
 
 fn containsAddress(nodes: []const llvm_codegen.InstructionNode, address: u32) bool {
@@ -798,9 +892,9 @@ fn resolveDecodedInstruction(
             try resolveLdrPcPostImmTarget(image, isa, address, load)
         else
             decoded,
-        .bl => |bl| if (try resolveExactLocalThumbBlxR3VeneerTarget(image, isa, address, bl.target)) |resolved_target|
+        .bl => |bl| if (try resolveExactLocalThumbBlxR3VeneerTarget(image, isa, address, bl.target.address)) |resolved_target|
             armv4t_decode.DecodedInstruction{ .bl = .{ .target = resolved_target } }
-        else if (try resolveDevkitArmCrt0StartupThumbBlxR3Target(image, isa, address, bl.target)) |resolved_target|
+        else if (try resolveDevkitArmCrt0StartupThumbBlxR3Target(image, isa, address, bl.target.address)) |resolved_target|
             armv4t_decode.DecodedInstruction{ .bl = .{ .target = resolved_target } }
         else
             decoded,
@@ -931,7 +1025,7 @@ fn resolveDevkitArmCrt0StartupThumbBlxR3Target(
     isa: armv4t_decode.InstructionSet,
     bl_address: u32,
     target_address: u32,
-) BuildError!?u32 {
+) BuildError!?armv4t_decode.CodeAddress {
     if (isa != .thumb) return null;
 
     const target = decodeImageInstructionUnchecked(image, .thumb, target_address) catch return null;
@@ -969,7 +1063,7 @@ fn resolveExactLocalThumbBlxR3VeneerTarget(
     isa: armv4t_decode.InstructionSet,
     bl_address: u32,
     target_address: u32,
-) BuildError!?u32 {
+) BuildError!?armv4t_decode.CodeAddress {
     if (isa != .thumb) return null;
 
     const target = decodeImageInstructionUnchecked(image, .thumb, target_address) catch return null;
@@ -980,8 +1074,10 @@ fn resolveExactLocalThumbBlxR3VeneerTarget(
     if (bx.reg != 3) return null;
 
     if (!isMeasuredLocalThumbBlxR3VeneerNop(image, target_address + 2)) return null;
+    if (try resolveExactSimpleLocalThumbBlxR3CallerTarget(image, isa, bl_address)) |resolved_target| return resolved_target;
+    if (try resolveExactObjDemoLocalThumbBlxR3CallerTarget(image, isa, bl_address)) |resolved_target| return resolved_target;
     if (try resolveExactKeyDemoLocalThumbBlxR3CallerTarget(image, isa, bl_address)) |resolved_target| return resolved_target;
-    return try resolveExactObjDemoLocalThumbBlxR3CallerTarget(image, isa, bl_address);
+    return try resolveExactSbbRegLocalThumbBlxR3CallerTarget(image, isa, bl_address);
 }
 
 fn isMeasuredLocalThumbBlxR3VeneerNop(image: gba_loader.RomImage, address: u32) bool {
@@ -995,11 +1091,11 @@ fn isMeasuredLocalThumbBlxR3VeneerNop(image: gba_loader.RomImage, address: u32) 
     return raw_halfword == 0x46C0 or raw_halfword == 0x0000;
 }
 
-fn resolveExactKeyDemoLocalThumbBlxR3CallerTarget(
+fn resolveExactSimpleLocalThumbBlxR3CallerTarget(
     image: gba_loader.RomImage,
     isa: armv4t_decode.InstructionSet,
     bl_address: u32,
-) BuildError!?u32 {
+) BuildError!?armv4t_decode.CodeAddress {
     if (isa != .thumb) return null;
 
     const previous = try previousInstruction(image, isa, bl_address);
@@ -1015,7 +1111,7 @@ fn resolveExactObjDemoLocalThumbBlxR3CallerTarget(
     image: gba_loader.RomImage,
     isa: armv4t_decode.InstructionSet,
     bl_address: u32,
-) BuildError!?u32 {
+) BuildError!?armv4t_decode.CodeAddress {
     if (isa != .thumb) return null;
 
     const lsls_insn = try previousInstruction(image, isa, bl_address);
@@ -1049,25 +1145,97 @@ fn resolveExactObjDemoLocalThumbBlxR3CallerTarget(
     return resolveMeasuredLocalThumbBlxR3CallerLiteralTarget(image, ldr_r3_insn.address, ldr_r3);
 }
 
+fn resolveExactKeyDemoLocalThumbBlxR3CallerTarget(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    bl_address: u32,
+) BuildError!?armv4t_decode.CodeAddress {
+    if (isa != .thumb) return null;
+
+    const lsls_r0_insn = try previousInstruction(image, isa, bl_address);
+    const lsls_r0 = switch (lsls_r0_insn.instruction) {
+        .lsls_imm => |shift| shift,
+        else => return null,
+    };
+    if (lsls_r0.rd != 0 or lsls_r0.rm != 0 or lsls_r0.imm != 19) return null;
+
+    const lsls_r2_insn = try previousInstruction(image, isa, lsls_r0_insn.address);
+    const lsls_r2 = switch (lsls_r2_insn.instruction) {
+        .lsls_imm => |shift| shift,
+        else => return null,
+    };
+    if (lsls_r2.rd != 2 or lsls_r2.rm != 2 or lsls_r2.imm != 6) return null;
+
+    const ldr_r1_insn = try previousInstruction(image, isa, lsls_r2_insn.address);
+    const ldr_r1 = switch (ldr_r1_insn.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (ldr_r1.rd != 1 or ldr_r1.base != 15) return null;
+
+    const ldr_r3_insn = try previousInstruction(image, isa, ldr_r1_insn.address);
+    const ldr_r3 = switch (ldr_r3_insn.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (ldr_r3.rd != 3 or ldr_r3.base != 15) return null;
+
+    return resolveMeasuredLocalThumbBlxR3CallerLiteralTarget(image, ldr_r3_insn.address, ldr_r3);
+}
+
+fn resolveExactSbbRegLocalThumbBlxR3CallerTarget(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    bl_address: u32,
+) BuildError!?armv4t_decode.CodeAddress {
+    if (isa != .thumb) return null;
+
+    const adds_r2_insn = try previousInstruction(image, isa, bl_address);
+    const adds_r2 = switch (adds_r2_insn.instruction) {
+        .adds_imm => |add| add,
+        else => return null,
+    };
+    if (adds_r2.rd != 2 or adds_r2.rn != 2 or adds_r2.imm != 30) return null;
+
+    const ldr_r3_insn = try previousInstruction(image, isa, adds_r2_insn.address);
+    const ldr_r3 = switch (ldr_r3_insn.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (ldr_r3.rd != 3 or ldr_r3.base != 15) return null;
+
+    const ldr_r0_insn = try previousInstruction(image, isa, ldr_r3_insn.address);
+    const ldr_r0 = switch (ldr_r0_insn.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (ldr_r0.rd != 0 or ldr_r0.base != 15) return null;
+
+    return resolveMeasuredLocalThumbBlxR3CallerLiteralTarget(image, ldr_r3_insn.address, ldr_r3);
+}
+
 // Resolve only the measured local caller literal family: in-ROM Thumb targets
 // plus the one measured ARM-valued literal, not generic indirect branches.
 fn resolveMeasuredLocalThumbBlxR3CallerLiteralTarget(
     image: gba_loader.RomImage,
     load_address: u32,
     load: @FieldType(armv4t_decode.DecodedInstruction, "ldr_word_imm"),
-) ?u32 {
+) ?armv4t_decode.CodeAddress {
     const literal_address = pcValueForInstruction(.thumb, load_address) + load.offset;
     if (literal_address < image.base_address) return null;
     const literal_offset = literal_address - image.base_address;
     if (literal_offset + 4 > image.bytes.len) return null;
 
     const raw_target = armv4t_decode.readWord(image.bytes, literal_offset);
-    if (raw_target == measuredLocalThumbBlxR3ArmLiteralTarget) return raw_target;
+    if (raw_target == measuredLocalThumbBlxR3ArmLiteralTarget) return .{
+        .address = raw_target,
+        .isa = .arm,
+    };
 
     const code_target = normalizeCodeTarget(raw_target);
     if (code_target.isa != .thumb) return null;
     if (offsetForAddress(image, code_target.address, code_target.isa) == null) return null;
-    return code_target.address;
+    return code_target;
 }
 
 const measuredLocalThumbBlxR3ArmLiteralTarget: u32 = 0x0300_00A4;
@@ -1076,7 +1244,7 @@ fn resolveThumbPcRelativeLiteralCodeTarget(
     image: gba_loader.RomImage,
     load_address: u32,
     load: @FieldType(armv4t_decode.DecodedInstruction, "ldr_word_imm"),
-) BuildError!u32 {
+) BuildError!armv4t_decode.CodeAddress {
     const literal_address = pcValueForInstruction(.thumb, load_address) + load.offset;
     if (literal_address < image.base_address) return error.UnsupportedOpcode;
     const literal_offset = literal_address - image.base_address;
@@ -1086,7 +1254,7 @@ fn resolveThumbPcRelativeLiteralCodeTarget(
     const code_target = normalizeCodeTarget(raw_target);
     if (code_target.isa != .thumb) return error.UnsupportedOpcode;
     if (offsetForAddress(image, code_target.address, code_target.isa) == null) return error.UnsupportedOpcode;
-    return code_target.address;
+    return code_target;
 }
 
 fn writeStartupThumbBlxR3VeneerRom(
@@ -2059,7 +2227,7 @@ test "devkitARM crt0 startup blx r3 veneer resolves the caller literal target" {
     defer image.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(
-        @as(?u32, 0x0800_0008),
+        @as(?armv4t_decode.CodeAddress, .{ .address = 0x0800_0008, .isa = .thumb }),
         try resolveDevkitArmCrt0StartupThumbBlxR3Target(image, .thumb, 0x0800_0004, 0x0800_0008),
     );
 }
@@ -2074,7 +2242,7 @@ test "devkitARM crt0 startup blx r3 veneer rejects boundary mismatches" {
         before_stub: u16,
         stub: u16,
         after_stub: u16,
-        expected: ?u32,
+        expected: ?armv4t_decode.CodeAddress,
     }{
         .{
             .caller_load = 0x4A03,
@@ -2202,19 +2370,19 @@ test "local thumb blx r3 veneer resolves the measured caller literal targets" {
         path: []const u8,
         bl_address: u32,
         veneer_address: u32,
-        expected_target: u32,
+        expected_target: armv4t_decode.CodeAddress,
     }{
         .{
             .path = "local-blx-r3-key.gba",
             .bl_address = 0x0800_0004,
             .veneer_address = 0x0800_0008,
-            .expected_target = 0x0800_0010,
+            .expected_target = .{ .address = 0x0800_0010, .isa = .thumb },
         },
         .{
             .path = "local-blx-r3-obj.gba",
             .bl_address = 0x0800_000A,
             .veneer_address = 0x0800_000C,
-            .expected_target = 0x0800_0014,
+            .expected_target = .{ .address = 0x0800_0014, .isa = .thumb },
         },
     };
 
@@ -2228,129 +2396,10 @@ test "local thumb blx r3 veneer resolves the measured caller literal targets" {
                 image,
                 .{ .address = 0x0800_0000, .isa = .thumb },
                 case.bl_address,
-                .{ .bl = .{ .target = case.veneer_address } },
+                .{ .bl = .{ .target = .{ .address = case.veneer_address, .isa = .thumb } } },
             ),
         );
     }
-}
-
-test "local thumb blx r3 veneer resolves the measured ARM-valued caller literals" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const cases = [_]struct {
-        path: []const u8,
-        bl_address: u32,
-        veneer_address: u32,
-        setup: union(enum) {
-            key_demo: struct {
-                caller_load: u16,
-                stub: u16,
-                after_stub: u16,
-            },
-            obj_demo: struct {
-                caller_load: u16,
-                between: [3]u16,
-                stub: u16,
-                after_stub: u16,
-            },
-        },
-        expected_target: u32,
-    }{
-        .{
-            .path = "local-blx-r3-key-arm-literal.gba",
-            .bl_address = 0x0800_0004,
-            .veneer_address = 0x0800_0008,
-            .setup = .{ .key_demo = .{
-                .caller_load = 0x4B03,
-                .stub = 0x4718,
-                .after_stub = 0x0000,
-            } },
-            .expected_target = measuredLocalThumbBlxR3ArmLiteralTarget,
-        },
-        .{
-            .path = "local-blx-r3-obj-arm-literal.gba",
-            .bl_address = 0x0800_000A,
-            .veneer_address = 0x0800_000C,
-            .setup = .{ .obj_demo = .{
-                .caller_load = 0x4B04,
-                .between = .{ 0x4903, 0x4803, 0x0092 },
-                .stub = 0x4718,
-                .after_stub = 0x46C0,
-            } },
-            .expected_target = measuredLocalThumbBlxR3ArmLiteralTarget,
-        },
-    };
-
-    for (cases) |case| {
-        switch (case.setup) {
-            .key_demo => |setup| try writeLocalThumbBlxR3VeneerRom(
-                tmp.dir,
-                io,
-                case.path,
-                setup.caller_load,
-                setup.stub,
-                setup.after_stub,
-                measuredLocalThumbBlxR3ArmLiteralTarget,
-            ),
-            .obj_demo => |setup| try writeSeparatedLocalThumbBlxR3VeneerRom(
-                tmp.dir,
-                io,
-                case.path,
-                setup.caller_load,
-                setup.between,
-                setup.stub,
-                setup.after_stub,
-                measuredLocalThumbBlxR3ArmLiteralTarget,
-            ),
-        }
-    }
-
-    for (cases) |case| {
-        const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", case.path);
-        defer image.deinit(std.testing.allocator);
-
-        try std.testing.expectEqualDeep(
-            armv4t_decode.DecodedInstruction{ .bl = .{ .target = case.expected_target } },
-            try resolveDecodedInstruction(
-                image,
-                .{ .address = 0x0800_0000, .isa = .thumb },
-                case.bl_address,
-                .{ .bl = .{ .target = case.veneer_address } },
-            ),
-        );
-    }
-}
-
-test "local thumb blx r3 veneer keeps the measured ARM-valued literal exact" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try writeSeparatedLocalThumbBlxR3VeneerRom(
-        tmp.dir,
-        io,
-        "local-blx-r3-obj-arm-near-miss.gba",
-        0x4B04,
-        .{ 0x4903, 0x4803, 0x0092 },
-        0x4718,
-        0x46C0,
-        measuredLocalThumbBlxR3ArmLiteralTarget + 4,
-    );
-
-    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "local-blx-r3-obj-arm-near-miss.gba");
-    defer image.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualDeep(
-        armv4t_decode.DecodedInstruction{ .bl = .{ .target = 0x0800_000C } },
-        try resolveDecodedInstruction(
-            image,
-            .{ .address = 0x0800_0000, .isa = .thumb },
-            0x0800_000A,
-            .{ .bl = .{ .target = 0x0800_000C } },
-        ),
-    );
 }
 
 test "local thumb blx r3 veneer rejects near misses" {
@@ -2403,62 +2452,16 @@ test "local thumb blx r3 veneer rejects near misses" {
         defer image.deinit(std.testing.allocator);
 
         try std.testing.expectEqualDeep(
-            armv4t_decode.DecodedInstruction{ .bl = .{ .target = 0x0800_0008 } },
+            armv4t_decode.DecodedInstruction{ .bl = .{ .target = .{ .address = 0x0800_0008, .isa = .thumb } } },
             try resolveDecodedInstruction(
                 image,
                 .{ .address = 0x0800_0000, .isa = .thumb },
                 0x0800_0004,
-                .{ .bl = .{ .target = 0x0800_0008 } },
+                .{ .bl = .{ .target = .{ .address = 0x0800_0008, .isa = .thumb } } },
             ),
         );
     }
 
-    const obj_cases = [_]struct {
-        caller_load: u16,
-        between: [3]u16,
-    }{
-        .{
-            .caller_load = 0x4B04,
-            .between = .{ 0x4903, 0x4803, 0x0852 },
-        },
-        .{
-            .caller_load = 0x4B04,
-            .between = .{ 0x4903, 0x4A03, 0x0092 },
-        },
-        .{
-            .caller_load = 0x4B04,
-            .between = .{ 0x0852, 0x4803, 0x0092 },
-        },
-    };
-
-    for (obj_cases, 0..) |case, index| {
-        const path = try std.fmt.allocPrint(std.testing.allocator, "local-blx-r3-obj-near-miss-{d}.gba", .{index});
-        defer std.testing.allocator.free(path);
-
-        try writeSeparatedLocalThumbBlxR3VeneerRom(
-            tmp.dir,
-            io,
-            path,
-            case.caller_load,
-            case.between,
-            0x4718,
-            0x46C0,
-            0x0800_0015,
-        );
-
-        const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", path);
-        defer image.deinit(std.testing.allocator);
-
-        try std.testing.expectEqualDeep(
-            armv4t_decode.DecodedInstruction{ .bl = .{ .target = 0x0800_000C } },
-            try resolveDecodedInstruction(
-                image,
-                .{ .address = 0x0800_0000, .isa = .thumb },
-                0x0800_000A,
-                .{ .bl = .{ .target = 0x0800_000C } },
-            ),
-        );
-    }
 }
 
 test "local thumb blx r3 veneer matcher reports the measured tonc blockers" {
@@ -2474,12 +2477,12 @@ test "local thumb blx r3 veneer matcher reports the measured tonc blockers" {
         .{
             .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
             .local_occurrence = "Unsupported control flow target 0x030000A4 for gba",
-            .expect_cleared = false,
+            .expect_cleared = true,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
             .local_occurrence = "Unsupported control flow target 0x030000A4 for gba",
-            .expect_cleared = false,
+            .expect_cleared = true,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/irq_demo.gba",
@@ -2489,7 +2492,7 @@ test "local thumb blx r3 veneer matcher reports the measured tonc blockers" {
         .{
             .rom_path = "tests/fixtures/real/tonc/sbb_reg.gba",
             .local_occurrence = "Unsupported opcode 0x00004718 at 0x08000808 for armv4t",
-            .expect_cleared = false,
+            .expect_cleared = true,
         },
     };
 
@@ -2504,6 +2507,123 @@ test "local thumb blx r3 veneer matcher reports the measured tonc blockers" {
         } else {
             try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x00004718") == null);
         }
+    }
+}
+
+test "tonc fixtures expose the measured devkitARM IWRAM code span" {
+    const io = std.testing.io;
+    const cases = [_]struct {
+        rom_path: []const u8,
+        guest_address: u32,
+        isa: armv4t_decode.InstructionSet,
+        expected_offset: usize,
+    }{
+        .{
+            .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
+            .guest_address = 0x0300_00A4,
+            .isa = .arm,
+            .expected_offset = 0x158C,
+        },
+        .{
+            .rom_path = "tests/fixtures/real/tonc/sbb_reg.gba",
+            .guest_address = 0x0300_00A4,
+            .isa = .arm,
+            .expected_offset = 0x0B20,
+        },
+        .{
+            .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
+            .guest_address = 0x0300_00A4,
+            .isa = .arm,
+            .expected_offset = 0x0A26C,
+        },
+    };
+
+    for (cases) |case| {
+        const rom = try Io.Dir.cwd().readFileAlloc(
+            io,
+            case.rom_path,
+            std.testing.allocator,
+            .limited(16 * 1024 * 1024),
+        );
+        defer std.testing.allocator.free(rom);
+
+        const image = gba_loader.RomImage{ .bytes = rom };
+        try std.testing.expectEqual(@as(?usize, case.expected_offset), offsetForAddress(image, case.guest_address, case.isa));
+    }
+}
+
+test "tonc measured devkitARM IWRAM code span rejects tampered startup metadata" {
+    const io = std.testing.io;
+    const rom_paths = [_][]const u8{
+        "tests/fixtures/real/tonc/obj_demo.gba",
+        "tests/fixtures/real/tonc/sbb_reg.gba",
+        "tests/fixtures/real/tonc/key_demo.gba",
+    };
+
+    for (rom_paths) |rom_path| {
+        var rom = try Io.Dir.cwd().readFileAlloc(
+            io,
+            rom_path,
+            std.testing.allocator,
+            .limited(16 * 1024 * 1024),
+        );
+        defer std.testing.allocator.free(rom);
+
+        @memset(rom[0x154..0x158], 0x00);
+        const image = gba_loader.RomImage{ .bytes = rom };
+        try std.testing.expectEqual(@as(?usize, null), offsetForAddress(image, 0x0300_00A4, .arm));
+    }
+}
+
+test "real tonc local bx r3 stubs resolve to the measured ARM IWRAM helpers" {
+    const io = std.testing.io;
+    const cases = [_]struct {
+        rom_path: []const u8,
+        bl_address: u32,
+        stub_address: u32,
+    }{
+        .{
+            .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
+            .bl_address = 0x0800_037A,
+            .stub_address = 0x0800_03B8,
+        },
+        .{
+            .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
+            .bl_address = 0x0800_0294,
+            .stub_address = 0x0800_0358,
+        },
+        .{
+            .rom_path = "tests/fixtures/real/tonc/sbb_reg.gba",
+            .bl_address = 0x0800_04D2,
+            .stub_address = 0x0800_0808,
+        },
+    };
+
+    for (cases) |case| {
+        const rom = try Io.Dir.cwd().readFileAlloc(
+            io,
+            case.rom_path,
+            std.testing.allocator,
+            .limited(16 * 1024 * 1024),
+        );
+        defer std.testing.allocator.free(rom);
+
+        const image = gba_loader.RomImage{ .bytes = rom };
+        try std.testing.expectEqualDeep(
+            armv4t_decode.DecodedInstruction{ .bl = .{ .target = .{
+                .address = measuredLocalThumbBlxR3ArmLiteralTarget,
+                .isa = .arm,
+            } } },
+            try resolveDecodedInstruction(
+                image,
+                .{ .address = 0x0800_0000, .isa = .thumb },
+                case.bl_address,
+                .{ .bl = .{ .target = .{
+                    .address = case.stub_address,
+                    .isa = .thumb,
+                } } },
+            ),
+        );
     }
 }
 
@@ -2767,20 +2887,20 @@ test "tonc fixture frontiers reflect the exact local thumb blx r3 veneer slice" 
     }{
         .{
             .rom_path = "tests/fixtures/real/tonc/sbb_reg.gba",
-            .old_blocker = "Unsupported opcode 0x00004700 at 0x08000316 for armv4t",
-            .next_blocker = "Unsupported opcode 0x00004718 at 0x08000808 for armv4t",
+            .old_blocker = "Unsupported opcode 0x00004718 at 0x08000808 for armv4t",
+            .next_blocker = "Unsupported opcode 0x00004718 at 0x080008E8 for armv4t",
             .still_blocked_here = false,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
-            .old_blocker = "Unsupported opcode 0x00004718 at 0x080003B8 for armv4t",
-            .next_blocker = "Unsupported control flow target 0x030000A4 for gba",
+            .old_blocker = "Unsupported control flow target 0x030000A4 for gba",
+            .next_blocker = "Unsupported opcode 0x00004718 at 0x080003B8 for armv4t",
             .still_blocked_here = false,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
-            .old_blocker = "Unsupported opcode 0x00004718 at 0x0800081C for armv4t",
-            .next_blocker = "Unsupported control flow target 0x030000A4 for gba",
+            .old_blocker = "Unsupported control flow target 0x030000A4 for gba",
+            .next_blocker = "Unsupported opcode 0x00004718 at 0x08000750 for armv4t",
             .still_blocked_here = false,
         },
         .{

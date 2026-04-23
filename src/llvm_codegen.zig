@@ -2808,10 +2808,10 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
         .bl => |bl| {
             try emitRegPtr(writer, "state", node.address, "lr", 14);
             try writer.print("  store i32 {d}, ptr %lr_ptr_{x:0>8}, align 4\n", .{ node.address + node.size_bytes, node.address });
-            if (bl.target != node.address + node.size_bytes) {
+            if (bl.target.address != node.address + node.size_bytes or bl.target.isa != function.entry.isa) {
                 try writer.print("  call void @guest_{s}_{x:0>8}(ptr %state)\n", .{
-                    instructionSetName(function.entry.isa),
-                    bl.target,
+                    instructionSetName(bl.target.isa),
+                    bl.target.address,
                 });
             }
             try emitFallthrough(writer, function, node.address + node.size_bytes);
