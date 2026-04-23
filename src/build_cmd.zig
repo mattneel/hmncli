@@ -979,7 +979,17 @@ fn resolveExactKeyDemoLocalThumbBlxR3CallerTarget(
         else => return null,
     };
     if (load.rd != 3 or load.base != 15) return null;
-    return try resolveThumbPcRelativeLiteralCodeTarget(image, previous.address, load);
+    return resolveThumbPcRelativeLiteralCodeTarget(image, previous.address, load) catch |err| switch (err) {
+        error.UnsupportedOpcode => blk: {
+            const literal_address = pcValueForInstruction(.thumb, previous.address) + load.offset;
+            if (literal_address < image.base_address) return null;
+            const literal_offset = literal_address - image.base_address;
+            if (literal_offset + 4 > image.bytes.len) return null;
+            const raw_target = armv4t_decode.readWord(image.bytes, literal_offset);
+            break :blk normalizeCodeTarget(raw_target).address;
+        },
+        else => return err,
+    };
 }
 
 fn resolveExactObjDemoLocalThumbBlxR3CallerTarget(
@@ -1017,7 +1027,17 @@ fn resolveExactObjDemoLocalThumbBlxR3CallerTarget(
     };
     if (ldr_r3.rd != 3 or ldr_r3.base != 15) return null;
 
-    return try resolveThumbPcRelativeLiteralCodeTarget(image, ldr_r3_insn.address, ldr_r3);
+    return resolveThumbPcRelativeLiteralCodeTarget(image, ldr_r3_insn.address, ldr_r3) catch |err| switch (err) {
+        error.UnsupportedOpcode => blk: {
+            const literal_address = pcValueForInstruction(.thumb, ldr_r3_insn.address) + ldr_r3.offset;
+            if (literal_address < image.base_address) return null;
+            const literal_offset = literal_address - image.base_address;
+            if (literal_offset + 4 > image.bytes.len) return null;
+            const raw_target = armv4t_decode.readWord(image.bytes, literal_offset);
+            break :blk normalizeCodeTarget(raw_target).address;
+        },
+        else => return err,
+    };
 }
 
 fn resolveThumbPcRelativeLiteralCodeTarget(
@@ -2182,6 +2202,35 @@ test "local thumb blx r3 veneer resolves the measured caller literal targets" {
     }
 }
 
+test "local thumb blx r3 veneer falls back on ARM-valued caller literals" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeLocalThumbBlxR3VeneerRom(
+        tmp.dir,
+        io,
+        "local-blx-r3-arm-literal.gba",
+        0x4B03,
+        0x4718,
+        0x0000,
+        0x0800_0010,
+    );
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "local-blx-r3-arm-literal.gba");
+    defer image.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bl = .{ .target = 0x0800_0010 } },
+        try resolveDecodedInstruction(
+            image,
+            .{ .address = 0x0800_0000, .isa = .thumb },
+            0x0800_0004,
+            .{ .bl = .{ .target = 0x0800_0008 } },
+        ),
+    );
+}
+
 test "local thumb blx r3 veneer rejects near misses" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2582,14 +2631,14 @@ test "tonc fixture frontiers reflect the exact local thumb blx r3 veneer slice" 
             .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
             .old_blocker = "Unsupported opcode 0x00000000 at 0x080003A8 for armv4t",
             .cleared_blocker = "Unsupported opcode 0x00004718 at 0x080003B8 for armv4t",
-            .next_blocker = "Unsupported opcode 0xF81DF000 at 0x0800037A for armv4t",
+            .next_blocker = "Unsupported control flow target 0x030000A4 for gba",
             .still_blocked_here = false,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
             .old_blocker = "Unsupported opcode 0x00000021 at 0x080002F6 for armv4t",
             .cleared_blocker = "Unsupported opcode 0x00004718 at 0x0800081C for armv4t",
-            .next_blocker = "Unsupported opcode 0xF80BF000 at 0x08000802 for armv4t",
+            .next_blocker = "Unsupported control flow target 0x030000A4 for gba",
             .still_blocked_here = false,
         },
         .{
