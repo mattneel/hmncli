@@ -262,6 +262,7 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("@.fmt_retired = private unnamed_addr constant [14 x i8] c\"retired=%llu\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_irq_bad_ie = private unnamed_addr constant [64 x i8] c\"Unsupported interrupt source mask 0x%04x at 0x04000200 for gba\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_irq_nested_ime = private unnamed_addr constant [53 x i8] c\"Unsupported nested IME enable at 0x04000208 for gba\\0A\\00\", align 1\n", .{});
+    try writer.print("@.fmt_irq_multi_if = private unnamed_addr constant [58 x i8] c\"Unsupported pending IF mask 0x%04x at 0x04000202 for gba\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_irq_byte_store = private unnamed_addr constant [57 x i8] c\"Unsupported byte interrupt MMIO store at 0x%08x for gba\\0A\\00\", align 1\n", .{});
     try writer.print("declare i32 @printf(ptr, ...)\n", .{});
     try writer.print("declare i32 @hmgba_dump_frame_raw(ptr, ptr, ptr, ptr)\n", .{});
@@ -328,15 +329,32 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("  store i32 3818921988, ptr %sqrt_bios_latch_ptr, align 4\n", .{});
     try writer.print("  ret i32 %sqrt_result\n", .{});
     try writer.print("}}\n\n", .{});
-    try writer.print("define i32 @shim_gba_VBlankIntrWait(ptr %state) {{\n", .{});
+    try writer.print("define i64 @hmn_gba_advance_frame(ptr %state) {{\n", .{});
     try writer.print("entry:\n", .{});
     try writer.print(
-        "  %vblank_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+        "  %advance_vblank_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
         .{guest_state_vblank_count_field},
     );
-    try writer.print("  %vblank_curr = load i64, ptr %vblank_ptr, align 8\n", .{});
-    try writer.print("  %vblank_next = add i64 %vblank_curr, 1\n", .{});
-    try writer.print("  %keyinput_value = call i16 @hmgba_sample_keyinput_for_frame(i64 %vblank_next)\n", .{});
+    try writer.print("  %advance_vblank_curr = load i64, ptr %advance_vblank_ptr, align 8\n", .{});
+    try writer.print("  %advance_vblank_next = add i64 %advance_vblank_curr, 1\n", .{});
+    try writer.print("  store i64 %advance_vblank_next, ptr %advance_vblank_ptr, align 8\n", .{});
+    try writer.print(
+        "  %advance_io_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+        .{guest_state_io_field},
+    );
+    try writer.print(
+        "  %advance_if_ptr = getelementptr inbounds [1024 x i8], ptr %advance_io_ptr, i32 0, i32 {d}\n",
+        .{io_if_offset},
+    );
+    try writer.print("  %advance_if_curr = load i16, ptr %advance_if_ptr, align 1\n", .{});
+    try writer.print("  %advance_if_next = or i16 %advance_if_curr, {d}\n", .{irq_vblank_mask});
+    try writer.print("  store i16 %advance_if_next, ptr %advance_if_ptr, align 1\n", .{});
+    try writer.print("  ret i64 %advance_vblank_next\n", .{});
+    try writer.print("}}\n\n", .{});
+    try writer.print("define i32 @shim_gba_VBlankIntrWait(ptr %state) {{\n", .{});
+    try writer.print("entry:\n", .{});
+    try writer.print("  %frame_index = call i64 @hmn_gba_advance_frame(ptr %state)\n", .{});
+    try writer.print("  %keyinput_value = call i16 @hmgba_sample_keyinput_for_frame(i64 %frame_index)\n", .{});
     try writer.print(
         "  %wait_io_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
         .{guest_state_io_field},
@@ -346,14 +364,7 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
         .{io_keyinput_offset},
     );
     try writer.print("  store i16 %keyinput_value, ptr %keyinput_ptr, align 1\n", .{});
-    try writer.print("  store i64 %vblank_next, ptr %vblank_ptr, align 8\n", .{});
-    try writer.print(
-        "  %dispstat_ptr = getelementptr inbounds [1024 x i8], ptr %wait_io_ptr, i32 0, i32 {d}\n",
-        .{io_dispstat_offset},
-    );
-    try writer.print("  %dispstat = load i16, ptr %dispstat_ptr, align 1\n", .{});
-    try writer.print("  %dispstat_i32 = zext i16 %dispstat to i32\n", .{});
-    try writer.print("  call void @hmn_maybe_fire_vblank_irq(ptr %state, i32 %dispstat_i32)\n", .{});
+    try writer.print("  call void @hmn_dispatch_vblank_irq(ptr %state)\n", .{});
     try writer.print("  ret i32 0\n", .{});
     try writer.print("}}\n\n", .{});
     try writer.print("define void @hmn_interrupt_fail_bad_ie(ptr %state, i16 %value) {{\n", .{});
@@ -365,6 +376,17 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("  %bad_ie_value_i32 = zext i16 %value to i32\n", .{});
     try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_irq_bad_ie, i32 %bad_ie_value_i32)\n", .{});
     try writer.print("  store i1 true, ptr %bad_ie_stop_flag_ptr, align 1\n", .{});
+    try writer.print("  ret void\n", .{});
+    try writer.print("}}\n\n", .{});
+    try writer.print("define void @hmn_interrupt_fail_multi_if(ptr %state, i16 %value) {{\n", .{});
+    try writer.print("entry:\n", .{});
+    try writer.print(
+        "  %multi_if_stop_flag_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+        .{guest_state_stop_flag_field},
+    );
+    try writer.print("  %multi_if_value_i32 = zext i16 %value to i32\n", .{});
+    try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_irq_multi_if, i32 %multi_if_value_i32)\n", .{});
+    try writer.print("  store i1 true, ptr %multi_if_stop_flag_ptr, align 1\n", .{});
     try writer.print("  ret void\n", .{});
     try writer.print("}}\n\n", .{});
     try writer.print("define void @hmn_interrupt_fail_nested_ime(ptr %state) {{\n", .{});
@@ -431,32 +453,37 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("  store i16 %value, ptr %raw_ptr, align 1\n", .{});
     try writer.print("  ret void\n", .{});
     try writer.print("}}\n\n", .{});
-    try writer.print("define void @hmn_maybe_fire_vblank_irq(ptr %state, i32 %dispstat_value) {{\n", .{});
+    try writer.print("define void @hmn_dispatch_vblank_irq(ptr %state) {{\n", .{});
     try writer.print("entry:\n", .{});
-    try writer.print("  %irq_vblank_bits = and i32 %dispstat_value, 1\n", .{});
-    try writer.print("  %irq_is_vblank = icmp ne i32 %irq_vblank_bits, 0\n", .{});
-    try writer.print("  br i1 %irq_is_vblank, label %irq_check_ime, label %irq_done\n", .{});
-    try writer.print("irq_check_ime:\n", .{});
     try writer.print(
         "  %irq_io_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
         .{guest_state_io_field},
     );
-    try writer.print("  %irq_ime_ptr = getelementptr inbounds [1024 x i8], ptr %irq_io_ptr, i32 0, i32 520\n", .{});
+    try writer.print("  %irq_dispstat_ptr = getelementptr inbounds [1024 x i8], ptr %irq_io_ptr, i32 0, i32 {d}\n", .{io_dispstat_offset});
+    try writer.print("  %irq_dispstat = load i16, ptr %irq_dispstat_ptr, align 1\n", .{});
+    try writer.print("  %irq_dispstat_vblank = and i16 %irq_dispstat, 8\n", .{});
+    try writer.print("  %irq_dispstat_enabled = icmp ne i16 %irq_dispstat_vblank, 0\n", .{});
+    try writer.print("  br i1 %irq_dispstat_enabled, label %irq_check_ime, label %irq_done\n", .{});
+    try writer.print("irq_check_ime:\n", .{});
+    try writer.print("  %irq_ime_ptr = getelementptr inbounds [1024 x i8], ptr %irq_io_ptr, i32 0, i32 {d}\n", .{io_ime_offset});
     try writer.print("  %irq_ime = load i16, ptr %irq_ime_ptr, align 1\n", .{});
     try writer.print("  %irq_ime_enabled = icmp ne i16 %irq_ime, 0\n", .{});
     try writer.print("  br i1 %irq_ime_enabled, label %irq_check_ie, label %irq_done\n", .{});
     try writer.print("irq_check_ie:\n", .{});
-    try writer.print("  %irq_ie_ptr = getelementptr inbounds [1024 x i8], ptr %irq_io_ptr, i32 0, i32 512\n", .{});
+    try writer.print("  %irq_ie_ptr = getelementptr inbounds [1024 x i8], ptr %irq_io_ptr, i32 0, i32 {d}\n", .{io_ie_offset});
     try writer.print("  %irq_ie = load i16, ptr %irq_ie_ptr, align 1\n", .{});
-    try writer.print("  %irq_ie_vblank = and i16 %irq_ie, 1\n", .{});
+    try writer.print("  %irq_ie_vblank = and i16 %irq_ie, {d}\n", .{irq_vblank_mask});
     try writer.print("  %irq_ie_enabled = icmp ne i16 %irq_ie_vblank, 0\n", .{});
-    try writer.print("  br i1 %irq_ie_enabled, label %irq_check_dispstat, label %irq_done\n", .{});
-    try writer.print("irq_check_dispstat:\n", .{});
-    try writer.print("  %irq_dispstat_ptr = getelementptr inbounds [1024 x i8], ptr %irq_io_ptr, i32 0, i32 4\n", .{});
-    try writer.print("  %irq_dispstat = load i16, ptr %irq_dispstat_ptr, align 1\n", .{});
-    try writer.print("  %irq_dispstat_vblank = and i16 %irq_dispstat, 8\n", .{});
-    try writer.print("  %irq_dispstat_enabled = icmp ne i16 %irq_dispstat_vblank, 0\n", .{});
-    try writer.print("  br i1 %irq_dispstat_enabled, label %irq_check_vector, label %irq_done\n", .{});
+    try writer.print("  br i1 %irq_ie_enabled, label %irq_check_if, label %irq_done\n", .{});
+    try writer.print("irq_check_if:\n", .{});
+    try writer.print("  %irq_if_ptr = getelementptr inbounds [1024 x i8], ptr %irq_io_ptr, i32 0, i32 {d}\n", .{io_if_offset});
+    try writer.print("  %irq_if = load i16, ptr %irq_if_ptr, align 1\n", .{});
+    try writer.print("  %irq_if_multi = and i16 %irq_if, -2\n", .{});
+    try writer.print("  %irq_if_bad = icmp ne i16 %irq_if_multi, 0\n", .{});
+    try writer.print("  br i1 %irq_if_bad, label %irq_fail_multi_if, label %irq_check_vector\n", .{});
+    try writer.print("irq_fail_multi_if:\n", .{});
+    try writer.print("  call void @hmn_interrupt_fail_multi_if(ptr %state, i16 %irq_if)\n", .{});
+    try writer.print("  br label %irq_done\n", .{});
     try writer.print("irq_check_vector:\n", .{});
     try writer.print(
         "  %irq_iwram_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
@@ -468,20 +495,12 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("  br i1 %irq_has_vector, label %irq_fire, label %irq_done\n", .{});
     try writer.print("irq_fire:\n", .{});
     try writer.print(
-        "  %irq_bios_latch_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
-        .{guest_state_bios_latch_field},
-    );
-    try writer.print(
         "  %irq_in_handler_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
         .{guest_state_in_irq_handler_field},
     );
-    try writer.print("  %irq_iwram_base_ptr = getelementptr inbounds [32768 x i8], ptr %irq_iwram_ptr, i32 0, i32 0\n", .{});
-    try writer.print("  store i32 3797872644, ptr %irq_bios_latch_ptr, align 4\n", .{});
-    try writer.print("  store i32 3797872644, ptr %irq_iwram_base_ptr, align 1\n", .{});
     try writer.print("  store i1 true, ptr %irq_in_handler_ptr, align 1\n", .{});
     try writer.print("  call void @hmn_call_guest(ptr %state, i32 %irq_vector)\n", .{});
     try writer.print("  store i1 false, ptr %irq_in_handler_ptr, align 1\n", .{});
-    try writer.print("  store i32 3848192002, ptr %irq_bios_latch_ptr, align 4\n", .{});
     try writer.print("  br label %irq_done\n", .{});
     try writer.print("irq_done:\n", .{});
     try writer.print("  ret void\n", .{});
@@ -685,15 +704,10 @@ fn emitLoadHelper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
         "  %save_bank_load_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
         .{guest_state_flash_bank_field},
     );
-    try writer.print(
-        "  %dispstat_toggle_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
-        .{guest_state_dispstat_toggle_field},
-    );
     try writer.print("  %bios_hit = icmp ult i32 %addr, 16384\n", .{});
     try writer.print("  %save_hit_ge = icmp uge i32 %addr, {d}\n", .{save_region_base});
     try writer.print("  %save_hit_lt = icmp ult i32 %addr, {d}\n", .{save_region_end});
     try writer.print("  %save_hit = and i1 %save_hit_ge, %save_hit_lt\n", .{});
-    try writer.print("  %dispstat_hit = icmp eq i32 %addr, 67108868\n", .{});
     try writer.print("  br i1 %bios_hit, label %load_bios, label %check_rom\n", .{});
     try writer.print("load_bios:\n", .{});
     try writer.print("  %bios_value = load i32, ptr %bios_latch_ptr, align 4\n", .{});
@@ -735,7 +749,7 @@ fn emitLoadHelper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
         try writer.print("  %rom_offset = and i32 %rom_window_offset, 33554431\n", .{});
         try writer.print("  %rom_in_range = icmp ult i32 %rom_offset, {d}\n", .{rom_span});
         try writer.print("  %rom_hit = and i1 %rom_window_hit, %rom_in_range\n", .{});
-        try writer.print("  br i1 %rom_hit, label %load_rom, label %check_dispstat\n", .{});
+        try writer.print("  br i1 %rom_hit, label %load_rom, label %check_load_region_0\n", .{});
         try writer.print("load_rom:\n", .{});
         try writer.print(
             "  %rom_ptr = getelementptr inbounds [{d} x i8], ptr @rom_data, i32 0, i32 %rom_offset\n",
@@ -743,16 +757,7 @@ fn emitLoadHelper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
         );
         try writer.print("  %rom_value = load i32, ptr %rom_ptr, align 1\n", .{});
         try writer.print("  ret i32 %rom_value\n", .{});
-        try writer.print("check_dispstat:\n", .{});
     }
-    try writer.print("  br i1 %dispstat_hit, label %load_dispstat, label %check_load_region_0\n", .{});
-    try writer.print("load_dispstat:\n", .{});
-    try writer.print("  %dispstat_toggle = load i1, ptr %dispstat_toggle_ptr, align 1\n", .{});
-    try writer.print("  %dispstat_value = select i1 %dispstat_toggle, i32 1, i32 0\n", .{});
-    try writer.print("  %dispstat_next = xor i1 %dispstat_toggle, true\n", .{});
-    try writer.print("  store i1 %dispstat_next, ptr %dispstat_toggle_ptr, align 1\n", .{});
-    try writer.print("  call void @hmn_maybe_fire_vblank_irq(ptr %state, i32 %dispstat_value)\n", .{});
-    try writer.print("  ret i32 %dispstat_value\n", .{});
 
     for (memory_regions, 0..) |region, index| {
         try writer.print("check_load_region_{d}:\n", .{index});
@@ -2146,17 +2151,7 @@ fn instructionEndsRetiredBlock(node: InstructionNode) bool {
     return switch (node.instruction) {
         .mov_reg => |mov| mov.rd == 15 and mov.rm == 14,
         .movs_reg => |mov| mov.rd == 15 and mov.rm == 14,
-        .ldr_pc_post_imm_target,
-        .add_reg_pc_target,
-        .branch,
-        .bl,
-        .bx_target,
-        .bx_lr,
-        .thumb_saved_lr_return,
-        .ldm_pc_target,
-        .ldm_empty_pc_target,
-        .exception_return,
-        .bx_reg => true,
+        .ldr_pc_post_imm_target, .add_reg_pc_target, .branch, .bl, .bx_target, .bx_lr, .thumb_saved_lr_return, .ldm_pc_target, .ldm_empty_pc_target, .exception_return, .bx_reg => true,
         .pop => |mask| registerMaskIncludesPc(mask),
         else => false,
     };
@@ -4942,7 +4937,10 @@ test "minimal vblank interrupt MMIO helpers" {
 
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "@.fmt_irq_bad_ie") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "@.fmt_irq_nested_ime") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "@.fmt_irq_multi_if") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "@hmn_store_gba_io16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "@hmn_gba_advance_frame") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "@hmn_dispatch_vblank_irq") != null);
 }
 
 test "minimal vblank interrupt MMIO helpers preserve handler IF acknowledgement" {
@@ -4967,6 +4965,9 @@ test "minimal vblank interrupt MMIO helpers preserve handler IF acknowledgement"
     };
     try emitModule(&output.writer, program);
 
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "call i64 @hmn_gba_advance_frame(ptr %state)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "call void @hmn_dispatch_vblank_irq(ptr %state)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "call void @hmn_interrupt_fail_multi_if(ptr %state, i16 %irq_if)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "call void @hmn_call_guest(ptr %state, i32 %irq_vector)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "store i16 1, ptr %irq_if_ptr") == null);
 }
