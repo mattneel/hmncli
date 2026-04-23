@@ -2729,6 +2729,31 @@ fn writeNestedImeRom(
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
+fn writeCpuSetCopyRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xE59F0010, // ldr r0, [pc, #0x10] ; source
+        0xE59F1010, // ldr r1, [pc, #0x10] ; dest
+        0xE59F2010, // ldr r2, [pc, #0x10] ; control
+        0xEF00000B, // swi 0x0B (CpuSet)
+        0xE5910000, // ldr r0, [r1]
+        0xEF000000, // swi 0x00 (SoftReset)
+        0x08000024, // source literal
+        0x03000000, // dest literal
+        0x04000001, // one 32-bit unit, copy mode
+        42, // source word
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
 test "build emits a native executable for the first gba mov-plus-div slice" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3838,7 +3863,7 @@ test "minimal vblank fixture turns the signal pixel green" {
         "frame-irq-native",
         .frame_raw,
         interrupt_fixture_support.minimal_vblank.max_instructions,
-    );
+        );
     defer std.testing.allocator.free(native_path);
 
     const frame_path = try std.testing.allocator.dupe(u8, "frame_irq.rgba");
@@ -3882,7 +3907,7 @@ test "minimal vblank model rejects non-vblank IE bits" {
         "ie-bad-native",
         .retired_count,
         500_000,
-    );
+        );
     defer std.testing.allocator.free(native_path);
 
     const result = try runNativeCapture(
@@ -3917,7 +3942,7 @@ test "minimal vblank model rejects IME re-enable inside a handler" {
         "nested-ime-native",
         .retired_count,
         500_000,
-    );
+        );
     defer std.testing.allocator.free(native_path);
 
     const result = try runNativeCapture(
@@ -3966,7 +3991,7 @@ test "minimal vblank model rejects byte writes to interrupt MMIO" {
             case.native_path,
             .retired_count,
             500_000,
-        );
+            );
         defer std.testing.allocator.free(native_path);
 
         const result = try runNativeCapture(
@@ -4684,4 +4709,43 @@ test "build retired counts do not overcount when a block stops mid-execution" {
 
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("retired=2\n", result.stdout);
+}
+
+test "build executes CpuSet copy semantics on a synthetic ROM" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeCpuSetCopyRom(tmp.dir, io, "cpuset-copy.gba");
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "cpuset-copy.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "cpuset-copy-native",
+            .output_mode = .auto,
+            .optimize = .release,
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./cpuset-copy-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
 }

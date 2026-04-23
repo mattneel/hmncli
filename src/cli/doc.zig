@@ -34,3 +34,15 @@ test "doc renders shim declaration metadata deterministically" {
         output.writer.buffered(),
     );
 }
+
+test "doc renders CpuSet shim declaration metadata deterministically" {
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try render(&output.writer, "shim/gba/CpuSet");
+
+    try std.testing.expectEqualStrings(
+        "ID: shim/gba/CpuSet\nState: implemented\nEffects: memory_write\nReference: GBATEK BIOS CpuSet\n",
+        output.writer.buffered(),
+    );
+}

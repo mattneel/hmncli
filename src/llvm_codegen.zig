@@ -4901,6 +4901,31 @@ test "llvm emission lowers gba soft reset swi to the soft reset shim call" {
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "call i32 @shim_gba_SoftReset(ptr %state)") != null);
 }
 
+test "llvm emission lowers gba CpuSet swi to the CpuSet shim call" {
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const program = Program{
+        .entry = .{ .address = 0x08000000, .isa = .arm },
+        .rom_base_address = 0x08000000,
+        .rom_bytes = &.{},
+        .save_hardware = .none,
+        .functions = &.{
+            .{
+                .entry = .{ .address = 0x08000000, .isa = .arm },
+                .instructions = &.{
+                    .{ .address = 0x08000000, .condition = .al, .size_bytes = 4, .instruction = .{ .swi = .{ .imm24 = 0x00000B } } },
+                },
+            },
+        },
+        .output_mode = .register_r0_decimal,
+        .instruction_limit = null,
+    };
+    try emitModule(&output.writer, program);
+
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "call i32 @shim_gba_CpuSet(ptr %state)") != null);
+}
+
 test "llvm emission prepays retired counts for straight-line blocks" {
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
