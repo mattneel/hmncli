@@ -3956,6 +3956,23 @@ test "thumb push-lr pop-r0 bx-r0 resolves the measured commercial return shape" 
     }
 }
 
+test "thumb push-lr pop-r4 pop-r0 bx-r0 rejects the local near-miss" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom_bytes = &.{ 0x00, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-pop-r4-pop-r0-bx-r0-near-miss.gba", .data = rom_bytes });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-r4-pop-r0-bx-r0-near-miss.gba");
+    defer image.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.UnsupportedOpcode,
+        resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0006, 0),
+    );
+}
+
 test "tonc fixture frontiers reflect the exact local thumb blx r3 veneer slice" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
