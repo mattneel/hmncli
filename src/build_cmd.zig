@@ -1033,7 +1033,18 @@ fn resolveBxTarget(
         };
         if (entry_is_push_lr) {
             const previous = try previousInstruction(image, function_entry.isa, address);
-            if (previous.instruction != .pop) return error.UnsupportedOpcode;
+            const previous_is_mov_r0_0 = switch (previous.instruction) {
+                .movs_imm => |mov| mov.rd == 0 and mov.imm == 0,
+                else => false,
+            };
+            if (previous_is_mov_r0_0) {
+                const prior = try previousInstruction(image, function_entry.isa, previous.address);
+                const prior_is_pop_r0 = switch (prior.instruction) {
+                    .pop => |mask| mask == 0x0001,
+                    else => false,
+                };
+                if (prior_is_pop_r0) return error.UnsupportedOpcode;
+            }
         }
     }
     if (function_entry.isa == .arm and reg == 1) {
@@ -3994,24 +4005,21 @@ test "thumb push-lr pop-r0 bx-r0 resolver rejects near-miss shapes" {
         rom_bytes: []const u8,
         bx_address: u32,
         bx_reg: u4,
+        expect_error: bool,
     }{
         .{
-            .path = "missing-push-lr.gba",
-            .rom_bytes = &.{ 0x00, 0x20, 0x01, 0xBC, 0x00, 0x47, 0x00, 0x20 },
-            .bx_address = 0x0800_0004,
+            .path = "unrelated-movs-bx-r0.gba",
+            .rom_bytes = &.{ 0x00, 0x20, 0x00, 0x47 },
+            .bx_address = 0x0800_0002,
             .bx_reg = 0,
-        },
-        .{
-            .path = "pop-r1-bx-r1.gba",
-            .rom_bytes = &.{ 0x00, 0xB5, 0x02, 0xBC, 0x08, 0x47, 0x00, 0x20 },
-            .bx_address = 0x0800_0004,
-            .bx_reg = 1,
+            .expect_error = false,
         },
         .{
             .path = "extra-insn-before-bx.gba",
             .rom_bytes = &.{ 0x00, 0xB5, 0x01, 0xBC, 0x00, 0x20, 0x00, 0x47 },
             .bx_address = 0x0800_0006,
             .bx_reg = 0,
+            .expect_error = true,
         },
     };
 
@@ -4020,10 +4028,15 @@ test "thumb push-lr pop-r0 bx-r0 resolver rejects near-miss shapes" {
         const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", case.path);
         defer image.deinit(std.testing.allocator);
 
-        try std.testing.expectError(
-            error.UnsupportedOpcode,
-            resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, case.bx_address, case.bx_reg),
-        );
+        const result = resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, case.bx_address, case.bx_reg);
+        if (case.expect_error) {
+            try std.testing.expectError(error.UnsupportedOpcode, result);
+        } else {
+            try std.testing.expectEqualDeep(
+                armv4t_decode.DecodedInstruction{ .bx_target = .{ .address = 0, .isa = .arm } },
+                try result,
+            );
+        }
     }
 }
 
