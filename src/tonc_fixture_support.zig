@@ -8,6 +8,17 @@ pub const Fixture = struct {
     sha256_hex: []const u8,
 };
 
+pub const GoldenFixture = struct {
+    name: []const u8,
+    path: []const u8,
+    size: usize,
+    sha256_hex: []const u8,
+    max_instructions: u64,
+    stop_frames: u32,
+    mgba_key_mask: u32 = 0,
+    keyinput_script: ?[]const u8 = null,
+};
+
 pub const PixelSample = struct {
     x: usize,
     y: usize,
@@ -66,11 +77,58 @@ pub const fixtures = [_]Fixture{
     },
 };
 
+pub const golden_fixtures = [_]GoldenFixture{
+    .{
+        .name = "sbb_reg",
+        .path = "tests/fixtures/real/tonc/sbb_reg.golden.rgba",
+        .size = 153600,
+        .sha256_hex = "08d15b57faf5802eea234e0065c17f3273ed072c559b48e27db66a574e4f6673",
+        .max_instructions = 500_000,
+        .stop_frames = 60,
+    },
+    .{
+        .name = "obj_demo",
+        .path = "tests/fixtures/real/tonc/obj_demo.golden.rgba",
+        .size = 153600,
+        .sha256_hex = "ab1027848c15ae55573e3a85b6bd651371931ee6eba0778ee11422f84e31f79a",
+        .max_instructions = 500_000,
+        .stop_frames = 60,
+    },
+    .{
+        .name = "key_demo",
+        .path = "tests/fixtures/real/tonc/key_demo.golden.rgba",
+        .size = 153600,
+        .sha256_hex = "99138f4eca3379e2a502e3c08733e023e78562c206fbd556e9b7fa5291cd205f",
+        .max_instructions = 500_000,
+        .stop_frames = 60,
+        .mgba_key_mask = 1,
+        .keyinput_script = key_demo_hold_a_script,
+    },
+};
+
 test "tonc fixture hashes and sizes match provenance" {
     const io = std.testing.io;
     const cwd = Io.Dir.cwd();
 
     for (fixtures) |fixture| {
+        const bytes = try cwd.readFileAlloc(io, fixture.path, std.testing.allocator, .unlimited);
+        defer std.testing.allocator.free(bytes);
+
+        try std.testing.expectEqual(fixture.size, bytes.len);
+
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+
+        const actual_hex = std.fmt.bytesToHex(digest, .lower);
+        try std.testing.expectEqualStrings(fixture.sha256_hex, &actual_hex);
+    }
+}
+
+test "tonc golden hashes and sizes match recorded provenance" {
+    const io = std.testing.io;
+    const cwd = Io.Dir.cwd();
+
+    for (golden_fixtures) |fixture| {
         const bytes = try cwd.readFileAlloc(io, fixture.path, std.testing.allocator, .unlimited);
         defer std.testing.allocator.free(bytes);
 

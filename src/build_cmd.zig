@@ -2379,6 +2379,32 @@ fn runFrameFixture(
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
 }
 
+fn expectToncGoldenFrame(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    demo_name: []const u8,
+    actual_frame: []const u8,
+    fixture: tonc_fixture_support.GoldenFixture,
+) !void {
+    const expected_frame = try frame_test_support.readExactFrame(allocator, io, Io.Dir.cwd(), fixture.path);
+    defer allocator.free(expected_frame);
+
+    if (!std.mem.eql(u8, expected_frame, actual_frame)) {
+        const scratch_dir = ".zig-cache/tonc-parity";
+        const scratch_path = try std.fmt.allocPrint(allocator, "{s}/{s}.actual.rgba", .{ scratch_dir, demo_name });
+        defer allocator.free(scratch_path);
+
+        try Io.Dir.cwd().createDirPath(io, scratch_dir);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = scratch_path, .data = actual_frame });
+        std.debug.print(
+            "tonc parity mismatch for {s}; wrote actual frame to {s}; expected golden {s}\n",
+            .{ demo_name, scratch_path, fixture.path },
+        );
+    }
+
+    try std.testing.expectEqualSlices(u8, expected_frame, actual_frame);
+}
+
 fn writeThumbStartupBranchRom(
     dir: std.Io.Dir,
     io: std.Io,
@@ -3390,7 +3416,7 @@ test "tonc obj_demo main tail call is measured as no-fallthrough" {
     ));
 }
 
-test "tonc sbb_reg frame smoke test" {
+test "tonc sbb_reg frame parity test" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3402,21 +3428,21 @@ test "tonc sbb_reg frame smoke test" {
         "tests/fixtures/real/tonc/sbb_reg.gba",
         "sbb_reg-native",
         .frame_raw,
-        500_000,
+        tonc_fixture_support.golden_fixtures[0].max_instructions,
     );
     defer std.testing.allocator.free(output_path);
 
-    try runFrameFixture(io, tmp.dir, output_path, "sbb_reg.rgba", .{ .max_instructions = 500_000 });
+    try runFrameFixture(io, tmp.dir, output_path, "sbb_reg.rgba", .{
+        .max_instructions = tonc_fixture_support.golden_fixtures[0].max_instructions,
+    });
 
     const frame = try frame_test_support.readExactFrame(std.testing.allocator, io, tmp.dir, "sbb_reg.rgba");
     defer std.testing.allocator.free(frame);
 
-    for (tonc_fixture_support.sbb_reg_samples) |sample| {
-        try frame_test_support.expectPixel(frame, sample.x, sample.y, sample.expected);
-    }
+    try expectToncGoldenFrame(std.testing.allocator, io, "sbb_reg", frame, tonc_fixture_support.golden_fixtures[0]);
 }
 
-test "tonc obj_demo frame smoke test" {
+test "tonc obj_demo frame parity test" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3428,21 +3454,21 @@ test "tonc obj_demo frame smoke test" {
         "tests/fixtures/real/tonc/obj_demo.gba",
         "obj_demo-native",
         .frame_raw,
-        500_000,
+        tonc_fixture_support.golden_fixtures[1].max_instructions,
     );
     defer std.testing.allocator.free(output_path);
 
-    try runFrameFixture(io, tmp.dir, output_path, "obj_demo.rgba", .{ .max_instructions = 500_000 });
+    try runFrameFixture(io, tmp.dir, output_path, "obj_demo.rgba", .{
+        .max_instructions = tonc_fixture_support.golden_fixtures[1].max_instructions,
+    });
 
     const frame = try frame_test_support.readExactFrame(std.testing.allocator, io, tmp.dir, "obj_demo.rgba");
     defer std.testing.allocator.free(frame);
 
-    for (tonc_fixture_support.obj_demo_samples) |sample| {
-        try frame_test_support.expectPixel(frame, sample.x, sample.y, sample.expected);
-    }
+    try expectToncGoldenFrame(std.testing.allocator, io, "obj_demo", frame, tonc_fixture_support.golden_fixtures[1]);
 }
 
-test "tonc key_demo frame smoke test" {
+test "tonc key_demo frame parity test" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3454,21 +3480,19 @@ test "tonc key_demo frame smoke test" {
         "tests/fixtures/real/tonc/key_demo.gba",
         "key_demo-native",
         .frame_raw,
-        500_000,
+        tonc_fixture_support.golden_fixtures[2].max_instructions,
     );
     defer std.testing.allocator.free(output_path);
 
     try runFrameFixture(io, tmp.dir, output_path, "key_demo.rgba", .{
-        .max_instructions = 500_000,
-        .keyinput_script = tonc_fixture_support.key_demo_hold_a_script,
+        .max_instructions = tonc_fixture_support.golden_fixtures[2].max_instructions,
+        .keyinput_script = tonc_fixture_support.golden_fixtures[2].keyinput_script,
     });
 
     const frame = try frame_test_support.readExactFrame(std.testing.allocator, io, tmp.dir, "key_demo.rgba");
     defer std.testing.allocator.free(frame);
 
-    for (tonc_fixture_support.key_demo_samples) |sample| {
-        try frame_test_support.expectPixel(frame, sample.x, sample.y, sample.expected);
-    }
+    try expectToncGoldenFrame(std.testing.allocator, io, "key_demo", frame, tonc_fixture_support.golden_fixtures[2]);
 }
 
 test "build reports a structured diagnostic for an unsupported opcode" {

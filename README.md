@@ -13,8 +13,9 @@ This is not an emulator. There is no interpreter, no JIT, no runtime recompilati
 - The first `tonc` bring-up ladder is green for `sbb_reg`, `obj_demo`, and `key_demo`.
 - `irq_demo` is intentionally deferred to the later interrupt milestone because its upstream shape exceeds the current minimal VBlank-only interrupt model.
 - A limited `frame_raw` dump path exists for framebuffer inspection: Mode 4, Mode 0 regular BG0 tiles, and the minimal regular OBJ path needed by the current `tonc` demos.
+- mGBA-backed raw frame goldens now exist for the green `tonc` demos: `sbb_reg`, `obj_demo`, and `key_demo`.
 - Deterministic scripted KEYINPUT exists for bring-up smoke tests.
-- There is still no audio backend, no oracle-backed pixel goldens yet, and no second machine target.
+- There is still no audio backend and no second machine target.
 
 ## Quickstart
 
