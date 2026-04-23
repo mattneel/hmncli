@@ -10,7 +10,8 @@
 ## Oracle Notes
 
 - The `0.10.5` Ubuntu release artifact is not used for tonc parity because it does not ship `mgba-headless`.
-- The pinned source commit above does include `mgba-headless` plus Lua scripting, but upstream headless capture still needs a software video buffer attached before `screenshotToImage()` can return a usable frame.
+- The pinned source commit above does include `mgba-headless` plus Lua scripting, but upstream headless capture does not attach a software video buffer by default.
+- `scripts/patches/mgba-headless-video-buffer.patch` exists specifically to attach that software video buffer in headless mode so `screenshotToImage()` can return real frame data during scripted capture.
 - The patch is therefore part of the oracle contract, not an incidental local tweak.
 
 ## Capture Contract
