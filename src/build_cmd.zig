@@ -2786,6 +2786,62 @@ fn writeCpuSetCopyAutoProbeRom(
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
+fn writeCpuSetWordAlignRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xE59F0014, // ldr r0, [pc, #0x14] ; misaligned source
+        0xE59F1014, // ldr r1, [pc, #0x14] ; misaligned dest
+        0xE59F2014, // ldr r2, [pc, #0x14] ; control
+        0xEF00000B, // swi 0x0B (CpuSet)
+        0xE59F3010, // ldr r3, [pc, #0x10] ; aligned dest base
+        0xE5930000, // ldr r0, [r3]
+        0xE12FFF1E, // bx lr
+        0x0800002D, // source literal: align down to 0x0800002C
+        0x03000002, // dest literal: align down to 0x03000000
+        0x04000001, // one 32-bit unit, copy mode
+        0x03000000, // aligned dest base literal
+        42, // source word at 0x08000030
+        0x12345678, // padding so buggy unaligned source reads stay in range
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
+fn writeCpuSetHalfwordAlignRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xE59F0014, // ldr r0, [pc, #0x14] ; misaligned source
+        0xE59F1014, // ldr r1, [pc, #0x14] ; misaligned dest
+        0xE59F2014, // ldr r2, [pc, #0x14] ; control
+        0xEF00000B, // swi 0x0B (CpuSet)
+        0xE59F3010, // ldr r3, [pc, #0x10] ; aligned dest base
+        0xE1D300B0, // ldrh r0, [r3]
+        0xE12FFF1E, // bx lr
+        0x0800002D, // source literal: align down to 0x0800002C
+        0x03000001, // dest literal: align down to 0x03000000
+        0x00000001, // one 16-bit unit, copy mode
+        0x03000000, // aligned dest base literal
+        7, // source halfword in low bits at 0x08000030
+        0x12345678, // padding so buggy unaligned source reads stay in range
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
 test "build emits a native executable for the first gba mov-plus-div slice" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -4798,5 +4854,83 @@ test "build executes CpuSet copy semantics on a synthetic ROM" {
 
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("99\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "build aligns CpuSet word-mode source and dest before copying" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeCpuSetWordAlignRom(tmp.dir, io, "cpuset-align-word.gba");
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "cpuset-align-word.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "cpuset-align-word-native",
+            .output_mode = .auto,
+            .optimize = .release,
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./cpuset-align-word-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "build aligns CpuSet halfword-mode source and dest before copying" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeCpuSetHalfwordAlignRom(tmp.dir, io, "cpuset-align-halfword.gba");
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "cpuset-align-halfword.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "cpuset-align-halfword-native",
+            .output_mode = .auto,
+            .optimize = .release,
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./cpuset-align-halfword-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("7\n", result.stdout);
     try std.testing.expectEqualStrings("", result.stderr);
 }
