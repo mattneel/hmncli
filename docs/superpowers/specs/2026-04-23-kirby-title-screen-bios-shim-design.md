@@ -172,3 +172,10 @@ Immediate non-goals:
 - Advance Wars work in parallel
 - Emerald loader-limit work in parallel
 - generic BIOS completion beyond measured Kirby blockers
+
+## Post CpuSet Re-Probe
+
+- the old blocker `Unsupported SWI 0x00000B at 0x080CFA58 for gba` is cleared on a fresh local re-probe of `.zig-cache/local-commercial-roms/kirby-nightmare.gba`
+- the new first meaningful blocker line is `Unsupported opcode 0x00004700 at 0x08001A2E for armv4t`
+- the optional local `CpuSet` performance note remains deferred because `.zig-cache/commercial-probes/kirby-cpuset-native` was not emitted and the frontier is still build-time, so the bitcode/LTO question is not newly urgent from this slice
+- Kirby remains the named commercial target, and the next bring-up slice is chosen by the new measured blocker above rather than by pre-selecting later BIOS or parity work
