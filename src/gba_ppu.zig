@@ -22,6 +22,103 @@ fn expand5(value: u5) u8 {
     return (@as(u8, value) << 3) | (@as(u8, value) >> 2);
 }
 
+fn writePaletteColor(
+    rgba: *[rgba_len]u8,
+    palette: *const [1024]u8,
+    x: usize,
+    y: usize,
+    palette_index: usize,
+) void {
+    const color_offset = palette_index * 2;
+    const color = std.mem.readInt(u16, palette[color_offset..][0..2], .little);
+    const rgba_offset = ((y * frame_width) + x) * 4;
+    rgba[rgba_offset + 0] = expand5(@truncate(color & 0x1F));
+    rgba[rgba_offset + 1] = expand5(@truncate((color >> 5) & 0x1F));
+    rgba[rgba_offset + 2] = expand5(@truncate((color >> 10) & 0x1F));
+    rgba[rgba_offset + 3] = 255;
+}
+
+fn fillBackdrop(
+    palette: *const [1024]u8,
+    rgba: *[rgba_len]u8,
+) void {
+    for (0..frame_height) |y| {
+        for (0..frame_width) |x| {
+            writePaletteColor(rgba, palette, x, y, 0);
+        }
+    }
+}
+
+fn tilePixel4bpp(
+    vram: *const [98304]u8,
+    charblock: usize,
+    tile_id: u16,
+    x: usize,
+    y: usize,
+) u8 {
+    const tile_base = (charblock * 0x4000) + (@as(usize, tile_id) * 32);
+    const row_offset = tile_base + (y * 4) + (x / 2);
+    const packed_pixels = vram[row_offset];
+    return if ((x & 1) == 0) packed_pixels & 0x0F else packed_pixels >> 4;
+}
+
+fn renderRegularBg0(
+    io: *const [1024]u8,
+    palette: *const [1024]u8,
+    vram: *const [98304]u8,
+    rgba: *[rgba_len]u8,
+) void {
+    const bgcnt = std.mem.readInt(u16, io[8..10], .little);
+    const cbb: usize = @intCast((bgcnt >> 2) & 0x3);
+    const sbb: usize = @intCast((bgcnt >> 8) & 0x1F);
+    const hofs = std.mem.readInt(u16, io[16..18], .little) & 0x01FF;
+    const vofs = std.mem.readInt(u16, io[18..20], .little) & 0x01FF;
+
+    for (0..frame_height) |y| {
+        for (0..frame_width) |x| {
+            const bg_x = (x + hofs) & 0x01FF;
+            const bg_y = (y + vofs) & 0x01FF;
+            const tile_x = bg_x >> 3;
+            const tile_y = bg_y >> 3;
+            const entry_offset = ((tile_y & 31) * 32) + (tile_x & 31);
+            const entry_addr = (sbb * 0x800) + (entry_offset * 2);
+            const entry = std.mem.readInt(u16, vram[entry_addr..][0..2], .little);
+            const tile_id: u16 = @truncate(entry & 0x03FF);
+            const palbank: usize = @intCast((entry >> 12) & 0x0F);
+            const color_index = tilePixel4bpp(vram, cbb, tile_id, bg_x & 7, bg_y & 7);
+            if (color_index == 0) continue;
+            writePaletteColor(rgba, palette, x, y, (palbank * 16) + color_index);
+        }
+    }
+}
+
+fn dumpMode0Rgba(
+    io: *const [1024]u8,
+    palette: *const [1024]u8,
+    vram: *const [98304]u8,
+    rgba: *[rgba_len]u8,
+) void {
+    const dispcnt = std.mem.readInt(u16, io[0..2], .little);
+    fillBackdrop(palette, rgba);
+    if ((dispcnt & 0x0100) != 0) {
+        renderRegularBg0(io, palette, vram, rgba);
+    }
+}
+
+pub fn dumpFrameRgba(
+    io: *const [1024]u8,
+    palette: *const [1024]u8,
+    vram: *const [98304]u8,
+    rgba: *[rgba_len]u8,
+) FrameError!void {
+    const dispcnt = std.mem.readInt(u16, io[0..2], .little);
+    switch (dispcnt & 0x7) {
+        0 => dumpMode0Rgba(io, palette, vram, rgba),
+        4 => try dumpMode4Rgba(io, palette, vram, rgba),
+        else => return error.UnsupportedVideoMode,
+    }
+}
+
 pub fn dumpMode4Rgba(
     io: *const [1024]u8,
     palette: *const [1024]u8,
@@ -88,7 +185,7 @@ pub export fn hmgba_dump_frame_raw(
     const palette_bytes: *const [1024]u8 = @ptrCast(palette);
     const vram_bytes: *const [98304]u8 = @ptrCast(vram);
     var rgba: [rgba_len]u8 = undefined;
-    dumpMode4Rgba(io_bytes, palette_bytes, vram_bytes, &rgba) catch return dump_error_unsupported_video_mode;
+    dumpFrameRgba(io_bytes, palette_bytes, vram_bytes, &rgba) catch return dump_error_unsupported_video_mode;
 
     const file = fopen(output_path, "wb") orelse return dump_error_write_failed;
     defer _ = fclose(file);
@@ -124,6 +221,25 @@ test "mode4 renderer rejects unsupported display mode" {
 
     io[0] = 3;
     try std.testing.expectError(error.UnsupportedVideoMode, dumpMode4Rgba(&io, &palette, &vram, &rgba));
+}
+
+test "mode0 renderer decodes a regular 4bpp bg0 tilemap" {
+    var io: [1024]u8 = std.mem.zeroes([1024]u8);
+    var palette: [1024]u8 = std.mem.zeroes([1024]u8);
+    var vram: [98304]u8 = std.mem.zeroes([98304]u8);
+    var rgba: [rgba_len]u8 = undefined;
+
+    std.mem.writeInt(u16, io[0..2], 0x0100, .little); // mode 0 + BG0
+    std.mem.writeInt(u16, io[8..10], 0x0100, .little); // CBB0, SBB1, 4bpp
+    std.mem.writeInt(u16, vram[0x800..][0..2], 0x0000, .little); // tile 0
+    vram[0] = 0x10; // x=0 => color 0 backdrop, x=1 => color 1
+    std.mem.writeInt(u16, palette[0..2], 0x0000, .little);
+    std.mem.writeInt(u16, palette[2..4], 0x001F, .little);
+
+    try dumpFrameRgba(&io, &palette, &vram, &rgba);
+
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, rgba[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, rgba[4..8]);
 }
 
 test "gba keyinput helper replays comma-separated active-low samples" {

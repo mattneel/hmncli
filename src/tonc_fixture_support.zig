@@ -8,6 +8,23 @@ pub const Fixture = struct {
     sha256_hex: []const u8,
 };
 
+pub const PixelSample = struct {
+    x: usize,
+    y: usize,
+    expected: [4]u8,
+};
+
+pub const RunFrameOptions = struct {
+    max_instructions: u64 = 50_000,
+    keyinput_script: ?[]const u8 = null,
+};
+
+pub const sbb_reg_samples = [_]PixelSample{
+    .{ .x = 0, .y = 0, .expected = .{ 255, 0, 0, 255 } },
+    .{ .x = 120, .y = 80, .expected = .{ 0, 0, 0, 255 } },
+    .{ .x = 123, .y = 83, .expected = .{ 255, 0, 0, 255 } },
+};
+
 pub const fixtures = [_]Fixture{
     .{
         .name = "sbb_reg",

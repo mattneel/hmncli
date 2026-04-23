@@ -6,6 +6,7 @@ const frame_test_support = @import("frame_test_support.zig");
 const gba_loader = @import("gba_loader.zig");
 const llvm_codegen = @import("llvm_codegen.zig");
 const parse = @import("cli/parse.zig");
+const tonc_fixture_support = @import("tonc_fixture_support.zig");
 const gba_ppu_source = @embedFile("gba_ppu.zig");
 
 pub const BuildOptions = parse.BuildCommand;
@@ -2308,6 +2309,76 @@ fn buildFixtureCaptureOutput(
     };
 }
 
+fn buildFixtureNative(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    rom_path: []const u8,
+    output_name: []const u8,
+    output_mode: parse.OutputMode,
+    max_instructions: u64,
+) ![]u8 {
+    const fixture_bytes = try Io.Dir.cwd().readFileAlloc(
+        io,
+        rom_path,
+        allocator,
+        .limited(16 * 1024 * 1024),
+    );
+    defer allocator.free(fixture_bytes);
+
+    const rom_name = std.fs.path.basename(rom_path);
+    try dir.writeFile(io, .{ .sub_path = rom_name, .data = fixture_bytes });
+
+    const native_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ".zig-cache/tonc", output_name });
+    errdefer allocator.free(native_path);
+
+    var discard: Io.Writer.Allocating = .init(allocator);
+    defer discard.deinit();
+
+    try run(io, allocator, dir, &discard.writer, .{
+        .rom_path = rom_name,
+        .machine_name = "gba",
+        .target = "x86_64-linux",
+        .output_path = native_path,
+        .output_mode = output_mode,
+        .max_instructions = max_instructions,
+        .optimize = .release,
+    });
+    return native_path;
+}
+
+fn runFrameFixture(
+    io: std.Io,
+    dir: std.Io.Dir,
+    native_path: []const u8,
+    frame_name: []const u8,
+    options: tonc_fixture_support.RunFrameOptions,
+) !void {
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    try environ_map.put("HOMONCULI_OUTPUT_MODE", "frame_raw");
+    try environ_map.put("HOMONCULI_OUTPUT_PATH", frame_name);
+    const max_instructions = try std.fmt.allocPrint(std.testing.allocator, "{d}", .{options.max_instructions});
+    defer std.testing.allocator.free(max_instructions);
+    try environ_map.put("HOMONCULI_MAX_INSTRUCTIONS", max_instructions);
+    if (options.keyinput_script) |script| {
+        try environ_map.put("HOMONCULI_KEYINPUT_SCRIPT", script);
+    }
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{native_path},
+        .cwd = .{ .dir = dir },
+        .environ_map = &environ_map,
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+}
+
 fn writeThumbStartupBranchRom(
     dir: std.Io.Dir,
     io: std.Io,
@@ -3317,6 +3388,32 @@ test "tonc obj_demo main tail call is measured as no-fallthrough" {
         0x0800_039C,
         .{ .target = .{ .address = 0x0800_026C, .isa = .thumb } },
     ));
+}
+
+test "tonc sbb_reg frame smoke test" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const output_path = try buildFixtureNative(
+        std.testing.allocator,
+        io,
+        tmp.dir,
+        "tests/fixtures/real/tonc/sbb_reg.gba",
+        "sbb_reg-native",
+        .frame_raw,
+        500_000,
+    );
+    defer std.testing.allocator.free(output_path);
+
+    try runFrameFixture(io, tmp.dir, output_path, "sbb_reg.rgba", .{ .max_instructions = 500_000 });
+
+    const frame = try frame_test_support.readExactFrame(std.testing.allocator, io, tmp.dir, "sbb_reg.rgba");
+    defer std.testing.allocator.free(frame);
+
+    for (tonc_fixture_support.sbb_reg_samples) |sample| {
+        try frame_test_support.expectPixel(frame, sample.x, sample.y, sample.expected);
+    }
 }
 
 test "build reports a structured diagnostic for an unsupported opcode" {
