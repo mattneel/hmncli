@@ -2755,6 +2755,32 @@ fn writeCpuSetCopyRom(
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
+fn writeCpuSetCopyAutoProbeRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xE59F0010, // ldr r0, [pc, #0x10] ; source
+        0xE59F1010, // ldr r1, [pc, #0x10] ; dest
+        0xE59F2010, // ldr r2, [pc, #0x10] ; control
+        0xEF000006, // swi 0x06 (Div) as a supported stand-in
+        0xE5910004, // ldr r0, [r1, #4]
+        0xE12FFF1E, // bx lr
+        0x08000024, // source literal
+        0x03000000, // dest literal
+        0x04000002, // two 32-bit units, copy mode
+        42, // source word 0
+        99, // source word 1
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
 test "build emits a native executable for the first gba mov-plus-div slice" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3857,13 +3883,13 @@ test "minimal vblank fixture turns the signal pixel green" {
         )
     else
         try buildFixtureNative(
-        std.testing.allocator,
-        io,
-        tmp.dir,
-        interrupt_fixture_support.minimal_vblank.rom_path,
-        "frame-irq-native",
-        .frame_raw,
-        interrupt_fixture_support.minimal_vblank.max_instructions,
+            std.testing.allocator,
+            io,
+            tmp.dir,
+            interrupt_fixture_support.minimal_vblank.rom_path,
+            "frame-irq-native",
+            .frame_raw,
+            interrupt_fixture_support.minimal_vblank.max_instructions,
         );
     defer std.testing.allocator.free(native_path);
 
@@ -3901,13 +3927,13 @@ test "minimal vblank model rejects non-vblank IE bits" {
         try buildFixtureNativeViaCli(std.testing.allocator, io, &tmp, "ie-bad.gba", "ie-bad-native", .retired_count, 500_000)
     else
         try buildFixtureNative(
-        std.testing.allocator,
-        io,
-        tmp.dir,
-        "ie-bad.gba",
-        "ie-bad-native",
-        .retired_count,
-        500_000,
+            std.testing.allocator,
+            io,
+            tmp.dir,
+            "ie-bad.gba",
+            "ie-bad-native",
+            .retired_count,
+            500_000,
         );
     defer std.testing.allocator.free(native_path);
 
@@ -3936,13 +3962,13 @@ test "minimal vblank model rejects IME re-enable inside a handler" {
         try buildFixtureNativeViaCli(std.testing.allocator, io, &tmp, "nested-ime.gba", "nested-ime-native", .retired_count, 500_000)
     else
         try buildFixtureNative(
-        std.testing.allocator,
-        io,
-        tmp.dir,
-        "nested-ime.gba",
-        "nested-ime-native",
-        .retired_count,
-        500_000,
+            std.testing.allocator,
+            io,
+            tmp.dir,
+            "nested-ime.gba",
+            "nested-ime-native",
+            .retired_count,
+            500_000,
         );
     defer std.testing.allocator.free(native_path);
 
@@ -3985,13 +4011,13 @@ test "minimal vblank model rejects byte writes to interrupt MMIO" {
             try buildFixtureNativeViaCli(std.testing.allocator, io, &tmp, case.rom_path, case.native_path, .retired_count, 500_000)
         else
             try buildFixtureNative(
-            std.testing.allocator,
-            io,
-            tmp.dir,
-            case.rom_path,
-            case.native_path,
-            .retired_count,
-            500_000,
+                std.testing.allocator,
+                io,
+                tmp.dir,
+                case.rom_path,
+                case.native_path,
+                .retired_count,
+                500_000,
             );
         defer std.testing.allocator.free(native_path);
 
@@ -4712,6 +4738,25 @@ test "build retired counts do not overcount when a block stops mid-execution" {
     try std.testing.expectEqualStrings("retired=2\n", result.stdout);
 }
 
+test "CpuSet copy fixture shape still defaults to register_r0_decimal under auto" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeCpuSetCopyAutoProbeRom(tmp.dir, io, "cpuset-copy-auto-probe.gba");
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "cpuset-copy-auto-probe.gba");
+    defer image.deinit(std.testing.allocator);
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const program = try liftRom(std.testing.allocator, &output.writer, image);
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(llvm_codegen.OutputMode.register_r0_decimal, program.output_mode);
+}
+
 test "build executes CpuSet copy semantics on a synthetic ROM" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -4722,31 +4767,20 @@ test "build executes CpuSet copy semantics on a synthetic ROM" {
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
 
-    const options = BuildOptions{
-        .rom_path = "cpuset-copy.gba",
-        .machine_name = "gba",
-        .target = "x86_64-linux",
-        .output_path = "cpuset-copy-native",
-        .output_mode = .auto,
-        .optimize = .release,
-    };
-
-    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, options.machine_name, options.rom_path);
-    defer image.deinit(std.testing.allocator);
-
-    var program = try liftRom(std.testing.allocator, &output.writer, image);
-    defer program.deinit(std.testing.allocator);
-    program.output_mode = .register_r0_decimal;
-
-    try ensureParentDir(io, tmp.dir, options.output_path);
-    const llvm_path = try llvmPath(std.testing.allocator, options.output_path);
-    defer std.testing.allocator.free(llvm_path);
-    try ensureParentDir(io, tmp.dir, llvm_path);
-    try writeLlvmFile(io, std.testing.allocator, tmp.dir, llvm_path, program);
-    const runtime_helper_obj = try compileRuntimeHelper(io, std.testing.allocator, tmp.dir, &output.writer, options);
-    defer if (runtime_helper_obj) |helper_path| std.testing.allocator.free(helper_path);
-    try compileLlvm(io, std.testing.allocator, tmp.dir, &output.writer, llvm_path, runtime_helper_obj, options);
-    try output.writer.print("Built {s}\n", .{options.output_path});
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "cpuset-copy.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "cpuset-copy-native",
+            .output_mode = .auto,
+            .optimize = .release,
+        },
+    );
 
     const result = try std.process.run(std.testing.allocator, io, .{
         .argv = &.{"./cpuset-copy-native"},
