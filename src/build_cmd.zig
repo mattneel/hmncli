@@ -2950,6 +2950,59 @@ test "arm startup bx r1 literal target resolves the measured commercial handoff 
     }
 }
 
+test "arm startup bx r1 literal resolver rejects near-miss shapes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cases = [_]struct {
+        name: []const u8,
+        load_word: u32,
+        middle_word: u32,
+        literal: u32,
+    }{
+        .{
+            .name = "even-target",
+            .load_word = 0xE59F1004,
+            .middle_word = 0xE1A0E00F,
+            .literal = 0x0800_0010,
+        },
+        .{
+            .name = "missing-mov-lr-pc",
+            .load_word = 0xE59F1004,
+            .middle_word = 0xE1A00000,
+            .literal = 0x0800_0011,
+        },
+        .{
+            .name = "non-pc-load-base",
+            .load_word = 0xE5911004,
+            .middle_word = 0xE1A0E00F,
+            .literal = 0x0800_0011,
+        },
+    };
+
+    for (cases, 0..) |case, index| {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "arm-startup-bx-r1-near-miss-{d}.gba", .{index});
+        defer std.testing.allocator.free(path);
+
+        var rom: [24]u8 = std.mem.zeroes([24]u8);
+        std.mem.writeInt(u32, rom[0..4], case.load_word, .little);
+        std.mem.writeInt(u32, rom[4..8], case.middle_word, .little);
+        std.mem.writeInt(u32, rom[8..12], 0xE12FFF11, .little);
+        std.mem.writeInt(u32, rom[12..16], case.literal, .little);
+        std.mem.writeInt(u16, rom[16..18], 0x4770, .little);
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+
+        const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", path);
+        defer image.deinit(std.testing.allocator);
+
+        try std.testing.expectError(
+            error.UnsupportedOpcode,
+            resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .arm }, 0x0800_0008, 1),
+        );
+    }
+}
+
 test "devkitARM crt0 startup blx r3 veneer rejects boundary mismatches" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
