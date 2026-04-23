@@ -30,6 +30,15 @@ pub const obj_demo_samples = [_]PixelSample{
     .{ .x = 123, .y = 40, .expected = .{ 0, 66, 0, 255 } },
 };
 
+pub const key_demo_hold_a_script =
+    "03fe,03fe,03fe,03fe,03fe,03fe,03fe,03fe," ++
+    "03fe,03fe,03fe,03fe,03fe,03fe,03fe,03fe";
+
+pub const key_demo_samples = [_]PixelSample{
+    .{ .x = 201, .y = 62, .expected = .{ 0, 255, 0, 255 } },
+    .{ .x = 184, .y = 68, .expected = .{ 222, 222, 239, 255 } },
+};
+
 pub const fixtures = [_]Fixture{
     .{
         .name = "sbb_reg",

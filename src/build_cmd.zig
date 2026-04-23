@@ -3442,6 +3442,35 @@ test "tonc obj_demo frame smoke test" {
     }
 }
 
+test "tonc key_demo frame smoke test" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const output_path = try buildFixtureNative(
+        std.testing.allocator,
+        io,
+        tmp.dir,
+        "tests/fixtures/real/tonc/key_demo.gba",
+        "key_demo-native",
+        .frame_raw,
+        500_000,
+    );
+    defer std.testing.allocator.free(output_path);
+
+    try runFrameFixture(io, tmp.dir, output_path, "key_demo.rgba", .{
+        .max_instructions = 500_000,
+        .keyinput_script = tonc_fixture_support.key_demo_hold_a_script,
+    });
+
+    const frame = try frame_test_support.readExactFrame(std.testing.allocator, io, tmp.dir, "key_demo.rgba");
+    defer std.testing.allocator.free(frame);
+
+    for (tonc_fixture_support.key_demo_samples) |sample| {
+        try frame_test_support.expectPixel(frame, sample.x, sample.y, sample.expected);
+    }
+}
+
 test "build reports a structured diagnostic for an unsupported opcode" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

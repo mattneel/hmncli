@@ -15,7 +15,7 @@
 - The fixtures now diverge on their next blockers:
   - `sbb_reg`: bring-up green at the measured `frame_raw` stop of `500000` retired guest instructions
   - `obj_demo`: bring-up green at the measured `frame_raw` stop of `500000` retired guest instructions
-  - `key_demo`: no remaining build-time blocker in this ledger; bring-up now depends on deterministic input plus smoke validation
+  - `key_demo`: bring-up green at the measured held-input `frame_raw` stop of `500000` retired guest instructions
   - `irq_demo`: `Unsupported opcode 0x00004718 at 0x08003078 for armv4t`
 
 ## Scope Decisions
