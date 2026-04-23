@@ -135,6 +135,6 @@ Non-goals:
 ## Post `pop {r0}; bx r0` Re-Probe
 
 - the old shared `Unsupported opcode 0x00004700 ...` blocker is cleared in both Advance Wars and Kirby
-- `Advance Wars (USA) (Rev 1)` now fails first on `Unsupported opcode 0x00004708 at 0x0807B450 for armv4t`
-- `Kirby - Nightmare in Dream Land (USA)` now fails first on `Unsupported SWI 0x00000C at 0x080CFA54 for gba`
+- `Unsupported opcode 0x00004708 at 0x0807B450 for armv4t`
+- `Unsupported SWI 0x00000C at 0x080CFA54 for gba`
 - the next slice decision returns to Kirby specifically because the two post-slice blockers diverge rather than exposing another shared prerequisite
