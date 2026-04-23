@@ -874,10 +874,30 @@ fn thumbEntrySavedRegsMask(
     switch (entry.instruction) {
         .movs_imm => |mov| {
             // Exact carve-out for the measured `sbb_reg` prologue:
-            // `movs r2, #0` before the existing literal-load prefix.
+            // `movs r2, #0` + one literal load + `push {r4, lr}`.
             if (entry.size_bytes != 2) return null;
             if (mov.rd != 2 or mov.imm != 0) return null;
-            address += entry.size_bytes;
+
+            const first = decodeImageInstructionUnchecked(image, .thumb, address + entry.size_bytes) catch return null;
+            const first_load = switch (first.instruction) {
+                .ldr_word_imm => |load| load,
+                else => return null,
+            };
+            if (first.size_bytes != 2) return null;
+            if (first_load.base != 15 or first_load.rd >= 8) return null;
+
+            address += entry.size_bytes + first.size_bytes;
+            const push = decodeImageInstructionUnchecked(image, .thumb, address) catch return null;
+            if (push.size_bytes != 2) return null;
+            const push_mask = switch (push.instruction) {
+                .push => |mask| mask,
+                else => return null,
+            };
+            const saved_mask = push_mask & 0x00FF;
+            if ((push_mask & (@as(u16, 1) << 14)) == 0) return null;
+            if ((push_mask & ~@as(u16, 0x40FF)) != 0) return null;
+            if (saved_mask == 0) return null;
+            return saved_mask;
         },
         else => {},
     }
@@ -2525,24 +2545,20 @@ test "thumb saved-lr return epilogue allows the exact sbb_reg prologue" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var rom: [20]u8 = .{
+    var rom: [12]u8 = .{
         0x00, 0x22,
         0x23, 0x4B,
-        0x24, 0x4A,
         0x30, 0xB5,
         0x30, 0xBC,
         0x01, 0xBC,
         0x00, 0x47,
-        0x00, 0x00,
-        0x00, 0x00,
-        0x00, 0x00,
     };
     try tmp.dir.writeFile(io, .{ .sub_path = "thumb-pop-bx-return-multi-save-prefix.gba", .data = &rom });
 
     const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-bx-return-multi-save-prefix.gba");
     defer image.deinit(std.testing.allocator);
 
-    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_000C, 0);
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_000A, 0);
     try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
 }
 
@@ -2554,16 +2570,32 @@ test "thumb saved-lr return witness is anchored at function entry" {
     const cases = [_]struct {
         rom_bytes: []const u8,
         function_entry: armv4t_decode.CodeAddress,
+        bx_address: u32,
         expect_ok: bool,
     }{
         .{
             .rom_bytes = &.{ 0x10, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
             .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
+            .bx_address = 0x0800_0006,
             .expect_ok = true,
         },
         .{
             .rom_bytes = &.{ 0x30, 0xB5, 0x30, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
             .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
+            .bx_address = 0x0800_0006,
+            .expect_ok = true,
+        },
+        .{
+            .rom_bytes = &.{
+                0x00, 0x22,
+                0x23, 0x4B,
+                0x30, 0xB5,
+                0x30, 0xBC,
+                0x01, 0xBC,
+                0x00, 0x47,
+            },
+            .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
+            .bx_address = 0x0800_000A,
             .expect_ok = true,
         },
         .{
@@ -2576,25 +2608,40 @@ test "thumb saved-lr return witness is anchored at function entry" {
                 0x01, 0xBC,
                 0x00, 0x47,
                 0x00, 0x00,
-                0x00, 0x00,
+            },
+            .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
+            .bx_address = 0x0800_000C,
+            .expect_ok = false,
+        },
+        .{
+            .rom_bytes = &.{
+                0x00, 0x22,
+                0x30, 0xB5,
+                0x30, 0xBC,
+                0x01, 0xBC,
+                0x00, 0x47,
                 0x00, 0x00,
             },
             .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
-            .expect_ok = true,
+            .bx_address = 0x0800_0008,
+            .expect_ok = false,
         },
         .{
             .rom_bytes = &.{ 0x00, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
             .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
+            .bx_address = 0x0800_0006,
             .expect_ok = false,
         },
         .{
             .rom_bytes = &.{ 0x30, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
             .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
+            .bx_address = 0x0800_0006,
             .expect_ok = false,
         },
         .{
             .rom_bytes = &.{ 0x10, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
             .function_entry = .{ .address = 0x0800_0000, .isa = .arm },
+            .bx_address = 0x0800_0006,
             .expect_ok = false,
         },
         .{
@@ -2609,6 +2656,7 @@ test "thumb saved-lr return witness is anchored at function entry" {
                 0x00, 0x00,
             },
             .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
+            .bx_address = 0x0800_000A,
             .expect_ok = false,
         },
     };
@@ -2621,8 +2669,7 @@ test "thumb saved-lr return witness is anchored at function entry" {
         const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", path);
         defer image.deinit(std.testing.allocator);
 
-        const bx_address: u32 = if (case.rom_bytes.len > 16) 0x0800_000C else if (case.rom_bytes.len > 8) 0x0800_000A else 0x0800_0006;
-        const result = resolveBxTarget(image, case.function_entry, bx_address, 0);
+        const result = resolveBxTarget(image, case.function_entry, case.bx_address, 0);
         if (case.expect_ok) {
             try std.testing.expectEqualDeep(
                 armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} },
