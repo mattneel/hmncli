@@ -2821,11 +2821,10 @@ fn writeCpuSetBadControlRom(
         0xE59F100C, // ldr r1, [pc, #0x0C]
         0xE59F200C, // ldr r2, [pc, #0x0C]
         0xEF00000B, // swi 0x0B (CpuSet)
-        0xE12FFF1E, // bx lr
+        0xEAFFFFFE, // b . ; would spin until the instruction limit if stop_flag were ignored
         0x08000020,
         0x03000000,
         0x82000001, // reserved upper bit outside the supported CpuSet mask
-        1,
     };
 
     var rom: [words.len * 4]u8 = undefined;
@@ -4977,6 +4976,8 @@ test "CpuSet rejects unsupported control bits structurally" {
 
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Unsupported CpuSet control 0x82000001 for gba") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "retired=4\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "retired=500000\n") == null);
     try std.testing.expectEqualStrings("", result.stderr);
 }
 
