@@ -2739,12 +2739,13 @@ fn writeCpuSetCopyRom(
         0xE59F1010, // ldr r1, [pc, #0x10] ; dest
         0xE59F2010, // ldr r2, [pc, #0x10] ; control
         0xEF00000B, // swi 0x0B (CpuSet)
-        0xE5910000, // ldr r0, [r1]
+        0xE5910004, // ldr r0, [r1, #4]
         0xEF000000, // swi 0x00 (SoftReset)
         0x08000024, // source literal
         0x03000000, // dest literal
-        0x04000001, // one 32-bit unit, copy mode
-        42, // source word
+        0x04000002, // two 32-bit units, copy mode
+        42, // source word 0
+        99, // source word 1
     };
 
     var rom: [words.len * 4]u8 = undefined;
@@ -4721,20 +4722,31 @@ test "build executes CpuSet copy semantics on a synthetic ROM" {
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
 
-    try run(
-        io,
-        std.testing.allocator,
-        tmp.dir,
-        &output.writer,
-        .{
-            .rom_path = "cpuset-copy.gba",
-            .machine_name = "gba",
-            .target = "x86_64-linux",
-            .output_path = "cpuset-copy-native",
-            .output_mode = .auto,
-            .optimize = .release,
-        },
-    );
+    const options = BuildOptions{
+        .rom_path = "cpuset-copy.gba",
+        .machine_name = "gba",
+        .target = "x86_64-linux",
+        .output_path = "cpuset-copy-native",
+        .output_mode = .auto,
+        .optimize = .release,
+    };
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, options.machine_name, options.rom_path);
+    defer image.deinit(std.testing.allocator);
+
+    var program = try liftRom(std.testing.allocator, &output.writer, image);
+    defer program.deinit(std.testing.allocator);
+    program.output_mode = .register_r0_decimal;
+
+    try ensureParentDir(io, tmp.dir, options.output_path);
+    const llvm_path = try llvmPath(std.testing.allocator, options.output_path);
+    defer std.testing.allocator.free(llvm_path);
+    try ensureParentDir(io, tmp.dir, llvm_path);
+    try writeLlvmFile(io, std.testing.allocator, tmp.dir, llvm_path, program);
+    const runtime_helper_obj = try compileRuntimeHelper(io, std.testing.allocator, tmp.dir, &output.writer, options);
+    defer if (runtime_helper_obj) |helper_path| std.testing.allocator.free(helper_path);
+    try compileLlvm(io, std.testing.allocator, tmp.dir, &output.writer, llvm_path, runtime_helper_obj, options);
+    try output.writer.print("Built {s}\n", .{options.output_path});
 
     const result = try std.process.run(std.testing.allocator, io, .{
         .argv = &.{"./cpuset-copy-native"},
@@ -4746,6 +4758,6 @@ test "build executes CpuSet copy semantics on a synthetic ROM" {
     defer std.testing.allocator.free(result.stderr);
 
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqualStrings("99\n", result.stdout);
     try std.testing.expectEqualStrings("", result.stderr);
 }
