@@ -1025,6 +1025,17 @@ fn resolveBxTarget(
     if (isExactThumbPushLrPopR0BxR0ReturnEpilogue(image, function_entry, address, reg)) {
         return .{ .thumb_saved_lr_return = {} };
     }
+    if (function_entry.isa == .thumb and reg == 0) {
+        const entry = try decodeImageInstructionUnchecked(image, .thumb, function_entry.address);
+        const entry_is_push_lr = switch (entry.instruction) {
+            .push => |mask| mask == 0x4000,
+            else => false,
+        };
+        if (entry_is_push_lr) {
+            const previous = try previousInstruction(image, function_entry.isa, address);
+            if (previous.instruction != .pop) return error.UnsupportedOpcode;
+        }
+    }
     if (function_entry.isa == .arm and reg == 1) {
         if (try resolveMeasuredArmStartupBxR1LiteralTarget(image, function_entry, address)) |target| {
             return .{ .bx_target = target };
@@ -3971,6 +3982,49 @@ test "thumb push-lr pop-r4 pop-r0 bx-r0 rejects the local near-miss" {
         error.UnsupportedOpcode,
         resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0006, 0),
     );
+}
+
+test "thumb push-lr pop-r0 bx-r0 resolver rejects near-miss shapes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cases = [_]struct {
+        path: []const u8,
+        rom_bytes: []const u8,
+        bx_address: u32,
+        bx_reg: u4,
+    }{
+        .{
+            .path = "missing-push-lr.gba",
+            .rom_bytes = &.{ 0x00, 0x20, 0x01, 0xBC, 0x00, 0x47, 0x00, 0x20 },
+            .bx_address = 0x0800_0004,
+            .bx_reg = 0,
+        },
+        .{
+            .path = "pop-r1-bx-r1.gba",
+            .rom_bytes = &.{ 0x00, 0xB5, 0x02, 0xBC, 0x08, 0x47, 0x00, 0x20 },
+            .bx_address = 0x0800_0004,
+            .bx_reg = 1,
+        },
+        .{
+            .path = "extra-insn-before-bx.gba",
+            .rom_bytes = &.{ 0x00, 0xB5, 0x01, 0xBC, 0x00, 0x20, 0x00, 0x47 },
+            .bx_address = 0x0800_0006,
+            .bx_reg = 0,
+        },
+    };
+
+    for (cases) |case| {
+        try tmp.dir.writeFile(io, .{ .sub_path = case.path, .data = case.rom_bytes });
+        const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", case.path);
+        defer image.deinit(std.testing.allocator);
+
+        try std.testing.expectError(
+            error.UnsupportedOpcode,
+            resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, case.bx_address, case.bx_reg),
+        );
+    }
 }
 
 test "tonc fixture frontiers reflect the exact local thumb blx r3 veneer slice" {
