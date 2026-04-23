@@ -3810,15 +3810,26 @@ test "tonc sbb_reg frame parity test" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const output_path = try buildFixtureNative(
-        std.testing.allocator,
-        io,
-        tmp.dir,
-        "tests/fixtures/real/tonc/sbb_reg.gba",
-        "sbb_reg-native",
-        .frame_raw,
-        tonc_fixture_support.golden_fixtures[0].max_instructions,
-    );
+    const output_path = if (standalone_build_cmd_test)
+        try buildFixtureNativeViaCli(
+            std.testing.allocator,
+            io,
+            &tmp,
+            "tests/fixtures/real/tonc/sbb_reg.gba",
+            "sbb_reg-native",
+            .frame_raw,
+            tonc_fixture_support.golden_fixtures[0].max_instructions,
+        )
+    else
+        try buildFixtureNative(
+            std.testing.allocator,
+            io,
+            tmp.dir,
+            "tests/fixtures/real/tonc/sbb_reg.gba",
+            "sbb_reg-native",
+            .frame_raw,
+            tonc_fixture_support.golden_fixtures[0].max_instructions,
+        );
     defer std.testing.allocator.free(output_path);
 
     try runFrameFixture(io, tmp.dir, output_path, "sbb_reg.rgba", .{
@@ -3836,15 +3847,26 @@ test "tonc obj_demo frame parity test" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const output_path = try buildFixtureNative(
-        std.testing.allocator,
-        io,
-        tmp.dir,
-        "tests/fixtures/real/tonc/obj_demo.gba",
-        "obj_demo-native",
-        .frame_raw,
-        tonc_fixture_support.golden_fixtures[1].max_instructions,
-    );
+    const output_path = if (standalone_build_cmd_test)
+        try buildFixtureNativeViaCli(
+            std.testing.allocator,
+            io,
+            &tmp,
+            "tests/fixtures/real/tonc/obj_demo.gba",
+            "obj_demo-native",
+            .frame_raw,
+            tonc_fixture_support.golden_fixtures[1].max_instructions,
+        )
+    else
+        try buildFixtureNative(
+            std.testing.allocator,
+            io,
+            tmp.dir,
+            "tests/fixtures/real/tonc/obj_demo.gba",
+            "obj_demo-native",
+            .frame_raw,
+            tonc_fixture_support.golden_fixtures[1].max_instructions,
+        );
     defer std.testing.allocator.free(output_path);
 
     try runFrameFixture(io, tmp.dir, output_path, "obj_demo.rgba", .{
@@ -3862,15 +3884,26 @@ test "tonc key_demo frame parity test" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const output_path = try buildFixtureNative(
-        std.testing.allocator,
-        io,
-        tmp.dir,
-        "tests/fixtures/real/tonc/key_demo.gba",
-        "key_demo-native",
-        .frame_raw,
-        tonc_fixture_support.golden_fixtures[2].max_instructions,
-    );
+    const output_path = if (standalone_build_cmd_test)
+        try buildFixtureNativeViaCli(
+            std.testing.allocator,
+            io,
+            &tmp,
+            "tests/fixtures/real/tonc/key_demo.gba",
+            "key_demo-native",
+            .frame_raw,
+            tonc_fixture_support.golden_fixtures[2].max_instructions,
+        )
+    else
+        try buildFixtureNative(
+            std.testing.allocator,
+            io,
+            tmp.dir,
+            "tests/fixtures/real/tonc/key_demo.gba",
+            "key_demo-native",
+            .frame_raw,
+            tonc_fixture_support.golden_fixtures[2].max_instructions,
+        );
     defer std.testing.allocator.free(output_path);
 
     try runFrameFixture(io, tmp.dir, output_path, "key_demo.rgba", .{
