@@ -1022,6 +1022,9 @@ fn resolveBxTarget(
         // pop {return_reg}; bx return_reg`.
         return .{ .thumb_saved_lr_return = {} };
     }
+    if (isExactThumbPushLrPopR0BxR0ReturnEpilogue(image, function_entry, address, reg)) {
+        return .{ .thumb_saved_lr_return = {} };
+    }
     if (function_entry.isa == .arm and reg == 1) {
         if (try resolveMeasuredArmStartupBxR1LiteralTarget(image, function_entry, address)) |target| {
             return .{ .bx_target = target };
@@ -1098,6 +1101,39 @@ fn isExactThumbSavedLrInterworkingReturnEpilogue(
     // Keep this self-limiting: only the exact `push {saved_regs..., lr}`
     // prologue paired with `pop {saved_regs...}; pop {return_reg};
     // bx return_reg` is recognized as a return surface.
+    return true;
+}
+
+fn isExactThumbPushLrPopR0BxR0ReturnEpilogue(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+    address: u32,
+    reg: u4,
+) bool {
+    if (function_entry.isa != .thumb) return false;
+    if (reg != 0) return false;
+
+    const entry = decodeImageInstructionUnchecked(image, .thumb, function_entry.address) catch return false;
+    if (entry.size_bytes != 2) return false;
+    const push_mask = switch (entry.instruction) {
+        .push => |mask| mask,
+        else => return false,
+    };
+    if (push_mask != 0x4000) return false; // exact measured `push {lr}`
+
+    const previous = previousInstruction(image, .thumb, address) catch return false;
+    const pop_mask = switch (previous.instruction) {
+        .pop => |mask| mask,
+        else => return false,
+    };
+    if (pop_mask != 0x0001) return false; // exact measured `pop {r0}`
+
+    const prior = previousInstruction(image, .thumb, previous.address) catch return false;
+    switch (prior.instruction) {
+        .pop => return false,
+        else => {},
+    }
+
     return true;
 }
 
