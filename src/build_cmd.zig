@@ -6,6 +6,7 @@ const frame_test_support = @import("frame_test_support.zig");
 const gba_loader = @import("gba_loader.zig");
 const llvm_codegen = @import("llvm_codegen.zig");
 const parse = @import("cli/parse.zig");
+const interrupt_fixture_support = @import("interrupt_fixture_support.zig");
 const tonc_fixture_support = @import("tonc_fixture_support.zig");
 const gba_ppu_source = @embedFile("gba_ppu.zig");
 
@@ -2269,18 +2270,30 @@ const FixtureBuildResult = struct {
     stderr: []u8,
 };
 
+fn readFixtureBytes(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    rom_path: []const u8,
+) ![]u8 {
+    return dir.readFileAlloc(io, rom_path, allocator, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => Io.Dir.cwd().readFileAlloc(
+            io,
+            rom_path,
+            allocator,
+            .limited(16 * 1024 * 1024),
+        ),
+        else => err,
+    };
+}
+
 fn buildFixtureCaptureOutput(
     allocator: std.mem.Allocator,
     io: std.Io,
     dir: std.Io.Dir,
     rom_path: []const u8,
 ) !FixtureBuildResult {
-    const fixture_bytes = try Io.Dir.cwd().readFileAlloc(
-        io,
-        rom_path,
-        allocator,
-        .limited(16 * 1024 * 1024),
-    );
+    const fixture_bytes = try readFixtureBytes(allocator, io, dir, rom_path);
     defer allocator.free(fixture_bytes);
 
     const rom_name = std.fs.path.basename(rom_path);
@@ -2318,12 +2331,7 @@ fn buildFixtureNative(
     output_mode: parse.OutputMode,
     max_instructions: u64,
 ) ![]u8 {
-    const fixture_bytes = try Io.Dir.cwd().readFileAlloc(
-        io,
-        rom_path,
-        allocator,
-        .limited(16 * 1024 * 1024),
-    );
+    const fixture_bytes = try readFixtureBytes(allocator, io, dir, rom_path);
     defer allocator.free(fixture_bytes);
 
     const rom_name = std.fs.path.basename(rom_path);
@@ -2377,6 +2385,46 @@ fn runFrameFixture(
     defer std.testing.allocator.free(result.stderr);
 
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+}
+
+const NativeRunResult = struct {
+    stdout: []u8,
+    stderr: []u8,
+    term: std.process.Child.Term,
+};
+
+fn runNativeCapture(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    native_path: []const u8,
+    output_mode: ?[]const u8,
+    max_instructions: ?u64,
+) !NativeRunResult {
+    var environ_map = std.process.Environ.Map.init(allocator);
+    errdefer environ_map.deinit();
+
+    if (output_mode) |mode| try environ_map.put("HOMONCULI_OUTPUT_MODE", mode);
+    if (max_instructions) |limit| {
+        const rendered = try std.fmt.allocPrint(allocator, "{d}", .{limit});
+        defer allocator.free(rendered);
+        try environ_map.put("HOMONCULI_MAX_INSTRUCTIONS", rendered);
+    }
+
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{native_path},
+        .cwd = .{ .dir = dir },
+        .environ_map = &environ_map,
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    environ_map.deinit();
+
+    return .{
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+        .term = result.term,
+    };
 }
 
 fn expectToncGoldenFrame(
@@ -2441,6 +2489,71 @@ fn writeKeyinputReplayRom(
         0xE1800003, // orr r0, r0, r3
         0xEF000000, // swi 0x00
         0x04000130, // KEYINPUT
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
+fn writeNonVBlankIeRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xE59F0008, // ldr r0, [pc, #8]
+        0xE3A01002, // mov r1, #2
+        0xE1C010B0, // strh r1, [r0]
+        0xEF000000, // swi 0x00
+        0x04000200, // IE
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
+fn writeNestedImeRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xEB00000D,
+        0xE59F0054,
+        0xE59F1054,
+        0xE5801000,
+        0xE59F0050,
+        0xE3A01008,
+        0xE1C010B0,
+        0xE59F0048,
+        0xE3A01001,
+        0xE1C010B0,
+        0xE59F0040,
+        0xE3A01001,
+        0xE1C010B0,
+        0xEF000005,
+        0xEAFFFFFD,
+        0xE92D4003,
+        0xE59F0028,
+        0xE3A01001,
+        0xE1C010B0,
+        0xE59F0020,
+        0xE3A01001,
+        0xE1C010B0,
+        0xE8BD4003,
+        0xE12FFF1E,
+        0x03007FFC,
+        0x0800003C,
+        0x04000004,
+        0x04000200,
+        0x04000208,
+        0x04000202,
     };
 
     var rom: [words.len * 4]u8 = undefined;
@@ -2833,7 +2946,6 @@ test "local thumb blx r3 veneer rejects near misses" {
             ),
         );
     }
-
 }
 
 test "local thumb blx r3 veneer matcher reports the measured tonc blockers" {
@@ -3414,6 +3526,85 @@ test "tonc obj_demo main tail call is measured as no-fallthrough" {
         0x0800_039C,
         .{ .target = .{ .address = 0x0800_026C, .isa = .thumb } },
     ));
+}
+
+test "minimal vblank fixture turns the signal pixel green" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const native_path = try buildFixtureNative(
+        std.testing.allocator,
+        io,
+        tmp.dir,
+        interrupt_fixture_support.minimal_vblank.rom_path,
+        "frame-irq-native",
+        .frame_raw,
+        interrupt_fixture_support.minimal_vblank.max_instructions,
+    );
+    defer std.testing.allocator.free(native_path);
+
+    try runFrameFixture(io, tmp.dir, native_path, "frame_irq.rgba", .{
+        .max_instructions = interrupt_fixture_support.minimal_vblank.max_instructions,
+    });
+
+    const frame = try frame_test_support.readExactFrame(std.testing.allocator, io, tmp.dir, "frame_irq.rgba");
+    defer std.testing.allocator.free(frame);
+
+    try frame_test_support.expectPixel(
+        frame,
+        0,
+        0,
+        interrupt_fixture_support.minimal_vblank.signal_pixel,
+    );
+}
+
+test "minimal vblank model rejects non-vblank IE bits" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeNonVBlankIeRom(tmp.dir, io, "ie-bad.gba");
+    const native_path = try buildFixtureNative(
+        std.testing.allocator,
+        io,
+        tmp.dir,
+        "ie-bad.gba",
+        "ie-bad-native",
+        .retired_count,
+        500_000,
+    );
+    defer std.testing.allocator.free(native_path);
+
+    const result = try runNativeCapture(std.testing.allocator, io, tmp.dir, native_path, "retired_count", 500_000);
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Unsupported interrupt source mask 0x0002 at 0x04000200 for gba") != null);
+}
+
+test "minimal vblank model rejects IME re-enable inside a handler" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeNestedImeRom(tmp.dir, io, "nested-ime.gba");
+    const native_path = try buildFixtureNative(
+        std.testing.allocator,
+        io,
+        tmp.dir,
+        "nested-ime.gba",
+        "nested-ime-native",
+        .retired_count,
+        500_000,
+    );
+    defer std.testing.allocator.free(native_path);
+
+    const result = try runNativeCapture(std.testing.allocator, io, tmp.dir, native_path, "retired_count", 500_000);
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Unsupported nested IME enable at 0x04000208 for gba") != null);
 }
 
 test "tonc sbb_reg frame parity test" {
