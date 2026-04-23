@@ -2786,6 +2786,55 @@ fn writeCpuSetCopyAutoProbeRom(
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
+fn writeCpuSetFillRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xE59F0010, // ldr r0, [pc, #0x10] ; source
+        0xE59F1010, // ldr r1, [pc, #0x10] ; dest
+        0xE59F2010, // ldr r2, [pc, #0x10] ; control
+        0xEF00000B, // swi 0x0B (CpuSet)
+        0xE1D100B2, // ldrh r0, [r1, #2]
+        0xE12FFF1E, // bx lr
+        0x08000024, // source literal
+        0x03000000, // dest literal
+        0x01000002, // two 16-bit units, fill mode
+        7, // source halfword value in low bits
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
+fn writeCpuSetBadControlRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xE59F000C, // ldr r0, [pc, #0x0C]
+        0xE59F100C, // ldr r1, [pc, #0x0C]
+        0xE59F200C, // ldr r2, [pc, #0x0C]
+        0xEF00000B, // swi 0x0B (CpuSet)
+        0xE12FFF1E, // bx lr
+        0x08000020,
+        0x03000000,
+        0x82000001, // reserved upper bit outside the supported CpuSet mask
+        1,
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
 fn writeCpuSetWordAlignRom(
     dir: std.Io.Dir,
     io: std.Io,
@@ -4854,6 +4903,80 @@ test "build executes CpuSet copy semantics on a synthetic ROM" {
 
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("99\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "build executes CpuSet fill semantics on a synthetic ROM" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeCpuSetFillRom(tmp.dir, io, "cpuset-fill.gba");
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "cpuset-fill.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "cpuset-fill-native",
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./cpuset-fill-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("7\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "CpuSet rejects unsupported control bits structurally" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeCpuSetBadControlRom(tmp.dir, io, "cpuset-bad-control.gba");
+
+    const native_path = if (standalone_build_cmd_test)
+        try buildFixtureNativeViaCli(std.testing.allocator, io, &tmp, "cpuset-bad-control.gba", "cpuset-bad-control-native", .retired_count, 500_000)
+    else
+        try buildFixtureNative(
+            std.testing.allocator,
+            io,
+            tmp.dir,
+            "cpuset-bad-control.gba",
+            "cpuset-bad-control-native",
+            .retired_count,
+            500_000,
+        );
+    defer std.testing.allocator.free(native_path);
+
+    const result = try runNativeCapture(
+        std.testing.allocator,
+        io,
+        tmp.dir,
+        native_path,
+        "retired_count",
+        500_000,
+    );
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Unsupported CpuSet control 0x82000001 for gba") != null);
     try std.testing.expectEqualStrings("", result.stderr);
 }
 
