@@ -704,10 +704,15 @@ fn emitLoadHelper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
         "  %save_bank_load_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
         .{guest_state_flash_bank_field},
     );
+    try writer.print(
+        "  %dispstat_toggle_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+        .{guest_state_dispstat_toggle_field},
+    );
     try writer.print("  %bios_hit = icmp ult i32 %addr, 16384\n", .{});
     try writer.print("  %save_hit_ge = icmp uge i32 %addr, {d}\n", .{save_region_base});
     try writer.print("  %save_hit_lt = icmp ult i32 %addr, {d}\n", .{save_region_end});
     try writer.print("  %save_hit = and i1 %save_hit_ge, %save_hit_lt\n", .{});
+    try writer.print("  %dispstat_hit = icmp eq i32 %addr, 67108868\n", .{});
     try writer.print("  br i1 %bios_hit, label %load_bios, label %check_rom\n", .{});
     try writer.print("load_bios:\n", .{});
     try writer.print("  %bios_value = load i32, ptr %bios_latch_ptr, align 4\n", .{});
@@ -749,7 +754,7 @@ fn emitLoadHelper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
         try writer.print("  %rom_offset = and i32 %rom_window_offset, 33554431\n", .{});
         try writer.print("  %rom_in_range = icmp ult i32 %rom_offset, {d}\n", .{rom_span});
         try writer.print("  %rom_hit = and i1 %rom_window_hit, %rom_in_range\n", .{});
-        try writer.print("  br i1 %rom_hit, label %load_rom, label %check_load_region_0\n", .{});
+        try writer.print("  br i1 %rom_hit, label %load_rom, label %check_dispstat\n", .{});
         try writer.print("load_rom:\n", .{});
         try writer.print(
             "  %rom_ptr = getelementptr inbounds [{d} x i8], ptr @rom_data, i32 0, i32 %rom_offset\n",
@@ -758,6 +763,22 @@ fn emitLoadHelper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
         try writer.print("  %rom_value = load i32, ptr %rom_ptr, align 1\n", .{});
         try writer.print("  ret i32 %rom_value\n", .{});
     }
+    try writer.print("check_dispstat:\n", .{});
+    try writer.print("  br i1 %dispstat_hit, label %load_dispstat, label %check_load_region_0\n", .{});
+    try writer.print("load_dispstat:\n", .{});
+    try writer.print(
+        "  %dispstat_ptr = getelementptr inbounds [1024 x i8], ptr %io_load_ptr, i32 0, i32 {d}\n",
+        .{io_dispstat_offset},
+    );
+    try writer.print("  %dispstat_raw = load i16, ptr %dispstat_ptr, align 1\n", .{});
+    try writer.print("  %dispstat_masked = and i16 %dispstat_raw, -2\n", .{});
+    try writer.print("  %dispstat_toggle = load i1, ptr %dispstat_toggle_ptr, align 1\n", .{});
+    try writer.print("  %dispstat_vblank = select i1 %dispstat_toggle, i16 1, i16 0\n", .{});
+    try writer.print("  %dispstat_value16 = or i16 %dispstat_masked, %dispstat_vblank\n", .{});
+    try writer.print("  %dispstat_next = xor i1 %dispstat_toggle, true\n", .{});
+    try writer.print("  store i1 %dispstat_next, ptr %dispstat_toggle_ptr, align 1\n", .{});
+    try writer.print("  %dispstat_value = zext i16 %dispstat_value16 to i32\n", .{});
+    try writer.print("  ret i32 %dispstat_value\n", .{});
 
     for (memory_regions, 0..) |region, index| {
         try writer.print("check_load_region_{d}:\n", .{index});

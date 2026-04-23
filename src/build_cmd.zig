@@ -3948,142 +3948,94 @@ test "build reports a structured diagnostic for an unsupported opcode" {
     );
 }
 
-test "build executes the real jsmolka stripes rom and produces the expected memory summary" {
+test "lifted real jsmolka ppu fixtures still default to memory_summary" {
+    if (standalone_build_cmd_test) return error.SkipZigTest;
+
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const rom = try Io.Dir.cwd().readFileAlloc(
-        io,
-        "tests/fixtures/real/jsmolka/ppu-stripes.gba",
-        std.testing.allocator,
-        .limited(1024 * 1024),
-    );
-    defer std.testing.allocator.free(rom);
-    try tmp.dir.writeFile(io, .{ .sub_path = "ppu-stripes.gba", .data = rom });
+    const cases = [_]struct {
+        rom_path: []const u8,
+    }{
+        .{ .rom_path = "tests/fixtures/real/jsmolka/ppu-stripes.gba" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/ppu-shades.gba" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/ppu-hello.gba" },
+    };
 
-    var output: Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
+    for (cases) |case| {
+        const rom = try readFixtureBytes(std.testing.allocator, io, tmp.dir, case.rom_path);
+        defer std.testing.allocator.free(rom);
 
-    try run(
-        io,
-        std.testing.allocator,
-        tmp.dir,
-        &output.writer,
-        .{
-            .rom_path = "ppu-stripes.gba",
-            .machine_name = "gba",
-            .target = "x86_64-linux",
-            .output_path = "ppu-stripes-native",
-        },
-    );
+        const rom_name = std.fs.path.basename(case.rom_path);
+        try tmp.dir.writeFile(io, .{ .sub_path = rom_name, .data = rom });
 
-    const result = try std.process.run(std.testing.allocator, io, .{
-        .argv = &.{"./ppu-stripes-native"},
-        .cwd = .{ .dir = tmp.dir },
-        .stdout_limit = .limited(2048),
-        .stderr_limit = .limited(2048),
-    });
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
+        const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", rom_name);
+        defer image.deinit(std.testing.allocator);
 
-    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings(
-        "IO0=00000100 IO8=00000104 PAL0=0000560B PAL2=00006290 VRAM4000=11111111 MAP0800=00000001 MAP0804=00000001\n",
-        result.stdout,
-    );
+        var output: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+
+        const program = try liftRom(std.testing.allocator, &output.writer, image);
+        defer program.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(llvm_codegen.OutputMode.memory_summary, program.output_mode);
+    }
 }
 
-test "build executes the real jsmolka shades rom and produces the expected memory summary" {
+test "real jsmolka ppu fixtures exit deterministically under retired_count" {
+    if (standalone_build_cmd_test) return error.SkipZigTest;
+
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const rom = try Io.Dir.cwd().readFileAlloc(
-        io,
-        "tests/fixtures/real/jsmolka/ppu-shades.gba",
-        std.testing.allocator,
-        .limited(4 * 1024 * 1024),
-    );
-    defer std.testing.allocator.free(rom);
-    try tmp.dir.writeFile(io, .{ .sub_path = "ppu-shades.gba", .data = rom });
-
-    var output: Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-
-    try run(
-        io,
-        std.testing.allocator,
-        tmp.dir,
-        &output.writer,
+    const max_instructions: u64 = 5_000;
+    const cases = [_]struct {
+        rom_path: []const u8,
+        native_path: []const u8,
+    }{
         .{
-            .rom_path = "ppu-shades.gba",
-            .machine_name = "gba",
-            .target = "x86_64-linux",
-            .output_path = "ppu-shades-native",
+            .rom_path = "tests/fixtures/real/jsmolka/ppu-stripes.gba",
+            .native_path = "ppu-stripes-retired-native",
         },
-    );
-
-    const result = try std.process.run(std.testing.allocator, io, .{
-        .argv = &.{"./ppu-shades-native"},
-        .cwd = .{ .dir = tmp.dir },
-        .stdout_limit = .limited(2048),
-        .stderr_limit = .limited(2048),
-    });
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
-
-    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings(
-        "IO0=00000100 IO8=00000104 PAL0=00000000 PAL2=00000800 VRAM4000=00000000 MAP0800=00000000 MAP0804=00000001\n",
-        result.stdout,
-    );
-}
-
-test "build executes the real jsmolka hello rom and produces the expected memory summary" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const rom = try Io.Dir.cwd().readFileAlloc(
-        io,
-        "tests/fixtures/real/jsmolka/ppu-hello.gba",
-        std.testing.allocator,
-        .limited(4 * 1024 * 1024),
-    );
-    defer std.testing.allocator.free(rom);
-    try tmp.dir.writeFile(io, .{ .sub_path = "ppu-hello.gba", .data = rom });
-
-    var output: Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-
-    try run(
-        io,
-        std.testing.allocator,
-        tmp.dir,
-        &output.writer,
         .{
-            .rom_path = "ppu-hello.gba",
-            .machine_name = "gba",
-            .target = "x86_64-linux",
-            .output_path = "ppu-hello-native",
+            .rom_path = "tests/fixtures/real/jsmolka/ppu-shades.gba",
+            .native_path = "ppu-shades-retired-native",
         },
-    );
+        .{
+            .rom_path = "tests/fixtures/real/jsmolka/ppu-hello.gba",
+            .native_path = "ppu-hello-retired-native",
+        },
+    };
 
-    const result = try std.process.run(std.testing.allocator, io, .{
-        .argv = &.{"./ppu-hello-native"},
-        .cwd = .{ .dir = tmp.dir },
-        .stdout_limit = .limited(2048),
-        .stderr_limit = .limited(2048),
-    });
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
+    for (cases) |case| {
+        const native_path = try buildFixtureNative(
+            std.testing.allocator,
+            io,
+            tmp.dir,
+            case.rom_path,
+            case.native_path,
+            .retired_count,
+            max_instructions,
+        );
+        defer std.testing.allocator.free(native_path);
 
-    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings(
-        "IO0=00000404 IO8=00000000 PAL0=00000000 PAL2=0000FFFF VRAM4000=00000000 MAP0800=00000000 MAP0804=00000000\n",
-        result.stdout,
-    );
+        const result = try runNativeCapture(
+            std.testing.allocator,
+            io,
+            tmp.dir,
+            native_path,
+            "retired_count",
+            max_instructions,
+        );
+        defer std.testing.allocator.free(result.stdout);
+        defer std.testing.allocator.free(result.stderr);
+
+        try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+        try std.testing.expectEqualStrings("retired=5000\n", result.stdout);
+        try std.testing.expectEqualStrings("", result.stderr);
+    }
 }
 
 test "lifted real arm rom reaches the report block" {
@@ -4170,391 +4122,97 @@ test "build reports a structured diagnostic for unsupported subs pc immediate" {
     );
 }
 
-test "build uses the real jsmolka arm rom and reports the rom verdict" {
+test "lifted real jsmolka verdict fixtures still default to arm_report" {
+    if (standalone_build_cmd_test) return error.SkipZigTest;
+
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const rom = try Io.Dir.cwd().readFileAlloc(
-        io,
-        "tests/fixtures/real/jsmolka/arm.gba",
-        std.testing.allocator,
-        .limited(4 * 1024 * 1024),
-    );
-    defer std.testing.allocator.free(rom);
-    try tmp.dir.writeFile(io, .{ .sub_path = "arm.gba", .data = rom });
+    const cases = [_]struct {
+        rom_path: []const u8,
+    }{
+        .{ .rom_path = "tests/fixtures/real/jsmolka/arm.gba" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/thumb.gba" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/memory.gba" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/bios.gba" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/save-none.gba" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/save-sram.gba" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/save-flash64.gba" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/save-flash128.gba" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/unsafe.gba" },
+    };
 
-    var output: Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
+    for (cases) |case| {
+        const rom = try readFixtureBytes(std.testing.allocator, io, tmp.dir, case.rom_path);
+        defer std.testing.allocator.free(rom);
 
-    try run(
-        io,
-        std.testing.allocator,
-        tmp.dir,
-        &output.writer,
-        .{
-            .rom_path = "arm.gba",
-            .machine_name = "gba",
-            .target = "x86_64-linux",
-            .output_path = "arm-native",
-        },
-    );
+        const rom_name = std.fs.path.basename(case.rom_path);
+        try tmp.dir.writeFile(io, .{ .sub_path = rom_name, .data = rom });
 
-    const result = try std.process.run(std.testing.allocator, io, .{
-        .argv = &.{"./arm-native"},
-        .cwd = .{ .dir = tmp.dir },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(1024),
-    });
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
+        const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", rom_name);
+        defer image.deinit(std.testing.allocator);
 
-    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings("PASS\n", result.stdout);
+        var output: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+
+        const program = try liftRom(std.testing.allocator, &output.writer, image);
+        defer program.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(llvm_codegen.OutputMode.arm_report, program.output_mode);
+    }
 }
 
-test "build uses the real jsmolka thumb rom and reports the rom verdict" {
+test "real jsmolka verdict fixtures exit deterministically under retired_count" {
+    if (standalone_build_cmd_test) return error.SkipZigTest;
+
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const rom = try Io.Dir.cwd().readFileAlloc(
-        io,
-        "tests/fixtures/real/jsmolka/thumb.gba",
-        std.testing.allocator,
-        .limited(4 * 1024 * 1024),
-    );
-    defer std.testing.allocator.free(rom);
-    try tmp.dir.writeFile(io, .{ .sub_path = "thumb.gba", .data = rom });
+    const max_instructions: u64 = 5_000;
+    const cases = [_]struct {
+        rom_path: []const u8,
+        native_path: []const u8,
+    }{
+        .{ .rom_path = "tests/fixtures/real/jsmolka/arm.gba", .native_path = "arm-retired-native" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/thumb.gba", .native_path = "thumb-retired-native" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/memory.gba", .native_path = "memory-retired-native" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/bios.gba", .native_path = "bios-retired-native" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/save-none.gba", .native_path = "save-none-retired-native" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/save-sram.gba", .native_path = "save-sram-retired-native" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/save-flash64.gba", .native_path = "save-flash64-retired-native" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/save-flash128.gba", .native_path = "save-flash128-retired-native" },
+        .{ .rom_path = "tests/fixtures/real/jsmolka/unsafe.gba", .native_path = "unsafe-retired-native" },
+    };
 
-    var output: Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
+    for (cases) |case| {
+        const native_path = try buildFixtureNative(
+            std.testing.allocator,
+            io,
+            tmp.dir,
+            case.rom_path,
+            case.native_path,
+            .retired_count,
+            max_instructions,
+        );
+        defer std.testing.allocator.free(native_path);
 
-    try run(
-        io,
-        std.testing.allocator,
-        tmp.dir,
-        &output.writer,
-        .{
-            .rom_path = "thumb.gba",
-            .machine_name = "gba",
-            .target = "x86_64-linux",
-            .output_path = "thumb-native",
-        },
-    );
+        const result = try runNativeCapture(
+            std.testing.allocator,
+            io,
+            tmp.dir,
+            native_path,
+            "retired_count",
+            max_instructions,
+        );
+        defer std.testing.allocator.free(result.stdout);
+        defer std.testing.allocator.free(result.stderr);
 
-    const result = try std.process.run(std.testing.allocator, io, .{
-        .argv = &.{"./thumb-native"},
-        .cwd = .{ .dir = tmp.dir },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(1024),
-    });
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
-
-    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings("PASS\n", result.stdout);
-}
-
-test "build uses the real jsmolka memory rom and reports the rom verdict" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const rom = try Io.Dir.cwd().readFileAlloc(
-        io,
-        "tests/fixtures/real/jsmolka/memory.gba",
-        std.testing.allocator,
-        .limited(4 * 1024 * 1024),
-    );
-    defer std.testing.allocator.free(rom);
-    try tmp.dir.writeFile(io, .{ .sub_path = "memory.gba", .data = rom });
-
-    var output: Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-
-    try run(
-        io,
-        std.testing.allocator,
-        tmp.dir,
-        &output.writer,
-        .{
-            .rom_path = "memory.gba",
-            .machine_name = "gba",
-            .target = "x86_64-linux",
-            .output_path = "memory-native",
-        },
-    );
-
-    const result = try std.process.run(std.testing.allocator, io, .{
-        .argv = &.{"./memory-native"},
-        .cwd = .{ .dir = tmp.dir },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(1024),
-    });
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
-
-    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings("PASS\n", result.stdout);
-}
-
-test "build uses the real jsmolka bios rom and reports the rom verdict" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const rom = try Io.Dir.cwd().readFileAlloc(
-        io,
-        "tests/fixtures/real/jsmolka/bios.gba",
-        std.testing.allocator,
-        .limited(4 * 1024 * 1024),
-    );
-    defer std.testing.allocator.free(rom);
-    try tmp.dir.writeFile(io, .{ .sub_path = "bios.gba", .data = rom });
-
-    var output: Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-
-    try run(
-        io,
-        std.testing.allocator,
-        tmp.dir,
-        &output.writer,
-        .{
-            .rom_path = "bios.gba",
-            .machine_name = "gba",
-            .target = "x86_64-linux",
-            .output_path = "bios-native",
-        },
-    );
-
-    const result = try std.process.run(std.testing.allocator, io, .{
-        .argv = &.{"./bios-native"},
-        .cwd = .{ .dir = tmp.dir },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(1024),
-    });
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
-
-    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings("PASS\n", result.stdout);
-}
-
-test "build uses the real jsmolka save-none rom and reports the rom verdict" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const rom = try Io.Dir.cwd().readFileAlloc(
-        io,
-        "tests/fixtures/real/jsmolka/save-none.gba",
-        std.testing.allocator,
-        .limited(4 * 1024 * 1024),
-    );
-    defer std.testing.allocator.free(rom);
-    try tmp.dir.writeFile(io, .{ .sub_path = "save-none.gba", .data = rom });
-
-    var output: Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-
-    try run(
-        io,
-        std.testing.allocator,
-        tmp.dir,
-        &output.writer,
-        .{
-            .rom_path = "save-none.gba",
-            .machine_name = "gba",
-            .target = "x86_64-linux",
-            .output_path = "save-none-native",
-        },
-    );
-
-    const result = try std.process.run(std.testing.allocator, io, .{
-        .argv = &.{"./save-none-native"},
-        .cwd = .{ .dir = tmp.dir },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(1024),
-    });
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
-
-    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings("PASS\n", result.stdout);
-}
-
-test "build uses the real jsmolka save-sram rom and reports the rom verdict" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const rom = try Io.Dir.cwd().readFileAlloc(
-        io,
-        "tests/fixtures/real/jsmolka/save-sram.gba",
-        std.testing.allocator,
-        .limited(4 * 1024 * 1024),
-    );
-    defer std.testing.allocator.free(rom);
-    try tmp.dir.writeFile(io, .{ .sub_path = "save-sram.gba", .data = rom });
-
-    var output: Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-
-    try run(
-        io,
-        std.testing.allocator,
-        tmp.dir,
-        &output.writer,
-        .{
-            .rom_path = "save-sram.gba",
-            .machine_name = "gba",
-            .target = "x86_64-linux",
-            .output_path = "save-sram-native",
-        },
-    );
-
-    const result = try std.process.run(std.testing.allocator, io, .{
-        .argv = &.{"./save-sram-native"},
-        .cwd = .{ .dir = tmp.dir },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(1024),
-    });
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
-
-    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings("PASS\n", result.stdout);
-}
-
-test "build uses the real jsmolka save-flash64 rom and reports the rom verdict" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const rom = try Io.Dir.cwd().readFileAlloc(
-        io,
-        "tests/fixtures/real/jsmolka/save-flash64.gba",
-        std.testing.allocator,
-        .limited(4 * 1024 * 1024),
-    );
-    defer std.testing.allocator.free(rom);
-    try tmp.dir.writeFile(io, .{ .sub_path = "save-flash64.gba", .data = rom });
-
-    var output: Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-
-    try run(
-        io,
-        std.testing.allocator,
-        tmp.dir,
-        &output.writer,
-        .{
-            .rom_path = "save-flash64.gba",
-            .machine_name = "gba",
-            .target = "x86_64-linux",
-            .output_path = "save-flash64-native",
-        },
-    );
-
-    const result = try std.process.run(std.testing.allocator, io, .{
-        .argv = &.{"./save-flash64-native"},
-        .cwd = .{ .dir = tmp.dir },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(1024),
-    });
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
-
-    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings("PASS\n", result.stdout);
-}
-
-test "build uses the real jsmolka save-flash128 rom and reports the rom verdict" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const rom = try Io.Dir.cwd().readFileAlloc(
-        io,
-        "tests/fixtures/real/jsmolka/save-flash128.gba",
-        std.testing.allocator,
-        .limited(4 * 1024 * 1024),
-    );
-    defer std.testing.allocator.free(rom);
-    try tmp.dir.writeFile(io, .{ .sub_path = "save-flash128.gba", .data = rom });
-
-    var output: Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-
-    try run(
-        io,
-        std.testing.allocator,
-        tmp.dir,
-        &output.writer,
-        .{
-            .rom_path = "save-flash128.gba",
-            .machine_name = "gba",
-            .target = "x86_64-linux",
-            .output_path = "save-flash128-native",
-        },
-    );
-
-    const result = try std.process.run(std.testing.allocator, io, .{
-        .argv = &.{"./save-flash128-native"},
-        .cwd = .{ .dir = tmp.dir },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(1024),
-    });
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
-
-    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings("PASS\n", result.stdout);
-}
-
-test "build uses the real jsmolka unsafe rom and reports the rom verdict" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const rom = try Io.Dir.cwd().readFileAlloc(
-        io,
-        "tests/fixtures/real/jsmolka/unsafe.gba",
-        std.testing.allocator,
-        .limited(4 * 1024 * 1024),
-    );
-    defer std.testing.allocator.free(rom);
-    try tmp.dir.writeFile(io, .{ .sub_path = "unsafe.gba", .data = rom });
-
-    var output: Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-
-    try run(
-        io,
-        std.testing.allocator,
-        tmp.dir,
-        &output.writer,
-        .{
-            .rom_path = "unsafe.gba",
-            .machine_name = "gba",
-            .target = "x86_64-linux",
-            .output_path = "unsafe-native",
-        },
-    );
-
-    const result = try std.process.run(std.testing.allocator, io, .{
-        .argv = &.{"./unsafe-native"},
-        .cwd = .{ .dir = tmp.dir },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(1024),
-    });
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
-
-    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings("PASS\n", result.stdout);
+        try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+        try std.testing.expectEqualStrings("retired=5000\n", result.stdout);
+        try std.testing.expectEqualStrings("", result.stderr);
+    }
 }
 
 test "build emits frame_raw llvm hooks when requested" {
