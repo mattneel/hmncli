@@ -992,6 +992,8 @@ fn resolveDecodedInstruction(
             decoded,
         .bl => |bl| if (try resolveExactLocalThumbBlxR3VeneerTarget(image, isa, address, bl.target.address)) |resolved_target|
             armv4t_decode.DecodedInstruction{ .bl = .{ .target = resolved_target } }
+        else if (try resolveExactObjDemoLocalThumbBlxR9VeneerTarget(image, isa, address, bl.target.address)) |resolved_target|
+            armv4t_decode.DecodedInstruction{ .bl = .{ .target = resolved_target } }
         else if (try resolveDevkitArmCrt0StartupThumbBlxR3Target(image, isa, address, bl.target.address)) |resolved_target|
             armv4t_decode.DecodedInstruction{ .bl = .{ .target = resolved_target } }
         else
@@ -1243,6 +1245,65 @@ fn resolveExactObjDemoLocalThumbBlxR3CallerTarget(
     if (ldr_r3.rd != 3 or ldr_r3.base != 15) return null;
 
     return resolveMeasuredLocalThumbBlxR3CallerLiteralTarget(image, ldr_r3_insn.address, ldr_r3);
+}
+
+fn resolveExactObjDemoLocalThumbBlxR9VeneerTarget(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    bl_address: u32,
+    target_address: u32,
+) BuildError!?armv4t_decode.CodeAddress {
+    if (isa != .thumb) return null;
+
+    const target = decodeImageInstructionUnchecked(image, .thumb, target_address) catch return null;
+    const bx = switch (target.instruction) {
+        .bx_reg => |bx| bx,
+        else => return null,
+    };
+    if (bx.reg != 9) return null;
+    if (!isMeasuredLocalThumbBlxR3VeneerNop(image, target_address + 2)) return null;
+
+    const store_insn = try previousInstruction(image, isa, bl_address);
+    const store = switch (store_insn.instruction) {
+        .store => |store| store,
+        else => return null,
+    };
+    if (store.src != 3 or store.base != 5 or store.size != .word) return null;
+    switch (store.addressing) {
+        .offset => |offset| switch (offset.offset) {
+            .imm => |imm| if (imm != 0 or offset.subtract) return null,
+            else => return null,
+        },
+        else => return null,
+    }
+
+    const lsls_r0_insn = try previousInstruction(image, isa, store_insn.address);
+    const lsls_r0 = switch (lsls_r0_insn.instruction) {
+        .lsls_imm => |shift| shift,
+        else => return null,
+    };
+    if (lsls_r0.rd != 0 or lsls_r0.rm != 0 or lsls_r0.imm != 19) return null;
+
+    const movs_r2_insn = try previousInstruction(image, isa, lsls_r0_insn.address);
+    const movs_r2 = switch (movs_r2_insn.instruction) {
+        .movs_imm => |mov| mov,
+        else => return null,
+    };
+    if (movs_r2.rd != 2 or movs_r2.imm != 2) return null;
+
+    const movs_r1_insn = try previousInstruction(image, isa, movs_r2_insn.address);
+    const movs_r1 = switch (movs_r1_insn.instruction) {
+        .movs_reg => |mov| mov,
+        else => return null,
+    };
+    if (movs_r1.rd != 1 or movs_r1.rm != 5) return null;
+
+    const literal_offset = romOffsetForAddress(image, target_address - 0x0C, .thumb) orelse return null;
+    if (literal_offset + 4 > image.bytes.len) return null;
+    const raw_target = armv4t_decode.readWord(image.bytes, literal_offset);
+    const code_target = normalizeCodeTarget(raw_target);
+    if (offsetForAddress(image, code_target.address, code_target.isa) == null) return null;
+    return code_target;
 }
 
 fn resolveExactKeyDemoLocalThumbBlxR3CallerTarget(
@@ -2693,6 +2754,7 @@ test "local thumb blx r3 veneer matcher reports the measured tonc blockers" {
             .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
             .local_occurrence = "Unsupported control flow target 0x030000A4 for gba",
             .expect_cleared = true,
+            .expect_failed = false,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
@@ -2825,6 +2887,12 @@ test "real tonc local bx r3 stubs resolve to their measured exact targets" {
             .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
             .bl_address = 0x0800_037A,
             .stub_address = 0x0800_03B8,
+            .expected_target = .{ .address = 0x0300_00A4, .isa = .arm },
+        },
+        .{
+            .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
+            .bl_address = 0x0800_0338,
+            .stub_address = 0x0800_035C,
             .expected_target = .{ .address = 0x0300_00A4, .isa = .arm },
         },
         .{
@@ -3165,8 +3233,9 @@ test "tonc fixture frontiers reflect the exact local thumb blx r3 veneer slice" 
         .{
             .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
             .old_blocker = "Unsupported control flow target 0x030000A4 for gba",
-            .next_blocker = "Unsupported opcode 0x00004748 at 0x0800035C for armv4t",
+            .next_blocker = null,
             .still_blocked_here = false,
+            .expect_failed = false,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
