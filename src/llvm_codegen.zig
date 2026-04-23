@@ -770,14 +770,13 @@ fn emitLoadHelper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
         "  %dispstat_ptr = getelementptr inbounds [1024 x i8], ptr %io_load_ptr, i32 0, i32 {d}\n",
         .{io_dispstat_offset},
     );
-    try writer.print("  %dispstat_raw = load i16, ptr %dispstat_ptr, align 1\n", .{});
-    try writer.print("  %dispstat_masked = and i16 %dispstat_raw, -2\n", .{});
+    try writer.print("  %dispstat_raw = load i32, ptr %dispstat_ptr, align 1\n", .{});
+    try writer.print("  %dispstat_masked = and i32 %dispstat_raw, -2\n", .{});
     try writer.print("  %dispstat_toggle = load i1, ptr %dispstat_toggle_ptr, align 1\n", .{});
-    try writer.print("  %dispstat_vblank = select i1 %dispstat_toggle, i16 1, i16 0\n", .{});
-    try writer.print("  %dispstat_value16 = or i16 %dispstat_masked, %dispstat_vblank\n", .{});
+    try writer.print("  %dispstat_vblank = select i1 %dispstat_toggle, i32 1, i32 0\n", .{});
+    try writer.print("  %dispstat_value = or i32 %dispstat_masked, %dispstat_vblank\n", .{});
     try writer.print("  %dispstat_next = xor i1 %dispstat_toggle, true\n", .{});
     try writer.print("  store i1 %dispstat_next, ptr %dispstat_toggle_ptr, align 1\n", .{});
-    try writer.print("  %dispstat_value = zext i16 %dispstat_value16 to i32\n", .{});
     try writer.print("  ret i32 %dispstat_value\n", .{});
 
     for (memory_regions, 0..) |region, index| {
@@ -4991,4 +4990,61 @@ test "minimal vblank interrupt MMIO helpers preserve handler IF acknowledgement"
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "call void @hmn_interrupt_fail_multi_if(ptr %state, i16 %irq_if)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "call void @hmn_call_guest(ptr %state, i32 %irq_vector)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "store i16 1, ptr %irq_if_ptr") == null);
+}
+
+test "dispstat load32 compatibility preserves the upper halfword" {
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const program = Program{
+        .entry = .{ .address = 0x08000000, .isa = .arm },
+        .rom_base_address = 0x08000000,
+        .rom_bytes = &.{},
+        .save_hardware = .none,
+        .functions = &.{
+            .{
+                .entry = .{ .address = 0x08000000, .isa = .arm },
+                .instructions = &.{
+                    .{ .address = 0x08000000, .condition = .al, .size_bytes = 4, .instruction = .{ .mov_imm = .{ .rd = 0, .imm = 0 } } },
+                },
+            },
+        },
+        .output_mode = .retired_count,
+        .instruction_limit = 4,
+    };
+    try emitModule(&output.writer, program);
+
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "%dispstat_raw = load i32, ptr %dispstat_ptr, align 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "%dispstat_masked = and i32 %dispstat_raw, -2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "%dispstat_vblank = select i1 %dispstat_toggle, i32 1, i32 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "%dispstat_value = or i32 %dispstat_masked, %dispstat_vblank") != null);
+}
+
+test "arm_report output emits PASS and FAIL formatters from r12" {
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const program = Program{
+        .entry = .{ .address = 0x08000000, .isa = .arm },
+        .rom_base_address = 0x08000000,
+        .rom_bytes = &.{},
+        .save_hardware = .none,
+        .functions = &.{
+            .{
+                .entry = .{ .address = 0x08000000, .isa = .arm },
+                .instructions = &.{
+                    .{ .address = 0x08000000, .condition = .al, .size_bytes = 4, .instruction = .{ .mov_imm = .{ .rd = 12, .imm = 0 } } },
+                },
+            },
+        },
+        .output_mode = .arm_report,
+        .instruction_limit = null,
+    };
+    try emitModule(&output.writer, program);
+
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "@.fmt_arm_pass") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "@.fmt_arm_fail") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "%arm_report_code = load i32, ptr %r12_ptr_done, align 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "call i32 (ptr, ...) @printf(ptr @.fmt_arm_pass)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "call i32 (ptr, ...) @printf(ptr @.fmt_arm_fail, i32 %arm_report_code)") != null);
 }
