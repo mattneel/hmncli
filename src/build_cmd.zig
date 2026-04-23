@@ -870,6 +870,18 @@ fn thumbEntrySavedRegsMask(
     if (function_entry.isa != .thumb) return null;
 
     var address = function_entry.address;
+    const entry = decodeImageInstructionUnchecked(image, .thumb, address) catch return null;
+    switch (entry.instruction) {
+        .movs_imm => |mov| {
+            // Exact carve-out for the measured `sbb_reg` prologue:
+            // `movs r2, #0` before the existing literal-load prefix.
+            if (entry.size_bytes != 2) return null;
+            if (mov.rd != 2 or mov.imm != 0) return null;
+            address += entry.size_bytes;
+        },
+        else => {},
+    }
+
     var literal_prefix_count: u2 = 0;
     while (true) {
         const decoded = decodeImageInstructionUnchecked(image, .thumb, address) catch return null;
@@ -2459,7 +2471,8 @@ test "local thumb blx r3 veneer matcher reports the measured tonc blockers" {
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/sbb_reg.gba",
-            .expect_cleared = true,
+            .local_occurrence = "Unsupported opcode 0x00004718 at 0x08000808 for armv4t",
+            .expect_cleared = false,
         },
     };
 
@@ -2507,12 +2520,13 @@ test "thumb saved-lr return epilogue resolves exact low-register multi-save shap
     try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
 }
 
-test "thumb saved-lr return epilogue allows the exact sbb_reg literal-load prefix" {
+test "thumb saved-lr return epilogue allows the exact sbb_reg prologue" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var rom: [16]u8 = .{
+    var rom: [20]u8 = .{
+        0x00, 0x22,
         0x23, 0x4B,
         0x24, 0x4A,
         0x30, 0xB5,
@@ -2521,13 +2535,14 @@ test "thumb saved-lr return epilogue allows the exact sbb_reg literal-load prefi
         0x00, 0x47,
         0x00, 0x00,
         0x00, 0x00,
+        0x00, 0x00,
     };
     try tmp.dir.writeFile(io, .{ .sub_path = "thumb-pop-bx-return-multi-save-prefix.gba", .data = &rom });
 
     const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-bx-return-multi-save-prefix.gba");
     defer image.deinit(std.testing.allocator);
 
-    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_000A, 0);
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_000C, 0);
     try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
 }
 
@@ -2553,12 +2568,14 @@ test "thumb saved-lr return witness is anchored at function entry" {
         },
         .{
             .rom_bytes = &.{
+                0x00, 0x22,
                 0x23, 0x4B,
                 0x24, 0x4A,
                 0x30, 0xB5,
                 0x30, 0xBC,
                 0x01, 0xBC,
                 0x00, 0x47,
+                0x00, 0x00,
                 0x00, 0x00,
                 0x00, 0x00,
             },
@@ -2604,7 +2621,7 @@ test "thumb saved-lr return witness is anchored at function entry" {
         const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", path);
         defer image.deinit(std.testing.allocator);
 
-        const bx_address: u32 = if (case.rom_bytes.len > 8) 0x0800_000A else 0x0800_0006;
+        const bx_address: u32 = if (case.rom_bytes.len > 16) 0x0800_000C else if (case.rom_bytes.len > 8) 0x0800_000A else 0x0800_0006;
         const result = resolveBxTarget(image, case.function_entry, bx_address, 0);
         if (case.expect_ok) {
             try std.testing.expectEqualDeep(
@@ -2713,7 +2730,7 @@ test "tonc fixture frontiers reflect the exact local thumb blx r3 veneer slice" 
         .{
             .rom_path = "tests/fixtures/real/tonc/sbb_reg.gba",
             .old_blocker = "Unsupported opcode 0x00004700 at 0x08000316 for armv4t",
-            .next_blocker = "Unsupported opcode 0x00004700 at 0x080004E8 for armv4t",
+            .next_blocker = "Unsupported opcode 0x00004718 at 0x08000808 for armv4t",
             .still_blocked_here = false,
         },
         .{
