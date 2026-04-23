@@ -1660,6 +1660,27 @@ fn writeSeparatedLocalThumbBlxR3VeneerRom(
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
+fn writeMeasuredThumbPopR0BxR0Rom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+    body: []const u16,
+) !void {
+    const rom_len = 2 + body.len * 2 + 4;
+    const rom = try std.testing.allocator.alloc(u8, rom_len);
+    defer std.testing.allocator.free(rom);
+    @memset(rom, 0);
+
+    std.mem.writeInt(u16, rom[0..2], 0xB500, .little); // push {lr}
+    for (body, 0..) |halfword, index| {
+        const start = 2 + index * 2;
+        std.mem.writeInt(u16, rom[start..][0..2], halfword, .little);
+    }
+    std.mem.writeInt(u16, rom[rom_len - 4 ..][0..2], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[rom_len - 2 ..][0..2], 0x4700, .little); // bx r0
+    try dir.writeFile(io, .{ .sub_path = path, .data = rom });
+}
+
 fn resolveStartupThumbBxR6TargetValue(
     image: gba_loader.RomImage,
     isa: armv4t_decode.InstructionSet,
@@ -3863,6 +3884,39 @@ test "thumb saved-lr return epilogue rejects local tail near-misses" {
                 try result,
             );
         }
+    }
+}
+
+test "thumb push-lr pop-r0 bx-r0 resolves the measured commercial return shape" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cases = [_]struct {
+        path: []const u8,
+        body: []const u16,
+    }{
+        .{
+            .path = "advance-wars-pop-r0-bx-r0.gba",
+            .body = &.{ 0x2000, 0x2001, 0x1C08 }, // harmless Thumb body
+        },
+        .{
+            .path = "kirby-pop-r0-bx-r0.gba",
+            .body = &.{ 0x2000, 0x3008, 0x2800, 0xD1FC, 0x2001 },
+        },
+    };
+
+    for (cases) |case| {
+        try writeMeasuredThumbPopR0BxR0Rom(tmp.dir, io, case.path, case.body);
+
+        const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", case.path);
+        defer image.deinit(std.testing.allocator);
+        const bx_address = 0x0800_0000 + 2 + @as(u32, @intCast(case.body.len * 2)) + 2;
+
+        try std.testing.expectEqualDeep(
+            armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} },
+            try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, bx_address, 0),
+        );
     }
 }
 
