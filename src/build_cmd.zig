@@ -1606,18 +1606,20 @@ fn writeMeasuredCommercialStartupBxR1LiteralRom(
     thumb_target_address: u32,
     thumb_halfword: u16,
 ) !void {
-    var rom: [1024]u8 = std.mem.zeroes([1024]u8);
     const literal_offset = startup_offset + 8 + literal_pc_offset;
     const thumb_target_offset = @as(usize, @intCast((thumb_target_address & ~@as(u32, 1)) - 0x0800_0000));
-    std.debug.assert(literal_offset + 4 <= rom.len);
-    std.debug.assert(thumb_target_offset + 2 <= rom.len);
+    const min_rom_len = @max(@as(usize, 1024), @max(literal_offset + 4, thumb_target_offset + 2));
+    const rom_len = (min_rom_len + 3) & ~@as(usize, 3);
+    const rom = try std.testing.allocator.alloc(u8, rom_len);
+    defer std.testing.allocator.free(rom);
+    @memset(rom, 0);
 
     std.mem.writeInt(u32, rom[startup_offset..][0..4], load_word, .little);
     std.mem.writeInt(u32, rom[startup_offset + 4 ..][0..4], 0xE1A0E00F, .little);
     std.mem.writeInt(u32, rom[startup_offset + 8 ..][0..4], 0xE12FFF11, .little);
     std.mem.writeInt(u32, rom[literal_offset..][0..4], literal, .little);
     std.mem.writeInt(u16, rom[thumb_target_offset..][0..2], thumb_halfword, .little);
-    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+    try dir.writeFile(io, .{ .sub_path = path, .data = rom });
 }
 
 fn writeLocalThumbBlxR3VeneerRom(
@@ -2886,6 +2888,7 @@ test "arm startup bx r1 literal target resolves the measured commercial handoff 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    // Both measured Kirby bx r1 handoffs live inside the base ARM startup entry routine.
     const cases = [_]struct {
         path: []const u8,
         startup_offset: usize,
@@ -2912,6 +2915,15 @@ test "arm startup bx r1 literal target resolves the measured commercial handoff 
             .literal = 0x0800_0121,
             .bx_address = 0x0800_00EC,
             .expected_target = .{ .address = 0x0800_0120, .isa = .thumb },
+        },
+        .{
+            .path = "kirby-startup-second-handoff.gba",
+            .startup_offset = 0xF0,
+            .load_word = 0xE59F1124,
+            .literal_pc_offset = 292,
+            .literal = 0x0800_7301,
+            .bx_address = 0x0800_00F8,
+            .expected_target = .{ .address = 0x0800_7300, .isa = .thumb },
         },
     };
 
