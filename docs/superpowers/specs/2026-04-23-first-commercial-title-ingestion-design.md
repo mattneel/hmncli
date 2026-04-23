@@ -109,12 +109,18 @@ Shared-slice result:
 Interpretation:
 
 - Advance Wars blocker disassembly is Thumb `pop {r0}; bx r0` tail/return shape at `0x0803885C-0x0803885E`, which implies new control-flow modeling work
-- Kirby blocker is BIOS `SWI 0x0B`, which fits the existing BIOS shim-expansion path; current supported SWIs already include `SoftReset`, `VBlankIntrWait`, `Div`, and `Sqrt`
+- at that re-probe point, Kirby blocker was BIOS `SWI 0x0B`, which fit the existing BIOS shim-expansion path; the then-supported SWIs were `SoftReset`, `VBlankIntrWait`, `Div`, and `Sqrt`
 
 Decision:
 
 - Kirby is the first named commercial stopping rule
 - the reason is smaller next-blocker surface, not title preference
+
+Current status after the completed Kirby `CpuSet` slice:
+
+- `CpuSet` is now implemented in the public GBA shim surface
+- Kirby's current first meaningful blocker is `Unsupported opcode 0x00004700 at 0x08001A2E for armv4t`
+- the next commercial bring-up slice is therefore no longer BIOS-shim expansion by default; it is chosen from this new measured blocker
 
 ## Local-Only Commercial ROM Policy
 
@@ -170,7 +176,7 @@ Process rules:
 
 Standing regression invariant:
 
-- all existing `226/226` tests remain green throughout the shared prerequisite slice and every later commercial-title slice
+- all existing public tests remain green throughout the shared prerequisite slice and every later commercial-title slice
 - tonc parity, synthetic VBlank, ppu fixtures, and prior real-ROM validation remain hard-stop regressions
 
 Exit criteria for the shared commercial prerequisite slice:
