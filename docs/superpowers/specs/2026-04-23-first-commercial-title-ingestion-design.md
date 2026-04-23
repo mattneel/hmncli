@@ -90,6 +90,32 @@ Likely first named-title stopping rule:
 - not "audio works"
 - likely "builds and reaches a stable early visible frame" or equivalent measured checkpoint chosen after the re-probe
 
+## Post Shared-Prerequisite Re-Probe
+
+The post-slice re-probe was run locally against:
+
+- `.zig-cache/local-commercial-roms/advance-wars.gba`
+- `.zig-cache/local-commercial-roms/kirby-nightmare.gba`
+
+Measured first meaningful blocker lines:
+
+- Advance Wars: `Unsupported opcode 0x00004700 at 0x0803885E for armv4t`
+- Kirby: `Unsupported SWI 0x00000B at 0x080CFA58 for gba`
+
+Shared-slice result:
+
+- the old shared startup blocker is cleared for both titles
+
+Interpretation:
+
+- Advance Wars blocker disassembly is Thumb `pop {r0}; bx r0` tail/return shape at `0x0803885C-0x0803885E`, which implies new control-flow modeling work
+- Kirby blocker is BIOS `SWI 0x0B`, which fits the existing BIOS shim-expansion path; current supported SWIs already include `SoftReset`, `VBlankIntrWait`, `Div`, and `Sqrt`
+
+Decision:
+
+- Kirby is the first named commercial stopping rule
+- the reason is smaller next-blocker surface, not title preference
+
 ## Local-Only Commercial ROM Policy
 
 Commercial ROM handling becomes an explicit project rule starting with this milestone.
@@ -144,7 +170,7 @@ Process rules:
 
 Standing regression invariant:
 
-- all existing `224/224` tests remain green throughout the shared prerequisite slice and every later commercial-title slice
+- all existing `226/226` tests remain green throughout the shared prerequisite slice and every later commercial-title slice
 - tonc parity, synthetic VBlank, ppu fixtures, and prior real-ROM validation remain hard-stop regressions
 
 Exit criteria for the shared commercial prerequisite slice:
