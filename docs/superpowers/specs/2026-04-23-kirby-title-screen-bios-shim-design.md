@@ -13,7 +13,7 @@ Overall stopping rule:
 
 Immediate next slice:
 
-- Kirby no longer fails first on `Unsupported SWI 0x00000B at 0x080CFA58 for gba`
+- the first bring-up slice no longer fails first on `Unsupported SWI 0x00000B at 0x080CFA58 for gba`
 - the next first blocker is re-measured and recorded before any further Kirby scope is chosen
 
 Why this shape:
@@ -21,7 +21,7 @@ Why this shape:
 - title-screen parity is a binary commercial milestone
 - Kirby's current frontier is BIOS shim work, which compounds across future ROMs
 - "make Kirby pass" is not falsifiable, but "make Kirby title-screen parity green" is
-- the first bring-up slice can stay small by targeting the current `SWI 0x0B` blocker only
+- at slice start, the first bring-up slice could stay small by targeting the initial `SWI 0x0B` blocker only
 
 ## Measured Starting Point
 
@@ -31,13 +31,13 @@ Measured facts:
 
 - the local-only ROM under test is `.zig-cache/local-commercial-roms/kirby-nightmare.gba`
 - Kirby's startup `bx r1` handoff blocker is cleared
-- Kirby's current first blocker is `Unsupported SWI 0x00000B at 0x080CFA58 for gba`
+- Kirby's initial measured blocker for this slice was `Unsupported SWI 0x00000B at 0x080CFA58 for gba`
 - the blocker sits inside the BIOS trampoline block around `0x080CFA50-0x080CFA5A`
 - currently supported SWIs already include `SoftReset`, `VBlankIntrWait`, `Div`, and `Sqrt`
 
 Interpretation:
 
-- `SWI 0x0B` is `CpuSet`
+- that initial `SWI 0x0B` blocker is `CpuSet`
 - the next framework investment is therefore not more indirect-branch modeling
 - it is the first non-trivial BIOS memory shim on the commercial path
 
@@ -58,7 +58,7 @@ Bring-up rule:
 - each slice ends by re-probing Kirby and recording the next first blocker
 - no slice speculates ahead into "implement the BIOS" or "implement all startup shims"
 
-The first bring-up slice is `CpuSet`.
+The first bring-up slice was `CpuSet`.
 
 Stopping rule for the `CpuSet` slice:
 
@@ -112,7 +112,7 @@ Title-screen parity is a second phase, not part of the initial `CpuSet` slice.
 
 Why it is separate:
 
-- Kirby's current blocker is still bring-up, not image parity
+- at `CpuSet` slice start, Kirby's blocker was still bring-up, not image parity
 - the title screen is animated, so parity requires a measured deterministic capture point
 - commercial ROM policy means parity cannot use the same committed-golden shape as tonc
 
