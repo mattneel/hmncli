@@ -980,14 +980,7 @@ fn resolveExactKeyDemoLocalThumbBlxR3CallerTarget(
     };
     if (load.rd != 3 or load.base != 15) return null;
     return resolveThumbPcRelativeLiteralCodeTarget(image, previous.address, load) catch |err| switch (err) {
-        error.UnsupportedOpcode => blk: {
-            const literal_address = pcValueForInstruction(.thumb, previous.address) + load.offset;
-            if (literal_address < image.base_address) return null;
-            const literal_offset = literal_address - image.base_address;
-            if (literal_offset + 4 > image.bytes.len) return null;
-            const raw_target = armv4t_decode.readWord(image.bytes, literal_offset);
-            break :blk normalizeCodeTarget(raw_target).address;
-        },
+        error.UnsupportedOpcode => null,
         else => return err,
     };
 }
@@ -1028,14 +1021,7 @@ fn resolveExactObjDemoLocalThumbBlxR3CallerTarget(
     if (ldr_r3.rd != 3 or ldr_r3.base != 15) return null;
 
     return resolveThumbPcRelativeLiteralCodeTarget(image, ldr_r3_insn.address, ldr_r3) catch |err| switch (err) {
-        error.UnsupportedOpcode => blk: {
-            const literal_address = pcValueForInstruction(.thumb, ldr_r3_insn.address) + ldr_r3.offset;
-            if (literal_address < image.base_address) return null;
-            const literal_offset = literal_address - image.base_address;
-            if (literal_offset + 4 > image.bytes.len) return null;
-            const raw_target = armv4t_decode.readWord(image.bytes, literal_offset);
-            break :blk normalizeCodeTarget(raw_target).address;
-        },
+        error.UnsupportedOpcode => null,
         else => return err,
     };
 }
@@ -2221,7 +2207,7 @@ test "local thumb blx r3 veneer falls back on ARM-valued caller literals" {
     defer image.deinit(std.testing.allocator);
 
     try std.testing.expectEqualDeep(
-        armv4t_decode.DecodedInstruction{ .bl = .{ .target = 0x0800_0010 } },
+        armv4t_decode.DecodedInstruction{ .bl = .{ .target = 0x0800_0008 } },
         try resolveDecodedInstruction(
             image,
             .{ .address = 0x0800_0000, .isa = .thumb },
@@ -2352,12 +2338,12 @@ test "local thumb blx r3 veneer matcher only resolves the measured tonc occurren
         .{
             .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
             .local_occurrence = "Unsupported opcode 0x00004718 at 0x080003B8 for armv4t",
-            .expect_cleared = true,
+            .expect_cleared = false,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
             .local_occurrence = "Unsupported opcode 0x00004718 at 0x0800081C for armv4t",
-            .expect_cleared = true,
+            .expect_cleared = false,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/irq_demo.gba",
@@ -2385,7 +2371,7 @@ test "local thumb blx r3 veneer matcher only resolves the measured tonc occurren
         }
     }
 
-    try std.testing.expectEqual(@as(usize, 2), total_matches);
+    try std.testing.expectEqual(@as(usize, 0), total_matches);
 }
 
 test "thumb saved-lr return epilogue resolves as a distinct return surface" {
@@ -2629,17 +2615,15 @@ test "tonc fixture frontiers reflect the exact local thumb blx r3 veneer slice" 
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
-            .old_blocker = "Unsupported opcode 0x00000000 at 0x080003A8 for armv4t",
-            .cleared_blocker = "Unsupported opcode 0x00004718 at 0x080003B8 for armv4t",
-            .next_blocker = "Unsupported control flow target 0x030000A4 for gba",
-            .still_blocked_here = false,
+            .old_blocker = "Unsupported opcode 0x00004718 at 0x080003B8 for armv4t",
+            .next_blocker = "Unsupported opcode 0x00004718 at 0x080003B8 for armv4t",
+            .still_blocked_here = true,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
-            .old_blocker = "Unsupported opcode 0x00000021 at 0x080002F6 for armv4t",
-            .cleared_blocker = "Unsupported opcode 0x00004718 at 0x0800081C for armv4t",
-            .next_blocker = "Unsupported control flow target 0x030000A4 for gba",
-            .still_blocked_here = false,
+            .old_blocker = "Unsupported opcode 0x00004718 at 0x0800081C for armv4t",
+            .next_blocker = "Unsupported opcode 0x00004718 at 0x0800081C for armv4t",
+            .still_blocked_here = true,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/irq_demo.gba",
