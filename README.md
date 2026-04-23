@@ -10,8 +10,11 @@ This is not an emulator. There is no interpreter, no JIT, no runtime recompilati
 - The working build path today produces standalone `x86_64-linux` ELFs from GBA ROMs.
 - The current CLI surface is `build`, `doc`, `status`, and `test`.
 - The GBA path passes the bundled real-ROM validation set in this repo: `arm`, `thumb`, `bios`, `memory`, `save`, `unsafe`, and the `ppu` fixtures derived from `jsmolka/gba-tests`.
-- A Mode 4 `frame_raw` dump path exists for framebuffer inspection.
-- There is no general renderer, audio backend, input system, or second machine target yet.
+- The first `tonc` bring-up ladder is green for `sbb_reg`, `obj_demo`, and `key_demo`.
+- `irq_demo` is intentionally deferred to the later interrupt milestone because its upstream shape exceeds the current minimal VBlank-only interrupt model.
+- A limited `frame_raw` dump path exists for framebuffer inspection: Mode 4, Mode 0 regular BG0 tiles, and the minimal regular OBJ path needed by the current `tonc` demos.
+- Deterministic scripted KEYINPUT exists for bring-up smoke tests.
+- There is still no audio backend, no oracle-backed pixel goldens yet, and no second machine target.
 
 ## Quickstart
 
