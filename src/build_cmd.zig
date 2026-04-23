@@ -1556,20 +1556,20 @@ fn writeStartupThumbBlxR3VeneerRom(
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
-fn writeArmStartupBxR1LiteralRom(
+fn writeMeasuredCommercialStartupBxR1LiteralRom(
     dir: std.Io.Dir,
     io: std.Io,
     path: []const u8,
+    startup_offset: usize,
     load_word: u32,
+    literal_pc_offset: usize,
     literal: u32,
-    thumb_halfword: u16,
 ) !void {
-    var rom: [24]u8 = std.mem.zeroes([24]u8);
-    std.mem.writeInt(u32, rom[0..4], load_word, .little);
-    std.mem.writeInt(u32, rom[4..8], 0xE1A0E00F, .little);
-    std.mem.writeInt(u32, rom[8..12], 0xE12FFF11, .little);
-    std.mem.writeInt(u32, rom[12..16], literal, .little);
-    std.mem.writeInt(u16, rom[16..18], thumb_halfword, .little);
+    var rom: [512]u8 = std.mem.zeroes([512]u8);
+    std.mem.writeInt(u32, rom[startup_offset..][0..4], load_word, .little);
+    std.mem.writeInt(u32, rom[startup_offset + 4 ..][0..4], 0xE1A0E00F, .little);
+    std.mem.writeInt(u32, rom[startup_offset + 8 ..][0..4], 0xE12FFF11, .little);
+    std.mem.writeInt(u32, rom[startup_offset + 8 + literal_pc_offset ..][0..4], literal, .little);
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
@@ -2839,25 +2839,54 @@ test "arm startup bx r1 literal target resolves the measured commercial handoff 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeArmStartupBxR1LiteralRom(
-        tmp.dir,
-        io,
-        "arm-startup-bx-r1.gba",
-        0xE59F1004,
-        0x0800_0011,
-        0x4770,
-    );
+    const cases = [_]struct {
+        path: []const u8,
+        startup_offset: usize,
+        load_word: u32,
+        literal_pc_offset: usize,
+        literal: u32,
+        bx_address: u32,
+        expected_target: armv4t_decode.CodeAddress,
+    }{
+        .{
+            .path = "advance-wars-startup.gba",
+            .startup_offset = 0xD8,
+            .load_word = 0xE59F1010,
+            .literal_pc_offset = 16,
+            .literal = 0x0807_AD11,
+            .bx_address = 0x0800_00E0,
+            .expected_target = .{ .address = 0x0807_AD10, .isa = .thumb },
+        },
+        .{
+            .path = "kirby-startup.gba",
+            .startup_offset = 0xE4,
+            .load_word = 0xE59F112C,
+            .literal_pc_offset = 300,
+            .literal = 0x0800_0311,
+            .bx_address = 0x0800_00EC,
+            .expected_target = .{ .address = 0x0800_0310, .isa = .thumb },
+        },
+    };
 
-    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "arm-startup-bx-r1.gba");
-    defer image.deinit(std.testing.allocator);
+    for (cases) |case| {
+        try writeMeasuredCommercialStartupBxR1LiteralRom(
+            tmp.dir,
+            io,
+            case.path,
+            case.startup_offset,
+            case.load_word,
+            case.literal_pc_offset,
+            case.literal,
+        );
 
-    try std.testing.expectEqualDeep(
-        armv4t_decode.DecodedInstruction{ .bx_target = .{
-            .address = 0x0800_0010,
-            .isa = .thumb,
-        } },
-        try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .arm }, 0x0800_0008, 1),
-    );
+        const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", case.path);
+        defer image.deinit(std.testing.allocator);
+
+        try std.testing.expectEqualDeep(
+            armv4t_decode.DecodedInstruction{ .bx_target = case.expected_target },
+            try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .arm }, case.bx_address, 1),
+        );
+    }
 }
 
 test "devkitARM crt0 startup blx r3 veneer rejects boundary mismatches" {
