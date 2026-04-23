@@ -25,6 +25,11 @@ pub const sbb_reg_samples = [_]PixelSample{
     .{ .x = 123, .y = 83, .expected = .{ 255, 0, 0, 255 } },
 };
 
+pub const obj_demo_samples = [_]PixelSample{
+    .{ .x = 20, .y = 20, .expected = .{ 0, 0, 0, 255 } },
+    .{ .x = 123, .y = 40, .expected = .{ 0, 66, 0, 255 } },
+};
+
 pub const fixtures = [_]Fixture{
     .{
         .name = "sbb_reg",

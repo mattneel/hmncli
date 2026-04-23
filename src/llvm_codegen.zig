@@ -252,11 +252,11 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("@.fmt_arm_pass = private unnamed_addr constant [6 x i8] c\"PASS\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_arm_fail = private unnamed_addr constant [9 x i8] c\"FAIL %d\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_frame_missing_path = private unnamed_addr constant [42 x i8] c\"frame_raw requires HOMONCULI_OUTPUT_PATH\\0A\\00\", align 1\n", .{});
-    try writer.print("@.fmt_frame_bad_mode = private unnamed_addr constant [37 x i8] c\"frame_raw requires GBA video mode 4\\0A\\00\", align 1\n", .{});
+    try writer.print("@.fmt_frame_bad_mode = private unnamed_addr constant [47 x i8] c\"frame_raw requires a supported GBA video mode\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_frame_write_failed = private unnamed_addr constant [24 x i8] c\"frame_raw write failed\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_retired = private unnamed_addr constant [14 x i8] c\"retired=%llu\\0A\\00\", align 1\n", .{});
     try writer.print("declare i32 @printf(ptr, ...)\n", .{});
-    try writer.print("declare i32 @hmgba_dump_frame_raw(ptr, ptr, ptr)\n", .{});
+    try writer.print("declare i32 @hmgba_dump_frame_raw(ptr, ptr, ptr, ptr)\n", .{});
     try writer.print("declare i16 @hmgba_sample_keyinput_for_frame(i64)\n", .{});
     try writer.print("declare i64 @hm_runtime_max_instructions(i64)\n", .{});
     try writer.print("declare i32 @hm_runtime_output_mode_frame_raw()\n", .{});
@@ -4019,7 +4019,11 @@ fn emitFinalOutput(writer: *Io.Writer, output_mode: OutputMode) Io.Writer.Error!
                 .{guest_state_vram_field},
             );
             try writer.print(
-                "  %frame_output_result = call i32 @hmgba_dump_frame_raw(ptr %state_io_done, ptr %state_palette_done, ptr %state_vram_done)\n",
+                "  %state_oam_done = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+                .{guest_state_oam_field},
+            );
+            try writer.print(
+                "  %frame_output_result = call i32 @hmgba_dump_frame_raw(ptr %state_io_done, ptr %state_palette_done, ptr %state_vram_done, ptr %state_oam_done)\n",
                 .{},
             );
             try writer.print("  %frame_output_ok = icmp eq i32 %frame_output_result, 0\n", .{});

@@ -3416,6 +3416,32 @@ test "tonc sbb_reg frame smoke test" {
     }
 }
 
+test "tonc obj_demo frame smoke test" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const output_path = try buildFixtureNative(
+        std.testing.allocator,
+        io,
+        tmp.dir,
+        "tests/fixtures/real/tonc/obj_demo.gba",
+        "obj_demo-native",
+        .frame_raw,
+        500_000,
+    );
+    defer std.testing.allocator.free(output_path);
+
+    try runFrameFixture(io, tmp.dir, output_path, "obj_demo.rgba", .{ .max_instructions = 500_000 });
+
+    const frame = try frame_test_support.readExactFrame(std.testing.allocator, io, tmp.dir, "obj_demo.rgba");
+    defer std.testing.allocator.free(frame);
+
+    for (tonc_fixture_support.obj_demo_samples) |sample| {
+        try frame_test_support.expectPixel(frame, sample.x, sample.y, sample.expected);
+    }
+}
+
 test "build reports a structured diagnostic for an unsupported opcode" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
