@@ -132,6 +132,31 @@ pub const shims: []const shim_mod.ShimDecl = &.{
         .id = .{
             .kind = .shim,
             .namespace = "gba",
+            .name = "CpuSet",
+        },
+        .state = .implemented,
+        .args = &.{
+            .{ .name = "source", .ty = .guest_ptr },
+            .{ .name = "dest", .ty = .guest_ptr },
+            .{ .name = "control", .ty = .u32 },
+        },
+        .returns = .i32,
+        .effects = .memory_write,
+        .tests = &.{},
+        .doc_refs = &.{
+            .{
+                .label = "GBATEK BIOS CpuSet",
+                .url = "https://problemkaputt.de/gbatek.htm#biosmemorycopy",
+            },
+        },
+        .notes = &.{
+            "Commercial BIOS memory-copy shim used first by Kirby; implemented via existing guest-memory load/store helpers.",
+        },
+    },
+    .{
+        .id = .{
+            .kind = .shim,
+            .namespace = "gba",
             .name = "VBlankIntrWait",
         },
         .state = .implemented,

@@ -2175,11 +2175,16 @@ fn isSqrtSwi(imm24: u24) bool {
     return imm24 == 0x000008 or imm24 == 0x080000;
 }
 
+fn isCpuSetSwi(imm24: u24) bool {
+    return imm24 == 0x00000B or imm24 == 0x0B0000;
+}
+
 fn swiShimName(imm24: u24) ?[]const u8 {
     if (imm24 == 0x000000) return "SoftReset";
     if (isVBlankIntrWaitSwi(imm24)) return "VBlankIntrWait";
     if (isDivSwi(imm24)) return "Div";
     if (isSqrtSwi(imm24)) return "Sqrt";
+    if (isCpuSetSwi(imm24)) return "CpuSet";
     return null;
 }
 
@@ -2740,7 +2745,7 @@ fn writeCpuSetCopyRom(
         0xE59F2010, // ldr r2, [pc, #0x10] ; control
         0xEF00000B, // swi 0x0B (CpuSet)
         0xE5910004, // ldr r0, [r1, #4]
-        0xEF000000, // swi 0x00 (SoftReset)
+        0xE12FFF1E, // bx lr
         0x08000024, // source literal
         0x03000000, // dest literal
         0x04000002, // two 32-bit units, copy mode

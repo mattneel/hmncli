@@ -100,6 +100,11 @@ const flash_mode_read: u32 = 0;
 const flash_mode_program: u32 = 1;
 const flash_mode_erase: u32 = 2;
 const flash_mode_bank: u32 = 3;
+const cpuset_fill_bit: u32 = 1 << 24;
+const cpuset_word_bit: u32 = 1 << 26;
+const cpuset_count_mask: u32 = 0x001F_FFFF;
+const cpuset_supported_mask: u32 = cpuset_fill_bit | cpuset_word_bit | cpuset_count_mask;
+const cpuset_unsupported_mask: u32 = ~cpuset_supported_mask;
 
 const RegionOffsetKind = enum {
     linear,
@@ -227,6 +232,101 @@ fn saveMirrorLen(hardware: SaveHardware) u32 {
     };
 }
 
+fn emitGbaCpuSetBadControlHelper(writer: *Io.Writer) Io.Writer.Error!void {
+    try writer.print("define void @hmn_cpuset_fail_bad_control(ptr %state, i32 %control) {{\n", .{});
+    try writer.print("entry:\n", .{});
+    try writer.print(
+        "  %cpuset_stop_flag_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+        .{guest_state_stop_flag_field},
+    );
+    try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_cpuset_bad_control, i32 %control)\n", .{});
+    try writer.print("  store i1 true, ptr %cpuset_stop_flag_ptr, align 1\n", .{});
+    try writer.print("  ret void\n", .{});
+    try writer.print("}}\n\n", .{});
+}
+
+fn emitGbaCpuSetShim(writer: *Io.Writer) Io.Writer.Error!void {
+    try writer.print("define i32 @shim_gba_CpuSet(ptr %state) {{\n", .{});
+    try writer.print("entry:\n", .{});
+    try writer.print(
+        "  %cpuset_regs_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+        .{guest_state_regs_field},
+    );
+    try writer.print("  %cpuset_r0_ptr = getelementptr inbounds [16 x i32], ptr %cpuset_regs_ptr, i32 0, i32 0\n", .{});
+    try writer.print("  %cpuset_r1_ptr = getelementptr inbounds [16 x i32], ptr %cpuset_regs_ptr, i32 0, i32 1\n", .{});
+    try writer.print("  %cpuset_r2_ptr = getelementptr inbounds [16 x i32], ptr %cpuset_regs_ptr, i32 0, i32 2\n", .{});
+    try writer.print("  %cpuset_source = load i32, ptr %cpuset_r0_ptr, align 4\n", .{});
+    try writer.print("  %cpuset_dest = load i32, ptr %cpuset_r1_ptr, align 4\n", .{});
+    try writer.print("  %cpuset_control = load i32, ptr %cpuset_r2_ptr, align 4\n", .{});
+    try writer.print("  %cpuset_bad_bits = and i32 %cpuset_control, {d}\n", .{cpuset_unsupported_mask});
+    try writer.print("  %cpuset_bad_control = icmp ne i32 %cpuset_bad_bits, 0\n", .{});
+    try writer.print("  br i1 %cpuset_bad_control, label %cpuset_bad_control_path, label %cpuset_decode\n", .{});
+    try writer.print("cpuset_bad_control_path:\n", .{});
+    try writer.print("  call void @hmn_cpuset_fail_bad_control(ptr %state, i32 %cpuset_control)\n", .{});
+    try writer.print("  ret i32 0\n", .{});
+    try writer.print("cpuset_decode:\n", .{});
+    try writer.print("  %cpuset_count = and i32 %cpuset_control, {d}\n", .{cpuset_count_mask});
+    try writer.print("  %cpuset_count_is_zero = icmp eq i32 %cpuset_count, 0\n", .{});
+    try writer.print("  %cpuset_fill_bits = and i32 %cpuset_control, {d}\n", .{cpuset_fill_bit});
+    try writer.print("  %cpuset_is_fill = icmp ne i32 %cpuset_fill_bits, 0\n", .{});
+    try writer.print("  %cpuset_word_bits = and i32 %cpuset_control, {d}\n", .{cpuset_word_bit});
+    try writer.print("  %cpuset_is_word = icmp ne i32 %cpuset_word_bits, 0\n", .{});
+    try writer.print("  br i1 %cpuset_count_is_zero, label %cpuset_done, label %cpuset_mode\n", .{});
+    try writer.print("cpuset_mode:\n", .{});
+    try writer.print("  br i1 %cpuset_is_word, label %cpuset_word_mode, label %cpuset_half_mode\n", .{});
+    try writer.print("cpuset_word_mode:\n", .{});
+    try writer.print("  br i1 %cpuset_is_fill, label %cpuset_word_fill_init, label %cpuset_word_copy_loop\n", .{});
+    try writer.print("cpuset_word_fill_init:\n", .{});
+    try writer.print("  %cpuset_word_fill_value = call i32 @hmn_load32(ptr %state, i32 %cpuset_source)\n", .{});
+    try writer.print("  br label %cpuset_word_fill_loop\n", .{});
+    try writer.print("cpuset_word_fill_loop:\n", .{});
+    try writer.print("  %cpuset_word_fill_index = phi i32 [ 0, %cpuset_word_fill_init ], [ %cpuset_word_fill_next_index, %cpuset_word_fill_loop ]\n", .{});
+    try writer.print("  %cpuset_word_fill_dest = phi i32 [ %cpuset_dest, %cpuset_word_fill_init ], [ %cpuset_word_fill_next_dest, %cpuset_word_fill_loop ]\n", .{});
+    try writer.print("  call void @hmn_store32(ptr %state, i32 %cpuset_word_fill_dest, i32 %cpuset_word_fill_value)\n", .{});
+    try writer.print("  %cpuset_word_fill_next_index = add i32 %cpuset_word_fill_index, 1\n", .{});
+    try writer.print("  %cpuset_word_fill_next_dest = add i32 %cpuset_word_fill_dest, 4\n", .{});
+    try writer.print("  %cpuset_word_fill_done = icmp uge i32 %cpuset_word_fill_next_index, %cpuset_count\n", .{});
+    try writer.print("  br i1 %cpuset_word_fill_done, label %cpuset_done, label %cpuset_word_fill_loop\n", .{});
+    try writer.print("cpuset_word_copy_loop:\n", .{});
+    try writer.print("  %cpuset_word_copy_index = phi i32 [ 0, %cpuset_word_mode ], [ %cpuset_word_copy_next_index, %cpuset_word_copy_loop ]\n", .{});
+    try writer.print("  %cpuset_word_copy_source = phi i32 [ %cpuset_source, %cpuset_word_mode ], [ %cpuset_word_copy_next_source, %cpuset_word_copy_loop ]\n", .{});
+    try writer.print("  %cpuset_word_copy_dest = phi i32 [ %cpuset_dest, %cpuset_word_mode ], [ %cpuset_word_copy_next_dest, %cpuset_word_copy_loop ]\n", .{});
+    try writer.print("  %cpuset_word_copy_value = call i32 @hmn_load32(ptr %state, i32 %cpuset_word_copy_source)\n", .{});
+    try writer.print("  call void @hmn_store32(ptr %state, i32 %cpuset_word_copy_dest, i32 %cpuset_word_copy_value)\n", .{});
+    try writer.print("  %cpuset_word_copy_next_index = add i32 %cpuset_word_copy_index, 1\n", .{});
+    try writer.print("  %cpuset_word_copy_next_source = add i32 %cpuset_word_copy_source, 4\n", .{});
+    try writer.print("  %cpuset_word_copy_next_dest = add i32 %cpuset_word_copy_dest, 4\n", .{});
+    try writer.print("  %cpuset_word_copy_done = icmp uge i32 %cpuset_word_copy_next_index, %cpuset_count\n", .{});
+    try writer.print("  br i1 %cpuset_word_copy_done, label %cpuset_done, label %cpuset_word_copy_loop\n", .{});
+    try writer.print("cpuset_half_mode:\n", .{});
+    try writer.print("  br i1 %cpuset_is_fill, label %cpuset_half_fill_init, label %cpuset_half_copy_loop\n", .{});
+    try writer.print("cpuset_half_fill_init:\n", .{});
+    try writer.print("  %cpuset_half_fill_value = call i32 @hmn_load16(ptr %state, i32 %cpuset_source)\n", .{});
+    try writer.print("  br label %cpuset_half_fill_loop\n", .{});
+    try writer.print("cpuset_half_fill_loop:\n", .{});
+    try writer.print("  %cpuset_half_fill_index = phi i32 [ 0, %cpuset_half_fill_init ], [ %cpuset_half_fill_next_index, %cpuset_half_fill_loop ]\n", .{});
+    try writer.print("  %cpuset_half_fill_dest = phi i32 [ %cpuset_dest, %cpuset_half_fill_init ], [ %cpuset_half_fill_next_dest, %cpuset_half_fill_loop ]\n", .{});
+    try writer.print("  call void @hmn_store16(ptr %state, i32 %cpuset_half_fill_dest, i32 %cpuset_half_fill_value)\n", .{});
+    try writer.print("  %cpuset_half_fill_next_index = add i32 %cpuset_half_fill_index, 1\n", .{});
+    try writer.print("  %cpuset_half_fill_next_dest = add i32 %cpuset_half_fill_dest, 2\n", .{});
+    try writer.print("  %cpuset_half_fill_done = icmp uge i32 %cpuset_half_fill_next_index, %cpuset_count\n", .{});
+    try writer.print("  br i1 %cpuset_half_fill_done, label %cpuset_done, label %cpuset_half_fill_loop\n", .{});
+    try writer.print("cpuset_half_copy_loop:\n", .{});
+    try writer.print("  %cpuset_half_copy_index = phi i32 [ 0, %cpuset_half_mode ], [ %cpuset_half_copy_next_index, %cpuset_half_copy_loop ]\n", .{});
+    try writer.print("  %cpuset_half_copy_source = phi i32 [ %cpuset_source, %cpuset_half_mode ], [ %cpuset_half_copy_next_source, %cpuset_half_copy_loop ]\n", .{});
+    try writer.print("  %cpuset_half_copy_dest = phi i32 [ %cpuset_dest, %cpuset_half_mode ], [ %cpuset_half_copy_next_dest, %cpuset_half_copy_loop ]\n", .{});
+    try writer.print("  %cpuset_half_copy_value = call i32 @hmn_load16(ptr %state, i32 %cpuset_half_copy_source)\n", .{});
+    try writer.print("  call void @hmn_store16(ptr %state, i32 %cpuset_half_copy_dest, i32 %cpuset_half_copy_value)\n", .{});
+    try writer.print("  %cpuset_half_copy_next_index = add i32 %cpuset_half_copy_index, 1\n", .{});
+    try writer.print("  %cpuset_half_copy_next_source = add i32 %cpuset_half_copy_source, 2\n", .{});
+    try writer.print("  %cpuset_half_copy_next_dest = add i32 %cpuset_half_copy_dest, 2\n", .{});
+    try writer.print("  %cpuset_half_copy_done = icmp uge i32 %cpuset_half_copy_next_index, %cpuset_count\n", .{});
+    try writer.print("  br i1 %cpuset_half_copy_done, label %cpuset_done, label %cpuset_half_copy_loop\n", .{});
+    try writer.print("cpuset_done:\n", .{});
+    try writer.print("  ret i32 0\n", .{});
+    try writer.print("}}\n\n", .{});
+}
+
 pub fn emitModule(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
     try emitPrelude(writer);
     try emitPsrHelpers(writer);
@@ -264,6 +364,7 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("@.fmt_irq_nested_ime = private unnamed_addr constant [53 x i8] c\"Unsupported nested IME enable at 0x04000208 for gba\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_irq_multi_if = private unnamed_addr constant [58 x i8] c\"Unsupported pending IF mask 0x%04x at 0x04000202 for gba\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_irq_byte_store = private unnamed_addr constant [57 x i8] c\"Unsupported byte interrupt MMIO store at 0x%08x for gba\\0A\\00\", align 1\n", .{});
+    try writer.print("@.fmt_cpuset_bad_control = private unnamed_addr constant [43 x i8] c\"Unsupported CpuSet control 0x%08x for gba\\0A\\00\", align 1\n", .{});
     try writer.print("declare i32 @printf(ptr, ...)\n", .{});
     try writer.print("declare i32 @hmgba_dump_frame_raw(ptr, ptr, ptr, ptr)\n", .{});
     try writer.print("declare i16 @hmgba_sample_keyinput_for_frame(i64)\n", .{});
@@ -329,6 +430,8 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("  store i32 3818921988, ptr %sqrt_bios_latch_ptr, align 4\n", .{});
     try writer.print("  ret i32 %sqrt_result\n", .{});
     try writer.print("}}\n\n", .{});
+    try emitGbaCpuSetBadControlHelper(writer);
+    try emitGbaCpuSetShim(writer);
     try writer.print("define i64 @hmn_gba_advance_frame(ptr %state) {{\n", .{});
     try writer.print("entry:\n", .{});
     try writer.print(
@@ -3141,6 +3244,7 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
                 0x000005, 0x050000 => "VBlankIntrWait",
                 0x000006, 0x060000 => "Div",
                 0x000008, 0x080000 => "Sqrt",
+                0x00000B, 0x0B0000 => "CpuSet",
                 else => unreachable,
             };
             try writer.print("  call i32 @shim_gba_{s}(ptr %state)\n", .{shim_name});
