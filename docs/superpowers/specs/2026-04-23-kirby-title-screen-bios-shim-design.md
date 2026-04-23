@@ -19,7 +19,7 @@ Immediate next slice:
 Why this shape:
 
 - title-screen parity is a binary commercial milestone
-- Kirby's current frontier is BIOS shim work, which compounds across future ROMs
+- at slice start, Kirby's frontier was BIOS shim work, which compounds across future ROMs
 - "make Kirby pass" is not falsifiable, but "make Kirby title-screen parity green" is
 - at slice start, the first bring-up slice could stay small by targeting the initial `SWI 0x0B` blocker only
 
