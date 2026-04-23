@@ -1026,6 +1026,9 @@ fn resolveBxTarget(
         return .{ .thumb_saved_lr_return = {} };
     }
     if (function_entry.isa == .thumb and reg == 0) {
+        // Reject only the exact local near-miss `push {lr}; pop {r0}; movs r0,
+        // #0; bx r0`. Other `push {lr}` / `bx r0` flows still fall through to
+        // the generic register-value resolver below.
         const entry = try decodeImageInstructionUnchecked(image, .thumb, function_entry.address);
         const entry_is_push_lr = switch (entry.instruction) {
             .push => |mask| mask == 0x4000,
@@ -3976,6 +3979,23 @@ test "thumb push-lr pop-r0 bx-r0 resolves the measured commercial return shape" 
             try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, bx_address, 0),
         );
     }
+}
+
+test "thumb push-lr movs-r0-imm bx-r0 still resolves through the generic path" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom_bytes = &.{ 0x00, 0xB5, 0x00, 0x20, 0x00, 0x47, 0x00, 0x00 };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-push-lr-movs-r0-bx-r0-generic.gba", .data = rom_bytes });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-push-lr-movs-r0-bx-r0-generic.gba");
+    defer image.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_target = .{ .address = 0, .isa = .arm } },
+        try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0004, 0),
+    );
 }
 
 test "thumb push-lr pop-r4 pop-r0 bx-r0 rejects the local near-miss" {
