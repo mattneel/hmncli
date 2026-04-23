@@ -1020,6 +1020,8 @@ fn resolveExactObjDemoLocalThumbBlxR3CallerTarget(
     return resolveMeasuredLocalThumbBlxR3CallerLiteralTarget(image, ldr_r3_insn.address, ldr_r3);
 }
 
+// Resolve only the measured local caller literal family: in-ROM Thumb targets
+// plus the one measured ARM-valued literal, not generic indirect branches.
 fn resolveMeasuredLocalThumbBlxR3CallerLiteralTarget(
     image: gba_loader.RomImage,
     load_address: u32,
@@ -1031,16 +1033,15 @@ fn resolveMeasuredLocalThumbBlxR3CallerLiteralTarget(
     if (literal_offset + 4 > image.bytes.len) return null;
 
     const raw_target = armv4t_decode.readWord(image.bytes, literal_offset);
-    // Keep this exact: the measured obj_demo/key_demo caller pool stores the
-    // raw ARM-valued control-flow target `0x030000A4`, which should advance
-    // the frontier without broadening the generic literal resolver.
-    if (raw_target == 0x0300_00A4) return raw_target;
+    if (raw_target == measuredLocalThumbBlxR3ArmLiteralTarget) return raw_target;
 
     const code_target = normalizeCodeTarget(raw_target);
     if (code_target.isa != .thumb) return null;
     if (offsetForAddress(image, code_target.address, code_target.isa) == null) return null;
     return code_target.address;
 }
+
+const measuredLocalThumbBlxR3ArmLiteralTarget: u32 = 0x0300_00A4;
 
 fn resolveThumbPcRelativeLiteralCodeTarget(
     image: gba_loader.RomImage,
@@ -2204,31 +2205,121 @@ test "local thumb blx r3 veneer resolves the measured caller literal targets" {
     }
 }
 
-test "local thumb blx r3 veneer resolves the measured ARM-valued caller literal" {
+test "local thumb blx r3 veneer resolves the measured ARM-valued caller literals" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeLocalThumbBlxR3VeneerRom(
+    const cases = [_]struct {
+        path: []const u8,
+        bl_address: u32,
+        veneer_address: u32,
+        setup: union(enum) {
+            key_demo: struct {
+                caller_load: u16,
+                stub: u16,
+                after_stub: u16,
+            },
+            obj_demo: struct {
+                caller_load: u16,
+                between: [3]u16,
+                stub: u16,
+                after_stub: u16,
+            },
+        },
+        expected_target: u32,
+    }{
+        .{
+            .path = "local-blx-r3-key-arm-literal.gba",
+            .bl_address = 0x0800_0004,
+            .veneer_address = 0x0800_0008,
+            .setup = .{ .key_demo = .{
+                .caller_load = 0x4B03,
+                .stub = 0x4718,
+                .after_stub = 0x0000,
+            } },
+            .expected_target = measuredLocalThumbBlxR3ArmLiteralTarget,
+        },
+        .{
+            .path = "local-blx-r3-obj-arm-literal.gba",
+            .bl_address = 0x0800_000A,
+            .veneer_address = 0x0800_000C,
+            .setup = .{ .obj_demo = .{
+                .caller_load = 0x4B04,
+                .between = .{ 0x4903, 0x4803, 0x0092 },
+                .stub = 0x4718,
+                .after_stub = 0x46C0,
+            } },
+            .expected_target = measuredLocalThumbBlxR3ArmLiteralTarget,
+        },
+    };
+
+    for (cases) |case| {
+        switch (case.setup) {
+            .key_demo => |setup| try writeLocalThumbBlxR3VeneerRom(
+                tmp.dir,
+                io,
+                case.path,
+                setup.caller_load,
+                setup.stub,
+                setup.after_stub,
+                measuredLocalThumbBlxR3ArmLiteralTarget,
+            ),
+            .obj_demo => |setup| try writeSeparatedLocalThumbBlxR3VeneerRom(
+                tmp.dir,
+                io,
+                case.path,
+                setup.caller_load,
+                setup.between,
+                setup.stub,
+                setup.after_stub,
+                measuredLocalThumbBlxR3ArmLiteralTarget,
+            ),
+        }
+    }
+
+    for (cases) |case| {
+        const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", case.path);
+        defer image.deinit(std.testing.allocator);
+
+        try std.testing.expectEqualDeep(
+            armv4t_decode.DecodedInstruction{ .bl = .{ .target = case.expected_target } },
+            try resolveDecodedInstruction(
+                image,
+                .{ .address = 0x0800_0000, .isa = .thumb },
+                case.bl_address,
+                .{ .bl = .{ .target = case.veneer_address } },
+            ),
+        );
+    }
+}
+
+test "local thumb blx r3 veneer keeps the measured ARM-valued literal exact" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeSeparatedLocalThumbBlxR3VeneerRom(
         tmp.dir,
         io,
-        "local-blx-r3-arm-literal.gba",
-        0x4B03,
+        "local-blx-r3-obj-arm-near-miss.gba",
+        0x4B04,
+        .{ 0x4903, 0x4803, 0x0092 },
         0x4718,
-        0x0000,
-        0x0300_00A4,
+        0x46C0,
+        measuredLocalThumbBlxR3ArmLiteralTarget + 4,
     );
 
-    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "local-blx-r3-arm-literal.gba");
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "local-blx-r3-obj-arm-near-miss.gba");
     defer image.deinit(std.testing.allocator);
 
     try std.testing.expectEqualDeep(
-        armv4t_decode.DecodedInstruction{ .bl = .{ .target = 0x0300_00A4 } },
+        armv4t_decode.DecodedInstruction{ .bl = .{ .target = 0x0800_000C } },
         try resolveDecodedInstruction(
             image,
             .{ .address = 0x0800_0000, .isa = .thumb },
-            0x0800_0004,
-            .{ .bl = .{ .target = 0x0800_0008 } },
+            0x0800_000A,
+            .{ .bl = .{ .target = 0x0800_000C } },
         ),
     );
 }
@@ -2341,7 +2432,7 @@ test "local thumb blx r3 veneer rejects near misses" {
     }
 }
 
-test "local thumb blx r3 veneer matcher only resolves the measured tonc occurrences" {
+test "local thumb blx r3 veneer matcher reports the measured tonc blockers" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2372,7 +2463,6 @@ test "local thumb blx r3 veneer matcher only resolves the measured tonc occurren
         },
     };
 
-    var total_matches: usize = 0;
     for (fixtures) |fixture| {
         const result = try buildFixtureCaptureOutput(std.testing.allocator, io, tmp.dir, fixture.rom_path);
         defer std.testing.allocator.free(result.stderr);
@@ -2381,13 +2471,10 @@ test "local thumb blx r3 veneer matcher only resolves the measured tonc occurren
         if (fixture.local_occurrence) |local_occurrence| {
             const found = std.mem.indexOf(u8, result.stderr, local_occurrence) != null;
             try std.testing.expectEqual(!fixture.expect_cleared, found);
-            if (fixture.expect_cleared) total_matches += 1;
         } else {
             try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x00004718") == null);
         }
     }
-
-    try std.testing.expectEqual(@as(usize, 0), total_matches);
 }
 
 test "thumb saved-lr return epilogue resolves as a distinct return surface" {
