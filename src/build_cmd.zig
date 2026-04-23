@@ -527,7 +527,9 @@ fn enqueueSuccessors(
         },
         .bl => |bl| {
             try enqueueFunctionAddress(allocator, writer, pending_functions, image, bl.target);
-            try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
+            if (!isExactObjDemoMainTailNoReturnCall(image, isa, address, bl)) {
+                try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
+            }
         },
         .add_reg_pc_target => |add| {
             if (add.target == address) {
@@ -614,6 +616,47 @@ fn resolveDevkitArmCrt0HeaderCheckBranch(
     if (source_value != image.base_address) return null;
     const carry_set = lslImmediateCarryOut(source_value, shift.imm) orelse return null;
     return if (branch.cond == .hs) carry_set else !carry_set;
+}
+
+fn isExactObjDemoMainTailNoReturnCall(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+    bl: @FieldType(armv4t_decode.DecodedInstruction, "bl"),
+) bool {
+    if (isa != .thumb) return false;
+    if (address != image.base_address + 0x39C) return false;
+    if (bl.target.address != image.base_address + 0x26C or bl.target.isa != .thumb) return false;
+
+    const expected_literals = [_]u32{
+        0x0300_00A4,
+        0x0800_0AAC,
+        0x0601_0000,
+        0x0800_12AC,
+        0x0500_0200,
+        0x0300_0144,
+    };
+
+    for (expected_literals, 0..) |expected_literal, index| {
+        const literal_address = address + 4 + @as(u32, @intCast(index * 4));
+        const literal_offset = romOffsetForAddress(image, literal_address, .thumb) orelse return false;
+        if (literal_offset + 4 > image.bytes.len) return false;
+        if (armv4t_decode.readWord(image.bytes, literal_offset) != expected_literal) return false;
+    }
+
+    const stub = decodeImageInstructionUnchecked(image, .thumb, address + 0x1C) catch return false;
+    const bx = switch (stub.instruction) {
+        .bx_reg => |bx| bx,
+        else => return false,
+    };
+    if (bx.reg != 3) return false;
+    if (!isMeasuredLocalThumbBlxR3VeneerNop(image, address + 0x1E)) return false;
+
+    const next_function = decodeImageInstructionUnchecked(image, .thumb, address + 0x20) catch return false;
+    return switch (next_function.instruction) {
+        .push => |mask| mask == ((@as(u16, 1) << 4) | (@as(u16, 1) << 14)),
+        else => false,
+    };
 }
 
 fn lslImmediateCarryOut(value: u32, amount: u32) ?bool {
@@ -3122,7 +3165,7 @@ test "tonc fixture frontiers reflect the exact local thumb blx r3 veneer slice" 
         .{
             .rom_path = "tests/fixtures/real/tonc/obj_demo.gba",
             .old_blocker = "Unsupported control flow target 0x030000A4 for gba",
-            .next_blocker = "Unsupported opcode 0x00004718 at 0x080003B8 for armv4t",
+            .next_blocker = "Unsupported opcode 0x00004748 at 0x0800035C for armv4t",
             .still_blocked_here = false,
         },
         .{
@@ -3175,6 +3218,36 @@ test "tonc sbb_reg and key_demo no longer stop at VBlankIntrWait swi" {
         try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported SWI 0x000005") == null);
         try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported SWI 0x050000") == null);
     }
+}
+
+test "tonc obj_demo no longer falls through into the main tail bx r3 veneer" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const result = try buildFixtureCaptureOutput(std.testing.allocator, io, tmp.dir, "tests/fixtures/real/tonc/obj_demo.gba");
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Unsupported opcode 0x00004718 at 0x080003B8 for armv4t") == null);
+}
+
+test "tonc obj_demo main tail call is measured as no-fallthrough" {
+    const io = std.testing.io;
+    const rom = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/real/tonc/obj_demo.gba",
+        std.testing.allocator,
+        .limited(16 * 1024 * 1024),
+    );
+    defer std.testing.allocator.free(rom);
+
+    const image = gba_loader.RomImage{ .bytes = rom };
+    try std.testing.expect(isExactObjDemoMainTailNoReturnCall(
+        image,
+        .thumb,
+        0x0800_039C,
+        .{ .target = .{ .address = 0x0800_026C, .isa = .thumb } },
+    ));
 }
 
 test "build reports a structured diagnostic for an unsupported opcode" {
