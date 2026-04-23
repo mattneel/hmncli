@@ -1,0 +1,36 @@
+diff --git a/src/platform/headless-main.c b/src/platform/headless-main.c
+index 61110b1e8..e3cf41aa1 100644
+--- a/src/platform/headless-main.c
++++ b/src/platform/headless-main.c
+@@ -76,6 +76,9 @@ int main(int argc, char * argv[]) {
+ 	bool cleanExit = false;
+ 	int uncleanExit = 1;
+ 	size_t i;
++	unsigned videoWidth = 0;
++	unsigned videoHeight = 0;
++	mColor* videoBuffer = NULL;
+ 
+ 	struct HeadlessOpts headlessOpts = { 3, NULL };
+ 	StringListInit(&headlessOpts.scripts, 0);
+@@ -165,6 +168,13 @@ int main(int argc, char * argv[]) {
+ 		goto loadError;
+ 	}
+ 
++	core->currentVideoSize(core, &videoWidth, &videoHeight);
++	videoBuffer = calloc(videoWidth * videoHeight, sizeof(*videoBuffer));
++	if (!videoBuffer) {
++		goto loadError;
++	}
++	core->setVideoBuffer(core, videoBuffer, videoWidth);
++
+ #ifdef ENABLE_DEBUGGERS
+ 	struct mDebugger debugger;
+ 	mDebuggerInit(&debugger);
+@@ -245,6 +255,7 @@ scriptsError:
+ #endif
+ 
+ loadError:
++	free(videoBuffer);
+ 	mStandardLoggerDeinit(&_logger);
+ 	mCoreConfigDeinit(&core->config);
+ 	core->deinit(core);
