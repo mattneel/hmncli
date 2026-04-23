@@ -262,6 +262,7 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("@.fmt_retired = private unnamed_addr constant [14 x i8] c\"retired=%llu\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_irq_bad_ie = private unnamed_addr constant [64 x i8] c\"Unsupported interrupt source mask 0x%04x at 0x04000200 for gba\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_irq_nested_ime = private unnamed_addr constant [53 x i8] c\"Unsupported nested IME enable at 0x04000208 for gba\\0A\\00\", align 1\n", .{});
+    try writer.print("@.fmt_irq_byte_store = private unnamed_addr constant [57 x i8] c\"Unsupported byte interrupt MMIO store at 0x%08x for gba\\0A\\00\", align 1\n", .{});
     try writer.print("declare i32 @printf(ptr, ...)\n", .{});
     try writer.print("declare i32 @hmgba_dump_frame_raw(ptr, ptr, ptr, ptr)\n", .{});
     try writer.print("declare i16 @hmgba_sample_keyinput_for_frame(i64)\n", .{});
@@ -376,6 +377,16 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("  store i1 true, ptr %nested_ime_stop_flag_ptr, align 1\n", .{});
     try writer.print("  ret void\n", .{});
     try writer.print("}}\n\n", .{});
+    try writer.print("define void @hmn_interrupt_fail_byte_store(ptr %state, i32 %addr) {{\n", .{});
+    try writer.print("entry:\n", .{});
+    try writer.print(
+        "  %byte_store_stop_flag_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+        .{guest_state_stop_flag_field},
+    );
+    try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_irq_byte_store, i32 %addr)\n", .{});
+    try writer.print("  store i1 true, ptr %byte_store_stop_flag_ptr, align 1\n", .{});
+    try writer.print("  ret void\n", .{});
+    try writer.print("}}\n\n", .{});
     try writer.print("define void @hmn_store_gba_io16(ptr %state, i32 %offset, i16 %value, ptr %raw_ptr) {{\n", .{});
     try writer.print("entry:\n", .{});
     try writer.print("  switch i32 %offset, label %raw_store [\n", .{});
@@ -464,14 +475,12 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
         "  %irq_in_handler_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
         .{guest_state_in_irq_handler_field},
     );
-    try writer.print("  %irq_if_ptr = getelementptr inbounds [1024 x i8], ptr %irq_io_ptr, i32 0, i32 514\n", .{});
     try writer.print("  %irq_iwram_base_ptr = getelementptr inbounds [32768 x i8], ptr %irq_iwram_ptr, i32 0, i32 0\n", .{});
     try writer.print("  store i32 3797872644, ptr %irq_bios_latch_ptr, align 4\n", .{});
     try writer.print("  store i32 3797872644, ptr %irq_iwram_base_ptr, align 1\n", .{});
     try writer.print("  store i1 true, ptr %irq_in_handler_ptr, align 1\n", .{});
     try writer.print("  call void @hmn_call_guest(ptr %state, i32 %irq_vector)\n", .{});
     try writer.print("  store i1 false, ptr %irq_in_handler_ptr, align 1\n", .{});
-    try writer.print("  store i16 1, ptr %irq_if_ptr, align 1\n", .{});
     try writer.print("  store i32 3848192002, ptr %irq_bios_latch_ptr, align 4\n", .{});
     try writer.print("  br label %irq_done\n", .{});
     try writer.print("irq_done:\n", .{});
@@ -1522,7 +1531,61 @@ fn emitRegionDispatch(
             try writer.print("  store i16 %value16_{d}_{d}, ptr %ptr_{d}_{d}, align 1\n", .{ bits, index, bits, index });
         },
         8 => {
-            if (region.field_index == guest_state_oam_field) {
+            if (region.field_index == guest_state_io_field) {
+                try writer.print("  %io_byte_special_ie_{d}_{d} = icmp eq i32 %{s}_offset_{d}, {d}\n", .{
+                    bits,
+                    index,
+                    store_name,
+                    index,
+                    io_ie_offset,
+                });
+                try writer.print("  %io_byte_special_if_{d}_{d} = icmp eq i32 %{s}_offset_{d}, {d}\n", .{
+                    bits,
+                    index,
+                    store_name,
+                    index,
+                    io_if_offset,
+                });
+                try writer.print("  %io_byte_special_ime_{d}_{d} = icmp eq i32 %{s}_offset_{d}, {d}\n", .{
+                    bits,
+                    index,
+                    store_name,
+                    index,
+                    io_ime_offset,
+                });
+                try writer.print("  %io_byte_special_any0_{d}_{d} = or i1 %io_byte_special_ie_{d}_{d}, %io_byte_special_if_{d}_{d}\n", .{
+                    bits,
+                    index,
+                    bits,
+                    index,
+                    bits,
+                    index,
+                });
+                try writer.print("  %io_byte_special_any_{d}_{d} = or i1 %io_byte_special_any0_{d}_{d}, %io_byte_special_ime_{d}_{d}\n", .{
+                    bits,
+                    index,
+                    bits,
+                    index,
+                    bits,
+                    index,
+                });
+                try writer.print("  br i1 %io_byte_special_any_{d}_{d}, label %io_byte_store_fail_{d}_{d}, label %io_byte_store_raw_{d}_{d}\n", .{
+                    bits,
+                    index,
+                    bits,
+                    index,
+                    bits,
+                    index,
+                });
+                try writer.print("io_byte_store_fail_{d}_{d}:\n", .{ bits, index });
+                try writer.print("  call void @hmn_interrupt_fail_byte_store(ptr %state, i32 %addr)\n", .{});
+                try writer.print("  br label %store_ret_{d}\n", .{bits});
+                try writer.print("io_byte_store_raw_{d}_{d}:\n", .{ bits, index });
+                try writer.print("  %value8_{d}_{d} = trunc i32 %value to i8\n", .{ bits, index });
+                try writer.print("  store i8 %value8_{d}_{d}, ptr %ptr_{d}_{d}, align 1\n", .{ bits, index, bits, index });
+                try writer.print("  br label %store_ret_{d}\n", .{bits});
+                return;
+            } else if (region.field_index == guest_state_oam_field) {
                 // OAM byte stores are ignored on GBA.
             } else if (region.field_index == guest_state_palette_field or region.field_index == guest_state_vram_field) {
                 try writer.print("  %value8_{d}_{d} = trunc i32 %value to i8\n", .{ bits, index });
@@ -4835,4 +4898,30 @@ test "minimal vblank interrupt MMIO helpers" {
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "@.fmt_irq_bad_ie") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "@.fmt_irq_nested_ime") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "@hmn_store_gba_io16") != null);
+}
+
+test "minimal vblank interrupt MMIO helpers preserve handler IF acknowledgement" {
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const program = Program{
+        .entry = .{ .address = 0x08000000, .isa = .arm },
+        .rom_base_address = 0x08000000,
+        .rom_bytes = &.{},
+        .save_hardware = .none,
+        .functions = &.{
+            .{
+                .entry = .{ .address = 0x08000000, .isa = .arm },
+                .instructions = &.{
+                    .{ .address = 0x08000000, .condition = .al, .size_bytes = 4, .instruction = .{ .swi = .{ .imm24 = 0x000005 } } },
+                },
+            },
+        },
+        .output_mode = .retired_count,
+        .instruction_limit = 500_000,
+    };
+    try emitModule(&output.writer, program);
+
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "call void @hmn_call_guest(ptr %state, i32 %irq_vector)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "store i16 1, ptr %irq_if_ptr") == null);
 }

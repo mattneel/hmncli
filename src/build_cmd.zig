@@ -2595,6 +2595,27 @@ fn writeNonVBlankIeRom(
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
+fn writeInterruptByteStoreRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+    address: u32,
+) !void {
+    const words = [_]u32{
+        0xE59F0008, // ldr r0, [pc, #8]
+        0xE3A01001, // mov r1, #1
+        0xE5C01000, // strb r1, [r0]
+        0xEF000000, // swi 0x00
+        address,
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
 fn writeNestedImeRom(
     dir: std.Io.Dir,
     io: std.Io,
@@ -3725,6 +3746,60 @@ test "minimal vblank model rejects IME re-enable inside a handler" {
     defer std.testing.allocator.free(result.stderr);
 
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Unsupported nested IME enable at 0x04000208 for gba") != null);
+}
+
+test "minimal vblank model rejects byte writes to interrupt MMIO" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cases = [_]struct {
+        rom_path: []const u8,
+        native_path: []const u8,
+        address: u32,
+    }{
+        .{ .rom_path = "ie-byte.gba", .native_path = "ie-byte-native", .address = 0x0400_0200 },
+        .{ .rom_path = "if-byte.gba", .native_path = "if-byte-native", .address = 0x0400_0202 },
+        .{ .rom_path = "ime-byte.gba", .native_path = "ime-byte-native", .address = 0x0400_0208 },
+    };
+
+    for (cases) |case| {
+        try writeInterruptByteStoreRom(tmp.dir, io, case.rom_path, case.address);
+
+        const native_path = if (standalone_build_cmd_test)
+            try buildFixtureNativeViaCli(std.testing.allocator, io, &tmp, case.rom_path, case.native_path, .retired_count, 500_000)
+        else
+            try buildFixtureNative(
+            std.testing.allocator,
+            io,
+            tmp.dir,
+            case.rom_path,
+            case.native_path,
+            .retired_count,
+            500_000,
+        );
+        defer std.testing.allocator.free(native_path);
+
+        const result = try runNativeCapture(
+            std.testing.allocator,
+            io,
+            tmp.dir,
+            native_path,
+            "retired_count",
+            500_000,
+        );
+        defer std.testing.allocator.free(result.stdout);
+        defer std.testing.allocator.free(result.stderr);
+
+        const expected = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "Unsupported byte interrupt MMIO store at 0x{X:0>8} for gba",
+            .{case.address},
+        );
+        defer std.testing.allocator.free(expected);
+
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, expected) != null);
+    }
 }
 
 test "tonc sbb_reg frame parity test" {
