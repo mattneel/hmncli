@@ -1374,8 +1374,11 @@ fn resolveExactLibcInitArrayLocalThumbBlxR3CallerTarget(
 
     const source_address = resolveThumbLiteralWordFromRom(image, ldr_r5_insn.address, ldr_r5) orelse return null;
     const source_end = resolveThumbLiteralWordFromRom(image, ldr_r6_insn.address, ldr_r6) orelse return null;
-    if (source_address != 0x0300_019C) return null;
-    if (source_end != 0x0300_019C and source_end != 0x0300_01A0) return null;
+    const data_span = measuredDevkitArmIwramDataSpan(image) orelse return null;
+    if (!data_span.contains(source_address)) return null;
+    if (source_address & 3 != 0) return null;
+    if (source_end != source_address and source_end != source_address + 4) return null;
+    if (source_end > data_span.iwram_vma_start + data_span.size) return null;
 
     const raw_target = measuredDevkitArmIwramDataWord(image, source_address) orelse return null;
     const code_target = normalizeCodeTarget(raw_target);
@@ -2652,6 +2655,7 @@ test "local thumb blx r3 veneer matcher reports the measured tonc blockers" {
             .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
             .local_occurrence = "Unsupported control flow target 0x030000A4 for gba",
             .expect_cleared = true,
+            .expect_failed = false,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/irq_demo.gba",
@@ -2791,6 +2795,18 @@ test "real tonc local bx r3 stubs resolve to their measured exact targets" {
             .bl_address = 0x0800_041A,
             .stub_address = 0x0800_0750,
             .expected_target = .{ .address = 0x0300_00DC, .isa = .arm },
+        },
+        .{
+            .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
+            .bl_address = 0x0800_0838,
+            .stub_address = 0x0800_0874,
+            .expected_target = .{ .address = 0x0800_0248, .isa = .thumb },
+        },
+        .{
+            .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
+            .bl_address = 0x0800_0856,
+            .stub_address = 0x0800_0874,
+            .expected_target = .{ .address = 0x0800_0248, .isa = .thumb },
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/sbb_reg.gba",
@@ -3112,8 +3128,9 @@ test "tonc fixture frontiers reflect the exact local thumb blx r3 veneer slice" 
         .{
             .rom_path = "tests/fixtures/real/tonc/key_demo.gba",
             .old_blocker = "Unsupported opcode 0x00004718 at 0x08000750 for armv4t",
-            .next_blocker = "Unsupported opcode 0x00004718 at 0x08000874 for armv4t",
+            .next_blocker = null,
             .still_blocked_here = false,
+            .expect_failed = false,
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/irq_demo.gba",
