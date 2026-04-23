@@ -1022,6 +1022,11 @@ fn resolveBxTarget(
         // pop {return_reg}; bx return_reg`.
         return .{ .thumb_saved_lr_return = {} };
     }
+    if (function_entry.isa == .arm and reg == 1) {
+        if (try resolveMeasuredArmStartupBxR1LiteralTarget(image, function_entry, address)) |target| {
+            return .{ .bx_target = target };
+        }
+    }
     if (function_entry.isa == .thumb and reg == 6) {
         const previous = try previousInstruction(image, function_entry.isa, address);
         if (previous.instruction == .bl) {
@@ -1029,6 +1034,39 @@ fn resolveBxTarget(
         }
     }
     return .{ .bx_target = normalizeCodeTarget(try resolvePreviousRegisterValue(image, function_entry.isa, address, reg)) };
+}
+
+fn resolveMeasuredArmStartupBxR1LiteralTarget(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+    address: u32,
+) BuildError!?armv4t_decode.CodeAddress {
+    if (function_entry.isa != .arm) return null;
+    if (address < image.base_address or address > image.base_address + 0x200) return null;
+
+    const mov_lr_pc_insn = try previousInstruction(image, .arm, address);
+    const mov_lr_pc = switch (mov_lr_pc_insn.instruction) {
+        .mov_reg => |mov| mov,
+        else => return null,
+    };
+    if (mov_lr_pc.rd != 14 or mov_lr_pc.rm != 15) return null;
+
+    const ldr_r1_insn = try previousInstruction(image, .arm, mov_lr_pc_insn.address);
+    const ldr_r1 = switch (ldr_r1_insn.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (ldr_r1.rd != 1 or ldr_r1.base != 15) return null;
+
+    const literal_address = pcValueForInstruction(.arm, ldr_r1_insn.address) + ldr_r1.offset;
+    const literal_offset = romOffsetForAddress(image, literal_address, .arm) orelse return null;
+    if (literal_offset + 4 > image.bytes.len) return null;
+
+    const raw_target = armv4t_decode.readWord(image.bytes, literal_offset);
+    const code_target = normalizeCodeTarget(raw_target);
+    if (code_target.isa != .thumb) return null;
+    if (offsetForAddress(image, code_target.address, code_target.isa) == null) return null;
+    return code_target;
 }
 
 fn isExactThumbSavedLrInterworkingReturnEpilogue(
@@ -1567,12 +1605,16 @@ fn writeMeasuredCommercialStartupBxR1LiteralRom(
     thumb_target_address: u32,
     thumb_halfword: u16,
 ) !void {
-    var rom: [512]u8 = std.mem.zeroes([512]u8);
+    var rom: [1024]u8 = std.mem.zeroes([1024]u8);
+    const literal_offset = startup_offset + 8 + literal_pc_offset;
+    const thumb_target_offset = @as(usize, @intCast((thumb_target_address & ~@as(u32, 1)) - 0x0800_0000));
+    std.debug.assert(literal_offset + 4 <= rom.len);
+    std.debug.assert(thumb_target_offset + 2 <= rom.len);
+
     std.mem.writeInt(u32, rom[startup_offset..][0..4], load_word, .little);
     std.mem.writeInt(u32, rom[startup_offset + 4 ..][0..4], 0xE1A0E00F, .little);
     std.mem.writeInt(u32, rom[startup_offset + 8 ..][0..4], 0xE12FFF11, .little);
-    std.mem.writeInt(u32, rom[startup_offset + 8 + literal_pc_offset ..][0..4], literal, .little);
-    const thumb_target_offset = @as(usize, @intCast((thumb_target_address & ~@as(u32, 1)) - 0x0800_0000));
+    std.mem.writeInt(u32, rom[literal_offset..][0..4], literal, .little);
     std.mem.writeInt(u16, rom[thumb_target_offset..][0..2], thumb_halfword, .little);
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
