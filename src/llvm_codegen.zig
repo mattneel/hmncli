@@ -763,6 +763,10 @@ fn emitLoadHelper(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
         try writer.print("  %rom_value = load i32, ptr %rom_ptr, align 1\n", .{});
         try writer.print("  ret i32 %rom_value\n", .{});
     }
+    // Polling fixtures such as ppu-hello read DISPSTAT with 32-bit LDRs while
+    // waiting for VBlank. Keep this as a compatibility polling shim only:
+    // overlay synthetic VBlank state on bit 0, preserve the rest of the word,
+    // and leave IRQ dispatch to explicit frame-boundary wait paths.
     try writer.print("check_dispstat:\n", .{});
     try writer.print("  br i1 %dispstat_hit, label %load_dispstat, label %check_load_region_0\n", .{});
     try writer.print("load_dispstat:\n", .{});

@@ -3949,8 +3949,6 @@ test "build reports a structured diagnostic for an unsupported opcode" {
 }
 
 test "lifted real jsmolka ppu fixtures still default to memory_summary" {
-    if (standalone_build_cmd_test) return error.SkipZigTest;
-
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3984,8 +3982,6 @@ test "lifted real jsmolka ppu fixtures still default to memory_summary" {
 }
 
 test "real jsmolka ppu fixtures exit deterministically under retired_count" {
-    if (standalone_build_cmd_test) return error.SkipZigTest;
-
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3994,18 +3990,22 @@ test "real jsmolka ppu fixtures exit deterministically under retired_count" {
     const cases = [_]struct {
         rom_path: []const u8,
         native_path: []const u8,
+        expected_stdout: []const u8,
     }{
         .{
             .rom_path = "tests/fixtures/real/jsmolka/ppu-stripes.gba",
             .native_path = "ppu-stripes-retired-native",
+            .expected_stdout = "retired=2099\n",
         },
         .{
             .rom_path = "tests/fixtures/real/jsmolka/ppu-shades.gba",
             .native_path = "ppu-shades-retired-native",
+            .expected_stdout = "retired=5000\n",
         },
         .{
             .rom_path = "tests/fixtures/real/jsmolka/ppu-hello.gba",
             .native_path = "ppu-hello-retired-native",
+            .expected_stdout = "retired=4580\n",
         },
     };
 
@@ -4033,7 +4033,7 @@ test "real jsmolka ppu fixtures exit deterministically under retired_count" {
         defer std.testing.allocator.free(result.stderr);
 
         try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
-        try std.testing.expectEqualStrings("retired=5000\n", result.stdout);
+        try std.testing.expectEqualStrings(case.expected_stdout, result.stdout);
         try std.testing.expectEqualStrings("", result.stderr);
     }
 }
@@ -4123,8 +4123,6 @@ test "build reports a structured diagnostic for unsupported subs pc immediate" {
 }
 
 test "lifted real jsmolka verdict fixtures still default to arm_report" {
-    if (standalone_build_cmd_test) return error.SkipZigTest;
-
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4164,8 +4162,6 @@ test "lifted real jsmolka verdict fixtures still default to arm_report" {
 }
 
 test "real jsmolka verdict fixtures exit deterministically under retired_count" {
-    if (standalone_build_cmd_test) return error.SkipZigTest;
-
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -11,7 +11,8 @@ This is not an emulator. There is no interpreter, no JIT, no runtime recompilati
 - The current CLI surface is `build`, `doc`, `status`, and `test`.
 - The GBA path passes the bundled real-ROM validation set in this repo: `arm`, `thumb`, `bios`, `memory`, `save`, `unsafe`, and the `ppu` fixtures derived from `jsmolka/gba-tests`.
 - The first `tonc` bring-up ladder is green for `sbb_reg`, `obj_demo`, and `key_demo`.
-- `irq_demo` is intentionally deferred to the later interrupt milestone because its upstream shape exceeds the current minimal VBlank-only interrupt model.
+- The minimal synthetic VBlank interrupt fixture is green under deterministic `VBlankIntrWait` dispatch.
+- `irq_demo` remains intentionally deferred: its current first blocker is still `Unsupported opcode 0x00004718 at 0x08003078 for armv4t`, and its upstream shape exceeds the current VBlank-only interrupt model.
 - A limited `frame_raw` dump path exists for framebuffer inspection: Mode 4, Mode 0 regular BG0 tiles, and the minimal regular OBJ path needed by the current `tonc` demos.
 - mGBA-backed raw frame goldens now exist for the green `tonc` demos: `sbb_reg`, `obj_demo`, and `key_demo`.
 - Deterministic scripted KEYINPUT exists for bring-up smoke tests.
