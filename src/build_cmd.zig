@@ -1042,6 +1042,7 @@ fn resolveMeasuredArmStartupBxR1LiteralTarget(
     address: u32,
 ) BuildError!?armv4t_decode.CodeAddress {
     if (function_entry.isa != .arm) return null;
+    if (function_entry.address != image.base_address) return null;
     if (address < image.base_address or address > image.base_address + 0x200) return null;
 
     const mov_lr_pc_insn = try previousInstruction(image, .arm, address);
