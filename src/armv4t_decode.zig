@@ -1,5 +1,5 @@
 const std = @import("std");
-const c = @import("capstone_c");
+const c = @import("capstone_c.zig");
 const capstone_api = @import("capstone_api.zig");
 
 pub const DecodeError = error{

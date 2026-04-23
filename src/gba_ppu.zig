@@ -1,10 +1,13 @@
+const builtin = @import("builtin");
 const std = @import("std");
+const Io = std.Io;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*FileHandle;
 extern fn fwrite(buffer: *const anyopaque, size: usize, count: usize, stream: *FileHandle) usize;
 extern fn fclose(stream: *FileHandle) c_int;
 
 const FileHandle = opaque {};
+const standalone_build_cmd_test = builtin.is_test and !@hasDecl(@import("root"), "cli");
 
 pub const frame_width = 240;
 pub const frame_height = 160;
@@ -274,26 +277,39 @@ pub fn dumpMode4Rgba(
     }
 }
 
-fn envEquals(name: [*:0]const u8, expected: []const u8) bool {
-    const value = getenv(name) orelse return false;
-    return std.mem.eql(u8, std.mem.span(value), expected);
+fn envGetOwned(name: [:0]const u8) ?[]u8 {
+    if (comptime standalone_build_cmd_test) {
+        return std.testing.environ.getAlloc(std.heap.page_allocator, name) catch null;
+    }
+
+    const value = getenv(name) orelse return null;
+    return std.heap.page_allocator.dupeZ(u8, std.mem.span(value)) catch null;
+}
+
+fn envEquals(name: [:0]const u8, expected: []const u8) bool {
+    const value = envGetOwned(name) orelse return false;
+    defer std.heap.page_allocator.free(value);
+    return std.mem.eql(u8, value, expected);
 }
 
 pub export fn hm_runtime_output_mode_frame_raw() c_int {
-    if (getenv("HOMONCULI_OUTPUT_MODE")) |_| {
+    if (envGetOwned("HOMONCULI_OUTPUT_MODE")) |value| {
+        defer std.heap.page_allocator.free(value);
         return if (envEquals("HOMONCULI_OUTPUT_MODE", "frame_raw")) 1 else 0;
     }
     return 1;
 }
 
 pub export fn hm_runtime_max_instructions(default_limit: u64) u64 {
-    const value = getenv("HOMONCULI_MAX_INSTRUCTIONS") orelse return default_limit;
-    return std.fmt.parseUnsigned(u64, std.mem.span(value), 10) catch default_limit;
+    const value = envGetOwned("HOMONCULI_MAX_INSTRUCTIONS") orelse return default_limit;
+    defer std.heap.page_allocator.free(value);
+    return std.fmt.parseUnsigned(u64, value, 10) catch default_limit;
 }
 
 pub export fn hmgba_sample_keyinput_for_frame(frame_index: u64) u16 {
-    const script = getenv("HOMONCULI_KEYINPUT_SCRIPT") orelse return 0x03FF;
-    return hmgbaSampleKeyinput(std.mem.span(script), frame_index);
+    const script = envGetOwned("HOMONCULI_KEYINPUT_SCRIPT") orelse return 0x03FF;
+    defer std.heap.page_allocator.free(script);
+    return hmgbaSampleKeyinput(script, frame_index);
 }
 
 pub fn hmgbaSampleKeyinput(script: []const u8, frame_index: u64) u16 {
@@ -314,7 +330,8 @@ pub export fn hmgba_dump_frame_raw(
     vram: [*]const u8,
     oam: [*]const u8,
 ) c_int {
-    const output_path = getenv("HOMONCULI_OUTPUT_PATH") orelse return dump_error_missing_output_path;
+    const output_path = envGetOwned("HOMONCULI_OUTPUT_PATH") orelse return dump_error_missing_output_path;
+    defer std.heap.page_allocator.free(output_path);
     const io_bytes: *const [1024]u8 = @ptrCast(io);
     const palette_bytes: *const [1024]u8 = @ptrCast(palette);
     const vram_bytes: *const [98304]u8 = @ptrCast(vram);
@@ -322,11 +339,18 @@ pub export fn hmgba_dump_frame_raw(
     var rgba: [rgba_len]u8 = undefined;
     dumpFrameRgba(io_bytes, palette_bytes, vram_bytes, oam_bytes, &rgba) catch return dump_error_unsupported_video_mode;
 
-    const file = fopen(output_path, "wb") orelse return dump_error_write_failed;
-    defer _ = fclose(file);
+    if (comptime standalone_build_cmd_test) {
+        Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = output_path, .data = &rgba }) catch return dump_error_write_failed;
+    } else {
+        const output_path_z = std.heap.page_allocator.dupeZ(u8, output_path) catch return dump_error_write_failed;
+        defer std.heap.page_allocator.free(output_path_z);
 
-    const written = fwrite(&rgba, 1, rgba.len, file);
-    if (written != rgba.len) return dump_error_write_failed;
+        const file = fopen(output_path_z, "wb") orelse return dump_error_write_failed;
+        defer _ = fclose(file);
+
+        const written = fwrite(&rgba, 1, rgba.len, file);
+        if (written != rgba.len) return dump_error_write_failed;
+    }
     return dump_ok;
 }
 

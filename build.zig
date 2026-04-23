@@ -21,12 +21,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const capstone_lib = capstone_dependency.artifact("capstone");
-    const capstone_translate = b.addTranslateC(.{
-        .root_source_file = b.path("src/capstone.h"),
-        .target = target,
-        .optimize = optimize,
-    });
-    capstone_translate.addIncludePath(capstone_lib.getEmittedIncludeTree());
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -51,7 +45,6 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
     });
-    mod.addImport("capstone_c", capstone_translate.createModule());
     mod.linkLibrary(capstone_lib);
 
     // Here we define an executable. An executable needs to have a root module
@@ -95,7 +88,6 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    exe.root_module.addImport("capstone_c", capstone_translate.createModule());
     exe.root_module.linkLibrary(capstone_lib);
 
     // This declares intent for the executable to be installed into the

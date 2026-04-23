@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const Io = std.Io;
 const armv4t_decode = @import("armv4t_decode.zig");
@@ -9,6 +10,8 @@ const parse = @import("cli/parse.zig");
 const interrupt_fixture_support = @import("interrupt_fixture_support.zig");
 const tonc_fixture_support = @import("tonc_fixture_support.zig");
 const gba_ppu_source = @embedFile("gba_ppu.zig");
+
+const standalone_build_cmd_test = builtin.is_test and !@hasDecl(@import("root"), "cli");
 
 pub const BuildOptions = parse.BuildCommand;
 
@@ -2427,6 +2430,80 @@ fn runNativeCapture(
     };
 }
 
+fn repoRelativeTmpPath(
+    allocator: std.mem.Allocator,
+    tmp: *const std.testing.TmpDir,
+    leaf: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path[0..], leaf });
+}
+
+fn buildFixtureNativeViaCli(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    rom_path: []const u8,
+    output_name: []const u8,
+    output_mode: parse.OutputMode,
+    max_instructions: u64,
+) ![]u8 {
+    const fixture_bytes = try readFixtureBytes(allocator, io, tmp.dir, rom_path);
+    defer allocator.free(fixture_bytes);
+
+    const rom_name = std.fs.path.basename(rom_path);
+    try tmp.dir.writeFile(io, .{ .sub_path = rom_name, .data = fixture_bytes });
+
+    const native_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ".zig-cache/tonc", output_name });
+    errdefer allocator.free(native_path);
+    const repo_rom_path = try repoRelativeTmpPath(allocator, tmp, rom_name);
+    defer allocator.free(repo_rom_path);
+    const repo_native_path = try repoRelativeTmpPath(allocator, tmp, native_path);
+    defer allocator.free(repo_native_path);
+
+    const output_mode_arg = switch (output_mode) {
+        .frame_raw => "frame_raw",
+        .retired_count => "retired_count",
+        .auto => unreachable,
+    };
+    const max_instructions_arg = try std.fmt.allocPrint(allocator, "{d}", .{max_instructions});
+    defer allocator.free(max_instructions_arg);
+
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{
+            "zig",
+            "build",
+            "run",
+            "--",
+            "build",
+            repo_rom_path,
+            "--machine",
+            "gba",
+            "--target",
+            "x86_64-linux",
+            "--output",
+            output_mode_arg,
+            "--max-instructions",
+            max_instructions_arg,
+            "--opt",
+            "release",
+            "-o",
+            repo_native_path,
+        },
+        .cwd = .{ .dir = Io.Dir.cwd() },
+        .stdout_limit = .limited(16 * 1024),
+        .stderr_limit = .limited(16 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    if (!std.meta.eql(result.term, std.process.Child.Term{ .exited = 0 })) {
+        if (result.stdout.len != 0) std.debug.print("{s}", .{result.stdout});
+        if (result.stderr.len != 0) std.debug.print("{s}", .{result.stderr});
+        return error.ToolFailed;
+    }
+    return native_path;
+}
+
 fn expectToncGoldenFrame(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -3533,7 +3610,18 @@ test "minimal vblank fixture turns the signal pixel green" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const native_path = try buildFixtureNative(
+    const native_path = if (standalone_build_cmd_test)
+        try buildFixtureNativeViaCli(
+            std.testing.allocator,
+            io,
+            &tmp,
+            interrupt_fixture_support.minimal_vblank.rom_path,
+            "frame-irq-native",
+            .frame_raw,
+            interrupt_fixture_support.minimal_vblank.max_instructions,
+        )
+    else
+        try buildFixtureNative(
         std.testing.allocator,
         io,
         tmp.dir,
@@ -3544,11 +3632,19 @@ test "minimal vblank fixture turns the signal pixel green" {
     );
     defer std.testing.allocator.free(native_path);
 
-    try runFrameFixture(io, tmp.dir, native_path, "frame_irq.rgba", .{
+    const frame_path = try std.testing.allocator.dupe(u8, "frame_irq.rgba");
+    defer std.testing.allocator.free(frame_path);
+
+    try runFrameFixture(io, tmp.dir, native_path, frame_path, .{
         .max_instructions = interrupt_fixture_support.minimal_vblank.max_instructions,
     });
 
-    const frame = try frame_test_support.readExactFrame(std.testing.allocator, io, tmp.dir, "frame_irq.rgba");
+    const frame = try frame_test_support.readExactFrame(
+        std.testing.allocator,
+        io,
+        tmp.dir,
+        frame_path,
+    );
     defer std.testing.allocator.free(frame);
 
     try frame_test_support.expectPixel(
@@ -3565,7 +3661,11 @@ test "minimal vblank model rejects non-vblank IE bits" {
     defer tmp.cleanup();
 
     try writeNonVBlankIeRom(tmp.dir, io, "ie-bad.gba");
-    const native_path = try buildFixtureNative(
+
+    const native_path = if (standalone_build_cmd_test)
+        try buildFixtureNativeViaCli(std.testing.allocator, io, &tmp, "ie-bad.gba", "ie-bad-native", .retired_count, 500_000)
+    else
+        try buildFixtureNative(
         std.testing.allocator,
         io,
         tmp.dir,
@@ -3576,7 +3676,14 @@ test "minimal vblank model rejects non-vblank IE bits" {
     );
     defer std.testing.allocator.free(native_path);
 
-    const result = try runNativeCapture(std.testing.allocator, io, tmp.dir, native_path, "retired_count", 500_000);
+    const result = try runNativeCapture(
+        std.testing.allocator,
+        io,
+        tmp.dir,
+        native_path,
+        "retired_count",
+        500_000,
+    );
     defer std.testing.allocator.free(result.stdout);
     defer std.testing.allocator.free(result.stderr);
 
@@ -3589,7 +3696,11 @@ test "minimal vblank model rejects IME re-enable inside a handler" {
     defer tmp.cleanup();
 
     try writeNestedImeRom(tmp.dir, io, "nested-ime.gba");
-    const native_path = try buildFixtureNative(
+
+    const native_path = if (standalone_build_cmd_test)
+        try buildFixtureNativeViaCli(std.testing.allocator, io, &tmp, "nested-ime.gba", "nested-ime-native", .retired_count, 500_000)
+    else
+        try buildFixtureNative(
         std.testing.allocator,
         io,
         tmp.dir,
@@ -3600,7 +3711,14 @@ test "minimal vblank model rejects IME re-enable inside a handler" {
     );
     defer std.testing.allocator.free(native_path);
 
-    const result = try runNativeCapture(std.testing.allocator, io, tmp.dir, native_path, "retired_count", 500_000);
+    const result = try runNativeCapture(
+        std.testing.allocator,
+        io,
+        tmp.dir,
+        native_path,
+        "retired_count",
+        500_000,
+    );
     defer std.testing.allocator.free(result.stdout);
     defer std.testing.allocator.free(result.stderr);
 
