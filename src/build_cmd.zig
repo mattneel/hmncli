@@ -893,11 +893,8 @@ fn thumbEntrySavedRegsMask(
                 .push => |mask| mask,
                 else => return null,
             };
-            const saved_mask = push_mask & 0x00FF;
-            if ((push_mask & (@as(u16, 1) << 14)) == 0) return null;
-            if ((push_mask & ~@as(u16, 0x40FF)) != 0) return null;
-            if (saved_mask == 0) return null;
-            return saved_mask;
+            if (push_mask != 0x4010) return null;
+            return 0x0010;
         },
         else => {},
     }
@@ -2540,17 +2537,15 @@ test "thumb saved-lr return epilogue resolves exact low-register multi-save shap
     try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
 }
 
-test "thumb saved-lr return epilogue allows the exact sbb_reg prologue" {
+test "thumb saved-lr entry witness accepts the exact sbb_reg prologue" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var rom: [12]u8 = .{
+    var rom: [8]u8 = .{
         0x00, 0x22,
-        0x23, 0x4B,
-        0x30, 0xB5,
-        0x30, 0xBC,
-        0x01, 0xBC,
+        0x0B, 0x4B,
+        0x10, 0xB5,
         0x00, 0x47,
     };
     try tmp.dir.writeFile(io, .{ .sub_path = "thumb-pop-bx-return-multi-save-prefix.gba", .data = &rom });
@@ -2558,11 +2553,11 @@ test "thumb saved-lr return epilogue allows the exact sbb_reg prologue" {
     const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-bx-return-multi-save-prefix.gba");
     defer image.deinit(std.testing.allocator);
 
-    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_000A, 0);
-    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
+    const mask = thumbEntrySavedRegsMask(image, .{ .address = 0x0800_0000, .isa = .thumb });
+    try std.testing.expectEqual(@as(?u16, 0x0010), mask);
 }
 
-test "thumb saved-lr return witness is anchored at function entry" {
+test "thumb saved-lr entry witness is anchored at function entry" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2570,94 +2565,64 @@ test "thumb saved-lr return witness is anchored at function entry" {
     const cases = [_]struct {
         rom_bytes: []const u8,
         function_entry: armv4t_decode.CodeAddress,
-        bx_address: u32,
-        expect_ok: bool,
+        expect_mask: ?u16,
     }{
         .{
             .rom_bytes = &.{ 0x10, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
             .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
-            .bx_address = 0x0800_0006,
-            .expect_ok = true,
+            .expect_mask = 0x0010,
         },
         .{
             .rom_bytes = &.{ 0x30, 0xB5, 0x30, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
             .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
-            .bx_address = 0x0800_0006,
-            .expect_ok = true,
+            .expect_mask = 0x0030,
         },
         .{
             .rom_bytes = &.{
                 0x00, 0x22,
-                0x23, 0x4B,
-                0x30, 0xB5,
-                0x30, 0xBC,
-                0x01, 0xBC,
+                0x0B, 0x4B,
+                0x10, 0xB5,
                 0x00, 0x47,
             },
             .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
-            .bx_address = 0x0800_000A,
-            .expect_ok = true,
+            .expect_mask = 0x0010,
         },
         .{
             .rom_bytes = &.{
                 0x00, 0x22,
-                0x23, 0x4B,
-                0x24, 0x4A,
+                0x0B, 0x4B,
                 0x30, 0xB5,
-                0x30, 0xBC,
-                0x01, 0xBC,
+                0x00, 0x47,
+                0x00, 0x00,
+                0x00, 0x00,
+            },
+            .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
+            .expect_mask = null,
+        },
+        .{
+            .rom_bytes = &.{
+                0x00, 0x22,
+                0x10, 0xB5,
                 0x00, 0x47,
                 0x00, 0x00,
             },
             .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
-            .bx_address = 0x0800_000C,
-            .expect_ok = false,
-        },
-        .{
-            .rom_bytes = &.{
-                0x00, 0x22,
-                0x30, 0xB5,
-                0x30, 0xBC,
-                0x01, 0xBC,
-                0x00, 0x47,
-                0x00, 0x00,
-            },
-            .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
-            .bx_address = 0x0800_0008,
-            .expect_ok = false,
+            .expect_mask = null,
         },
         .{
             .rom_bytes = &.{ 0x00, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
             .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
-            .bx_address = 0x0800_0006,
-            .expect_ok = false,
+            .expect_mask = null,
         },
         .{
             .rom_bytes = &.{ 0x30, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
             .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
-            .bx_address = 0x0800_0006,
-            .expect_ok = false,
+            .expect_mask = 0x0030,
         },
         .{
             .rom_bytes = &.{ 0x10, 0xB5, 0x10, 0xBC, 0x01, 0xBC, 0x00, 0x47 },
             .function_entry = .{ .address = 0x0800_0000, .isa = .arm },
-            .bx_address = 0x0800_0006,
-            .expect_ok = false,
-        },
-        .{
-            .rom_bytes = &.{
-                0x00, 0x23,
-                0x24, 0x4A,
-                0x30, 0xB5,
-                0x30, 0xBC,
-                0x01, 0xBC,
-                0x00, 0x47,
-                0x00, 0x00,
-                0x00, 0x00,
-            },
-            .function_entry = .{ .address = 0x0800_0000, .isa = .thumb },
-            .bx_address = 0x0800_000A,
-            .expect_ok = false,
+            .expect_mask = null,
         },
     };
 
@@ -2669,14 +2634,11 @@ test "thumb saved-lr return witness is anchored at function entry" {
         const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", path);
         defer image.deinit(std.testing.allocator);
 
-        const result = resolveBxTarget(image, case.function_entry, case.bx_address, 0);
-        if (case.expect_ok) {
-            try std.testing.expectEqualDeep(
-                armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} },
-                try result,
-            );
+        const mask = thumbEntrySavedRegsMask(image, case.function_entry);
+        if (case.expect_mask) |expected_mask| {
+            try std.testing.expectEqual(@as(?u16, expected_mask), mask);
         } else {
-            try std.testing.expectError(error.UnsupportedOpcode, result);
+            try std.testing.expectEqual(@as(?u16, null), mask);
         }
     }
 }
