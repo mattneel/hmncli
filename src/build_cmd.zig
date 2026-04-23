@@ -1564,12 +1564,16 @@ fn writeMeasuredCommercialStartupBxR1LiteralRom(
     load_word: u32,
     literal_pc_offset: usize,
     literal: u32,
+    thumb_target_address: u32,
+    thumb_halfword: u16,
 ) !void {
     var rom: [512]u8 = std.mem.zeroes([512]u8);
     std.mem.writeInt(u32, rom[startup_offset..][0..4], load_word, .little);
     std.mem.writeInt(u32, rom[startup_offset + 4 ..][0..4], 0xE1A0E00F, .little);
     std.mem.writeInt(u32, rom[startup_offset + 8 ..][0..4], 0xE12FFF11, .little);
     std.mem.writeInt(u32, rom[startup_offset + 8 + literal_pc_offset ..][0..4], literal, .little);
+    const thumb_target_offset = @as(usize, @intCast((thumb_target_address & ~@as(u32, 1)) - 0x0800_0000));
+    std.mem.writeInt(u16, rom[thumb_target_offset..][0..2], thumb_halfword, .little);
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
@@ -2853,18 +2857,18 @@ test "arm startup bx r1 literal target resolves the measured commercial handoff 
             .startup_offset = 0xD8,
             .load_word = 0xE59F1010,
             .literal_pc_offset = 16,
-            .literal = 0x0807_AD11,
+            .literal = 0x0800_0101,
             .bx_address = 0x0800_00E0,
-            .expected_target = .{ .address = 0x0807_AD10, .isa = .thumb },
+            .expected_target = .{ .address = 0x0800_0100, .isa = .thumb },
         },
         .{
             .path = "kirby-startup.gba",
             .startup_offset = 0xE4,
             .load_word = 0xE59F112C,
             .literal_pc_offset = 300,
-            .literal = 0x0800_0311,
+            .literal = 0x0800_0121,
             .bx_address = 0x0800_00EC,
-            .expected_target = .{ .address = 0x0800_0310, .isa = .thumb },
+            .expected_target = .{ .address = 0x0800_0120, .isa = .thumb },
         },
     };
 
@@ -2877,6 +2881,8 @@ test "arm startup bx r1 literal target resolves the measured commercial handoff 
             case.load_word,
             case.literal_pc_offset,
             case.literal,
+            case.literal,
+            0x4770,
         );
 
         const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", case.path);
