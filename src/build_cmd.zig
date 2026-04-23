@@ -1556,6 +1556,23 @@ fn writeStartupThumbBlxR3VeneerRom(
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
+fn writeArmStartupBxR1LiteralRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+    load_word: u32,
+    literal: u32,
+    thumb_halfword: u16,
+) !void {
+    var rom: [24]u8 = std.mem.zeroes([24]u8);
+    std.mem.writeInt(u32, rom[0..4], load_word, .little);
+    std.mem.writeInt(u32, rom[4..8], 0xE1A0E00F, .little);
+    std.mem.writeInt(u32, rom[8..12], 0xE12FFF11, .little);
+    std.mem.writeInt(u32, rom[12..16], literal, .little);
+    std.mem.writeInt(u16, rom[16..18], thumb_halfword, .little);
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
 fn writeLocalThumbBlxR3VeneerRom(
     dir: std.Io.Dir,
     io: std.Io,
@@ -2814,6 +2831,32 @@ test "devkitARM crt0 startup blx r3 veneer resolves the caller literal target" {
     try std.testing.expectEqual(
         @as(?armv4t_decode.CodeAddress, .{ .address = 0x0800_0008, .isa = .thumb }),
         try resolveDevkitArmCrt0StartupThumbBlxR3Target(image, .thumb, 0x0800_0004, 0x0800_0008),
+    );
+}
+
+test "arm startup bx r1 literal target resolves the measured commercial handoff shape" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeArmStartupBxR1LiteralRom(
+        tmp.dir,
+        io,
+        "arm-startup-bx-r1.gba",
+        0xE59F1004,
+        0x0800_0011,
+        0x4770,
+    );
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "arm-startup-bx-r1.gba");
+    defer image.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_target = .{
+            .address = 0x0800_0010,
+            .isa = .thumb,
+        } },
+        try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .arm }, 0x0800_0008, 1),
     );
 }
 
