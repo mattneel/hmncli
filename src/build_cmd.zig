@@ -874,7 +874,7 @@ fn thumbEntrySavedRegsMask(
     switch (entry.instruction) {
         .movs_imm => |mov| {
             // Exact carve-out for the measured `sbb_reg` prologue:
-            // `movs r2, #0` + one literal load + `push {r4, lr}`.
+            // `movs r2, #0` + `ldr r3, [pc, #44]` + `push {r4, lr}`.
             if (entry.size_bytes != 2) return null;
             if (mov.rd != 2 or mov.imm != 0) return null;
 
@@ -884,7 +884,7 @@ fn thumbEntrySavedRegsMask(
                 else => return null,
             };
             if (first.size_bytes != 2) return null;
-            if (first_load.base != 15 or first_load.rd >= 8) return null;
+            if (first_load.rd != 3 or first_load.base != 15 or first_load.offset != 44) return null;
 
             address += entry.size_bytes + first.size_bytes;
             const push = decodeImageInstructionUnchecked(image, .thumb, address) catch return null;
@@ -2534,6 +2534,35 @@ test "thumb saved-lr return epilogue resolves exact low-register multi-save shap
     defer image.deinit(std.testing.allocator);
 
     const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0006, 0);
+    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
+}
+
+test "thumb saved-lr return epilogue resolves the exact sbb_reg prologue and tail" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var rom: [0x80C]u8 = undefined;
+    @memset(&rom, 0);
+    rom[0x04C0] = 0x00;
+    rom[0x04C1] = 0x22;
+    rom[0x04C2] = 0x0B;
+    rom[0x04C3] = 0x4B;
+    rom[0x04C4] = 0x10;
+    rom[0x04C5] = 0xB5;
+    rom[0x0804] = 0x10;
+    rom[0x0805] = 0xBC;
+    rom[0x0806] = 0x08;
+    rom[0x0807] = 0xBC;
+    rom[0x0808] = 0x18;
+    rom[0x0809] = 0x47;
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-sbb-reg-exact.gba", .data = &rom });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-sbb-reg-exact.gba");
+    defer image.deinit(std.testing.allocator);
+
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_04C0, .isa = .thumb }, 0x0800_0808, 3);
     try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
 }
 
