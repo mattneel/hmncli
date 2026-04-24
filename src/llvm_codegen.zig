@@ -853,12 +853,22 @@ fn emitGbaDmaHelpers(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("  %dma_should_run = and i1 %dma_enabled, %dma_immediate\n", .{});
     try writer.print("  br i1 %dma_should_run, label %dma_validate, label %dma_return\n", .{});
     try writer.print("dma_validate:\n", .{});
-    try writer.print("  %dma_source_mode = and i32 %dma_control_hi, 384\n", .{});
-    try writer.print("  %dma_dest_mode = and i32 %dma_control_hi, 96\n", .{});
+    try writer.print("  %dma_source_mode = and i32 %dma_control_hi, 96\n", .{});
+    try writer.print("  %dma_dest_mode = and i32 %dma_control_hi, 384\n", .{});
     try writer.print("  %dma_source_increment = icmp eq i32 %dma_source_mode, 0\n", .{});
+    try writer.print("  %dma_source_fixed = icmp eq i32 %dma_source_mode, 64\n", .{});
+    try writer.print("  %dma_source_decrement = icmp eq i32 %dma_source_mode, 32\n", .{});
+    try writer.print("  %dma_source_mode_supported_1 = or i1 %dma_source_increment, %dma_source_fixed\n", .{});
+    try writer.print("  %dma_source_mode_supported = or i1 %dma_source_mode_supported_1, %dma_source_decrement\n", .{});
+
     try writer.print("  %dma_dest_increment = icmp eq i32 %dma_dest_mode, 0\n", .{});
-    try writer.print("  %dma_increment_modes = and i1 %dma_source_increment, %dma_dest_increment\n", .{});
-    try writer.print("  br i1 %dma_increment_modes, label %dma_setup, label %dma_unsupported\n", .{});
+    try writer.print("  %dma_dest_fixed = icmp eq i32 %dma_dest_mode, 256\n", .{});
+    try writer.print("  %dma_dest_decrement = icmp eq i32 %dma_dest_mode, 128\n", .{});
+    try writer.print("  %dma_dest_mode_supported_1 = or i1 %dma_dest_increment, %dma_dest_fixed\n", .{});
+    try writer.print("  %dma_dest_mode_supported = or i1 %dma_dest_mode_supported_1, %dma_dest_decrement\n", .{});
+
+    try writer.print("  %dma_modes_supported = and i1 %dma_source_mode_supported, %dma_dest_mode_supported\n", .{});
+    try writer.print("  br i1 %dma_modes_supported, label %dma_setup, label %dma_unsupported\n", .{});
     try writer.print("dma_setup:\n", .{});
     try writer.print("  %dma_count_raw = and i32 %dma_control, 65535\n", .{});
     try writer.print("  %dma_count_is_zero = icmp eq i32 %dma_count_raw, 0\n", .{});
@@ -873,8 +883,15 @@ fn emitGbaDmaHelpers(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("  br i1 %dma_loop_done, label %dma_finish, label %dma_body\n", .{});
     try writer.print("dma_body:\n", .{});
     try writer.print("  %dma_byte_offset = mul i32 %dma_index, %dma_unit_bytes\n", .{});
-    try writer.print("  %dma_source = add i32 %dma_source_start, %dma_byte_offset\n", .{});
-    try writer.print("  %dma_dest = add i32 %dma_dest_start, %dma_byte_offset\n", .{});
+    try writer.print("  %dma_source_inc = add i32 %dma_source_start, %dma_byte_offset\n", .{});
+    try writer.print("  %dma_source_dec = sub i32 %dma_source_start, %dma_byte_offset\n", .{});
+    try writer.print("  %dma_source_stride = select i1 %dma_source_decrement, i32 %dma_source_dec, i32 %dma_source_inc\n", .{});
+    try writer.print("  %dma_source = select i1 %dma_source_fixed, i32 %dma_source_start, i32 %dma_source_stride\n", .{});
+
+    try writer.print("  %dma_dest_inc = add i32 %dma_dest_start, %dma_byte_offset\n", .{});
+    try writer.print("  %dma_dest_dec = sub i32 %dma_dest_start, %dma_byte_offset\n", .{});
+    try writer.print("  %dma_dest_stride = select i1 %dma_dest_decrement, i32 %dma_dest_dec, i32 %dma_dest_inc\n", .{});
+    try writer.print("  %dma_dest = select i1 %dma_dest_fixed, i32 %dma_dest_start, i32 %dma_dest_stride\n", .{});
     try writer.print("  br i1 %dma_word_sized, label %dma_word_body, label %dma_half_body\n", .{});
     try writer.print("dma_word_body:\n", .{});
     try writer.print("  %dma_word_value = call i32 @hmn_load32(ptr %state, i32 %dma_source)\n", .{});

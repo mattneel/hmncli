@@ -19,7 +19,8 @@ This is not an emulator. There is no interpreter, no JIT, no runtime recompilati
 - mGBA-backed raw frame goldens now exist for the green `tonc` demos: `sbb_reg`, `obj_demo`, and `key_demo`.
 - Deterministic scripted KEYINPUT exists for bring-up smoke tests.
 - Local-only commercial probing is active. Developer-supplied commercial ROMs live under `.zig-cache/local-commercial-roms/` and are never committed.
-- The current local Kirby probe reaches and renders the story/title sequence through `frame_raw`, including tiled BG layers and OAM sprites, and can run through the SDL3 frame-step window path. This is a local bring-up checkpoint, not a committed commercial fixture or compatibility claim.
+- Local commercial probing is active. The current local Kirby probe is blocked in disassembly (Thumb decode path) and does not yet reach a title render target; it remains a measured blocker only.
+- Local `advance-wars.gba` reaches the native-output path and produces `frame_raw`, but the first observable frame is all-black today while `max-instructions` is raised. Kirby/Advance Wars support is therefore not complete.
 - The SDL3 path is not a playable runtime yet. SDL keyboard input is not mapped into GBA KEYINPUT, there is no audio backend, and there is still no second machine target.
 
 ## Quickstart
