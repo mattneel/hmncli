@@ -2842,6 +2842,38 @@ fn writeCpuSetCopyRom(
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
+fn writeCpuFastSetCopyRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xE59F0010, // ldr r0, [pc, #0x10] ; source
+        0xE59F1010, // ldr r1, [pc, #0x10] ; dest
+        0xE59F2010, // ldr r2, [pc, #0x10] ; control
+        0xEF00000C, // swi 0x0C (CpuFastSet)
+        0xE591001C, // ldr r0, [r1, #28] ; eighth copied word
+        0xE1A0F00E, // mov pc, lr
+        0x08000024, // source literal
+        0x03000000, // dest literal
+        0x00000008, // eight 32-bit words, copy mode
+        11,
+        22,
+        33,
+        44,
+        55,
+        66,
+        77,
+        88,
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
 fn writeCpuSetCopyAutoProbeRom(
     dir: std.Io.Dir,
     io: std.Io,
@@ -5096,6 +5128,45 @@ test "build executes CpuSet copy semantics on a synthetic ROM" {
 
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("99\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "build executes CpuFastSet copy semantics on a synthetic ROM" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeCpuFastSetCopyRom(tmp.dir, io, "cpufastset-copy.gba");
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "cpufastset-copy.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "cpufastset-copy-native",
+            .output_mode = .auto,
+            .optimize = .release,
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./cpufastset-copy-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("88\n", result.stdout);
     try std.testing.expectEqualStrings("", result.stderr);
 }
 
