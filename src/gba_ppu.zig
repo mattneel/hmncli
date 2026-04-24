@@ -5,6 +5,9 @@ extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*FileHandle;
 extern fn fwrite(buffer: *const anyopaque, size: usize, count: usize, stream: *FileHandle) usize;
 extern fn fclose(stream: *FileHandle) c_int;
+extern fn dlopen(filename: [*:0]const u8, flags: c_int) ?*anyopaque;
+extern fn dlsym(handle: *anyopaque, symbol: [*:0]const u8) ?*anyopaque;
+extern fn dlclose(handle: *anyopaque) c_int;
 
 const FileHandle = opaque {};
 const standalone_build_cmd_test = builtin.is_test and !@hasDecl(@import("root"), "cli");
@@ -16,6 +19,20 @@ pub const dump_ok: c_int = 0;
 pub const dump_error_missing_output_path: c_int = 1;
 pub const dump_error_unsupported_video_mode: c_int = 2;
 pub const dump_error_write_failed: c_int = 3;
+pub const dump_error_sdl3_missing: c_int = 4;
+pub const dump_error_sdl3_init_failed: c_int = 5;
+pub const dump_error_sdl3_window_failed: c_int = 6;
+pub const dump_error_sdl3_renderer_failed: c_int = 7;
+pub const dump_error_sdl3_texture_failed: c_int = 8;
+pub const dump_error_sdl3_render_failed: c_int = 9;
+
+const rtld_now: c_int = 2;
+const sdl_init_video: u32 = 0x0000_0020;
+const sdl_window_resizable: u64 = 0x0000_0000_0000_0020;
+const sdl_window_high_pixel_density: u64 = 0x0000_0000_0000_2000;
+const sdl_pixelformat_rgba32: u32 = 0x1676_2004;
+const sdl_textureaccess_streaming: c_int = 1;
+const sdl_event_quit: u32 = 0x0000_0100;
 
 pub const FrameError = error{
     UnsupportedVideoMode,
@@ -568,6 +585,92 @@ pub fn hmgbaSampleKeyinput(script: []const u8, frame_index: u64) u16 {
     return current;
 }
 
+const SdlWindow = opaque {};
+const SdlRenderer = opaque {};
+const SdlTexture = opaque {};
+
+const SdlEvent = extern struct {
+    type: u32,
+    padding: [252]u8,
+};
+
+const SdlInitFn = *const fn (u32) callconv(.c) bool;
+const SdlQuitFn = *const fn () callconv(.c) void;
+const SdlCreateWindowFn = *const fn ([*:0]const u8, c_int, c_int, u64) callconv(.c) ?*SdlWindow;
+const SdlDestroyWindowFn = *const fn (?*SdlWindow) callconv(.c) void;
+const SdlCreateRendererFn = *const fn (?*SdlWindow, ?[*:0]const u8) callconv(.c) ?*SdlRenderer;
+const SdlDestroyRendererFn = *const fn (?*SdlRenderer) callconv(.c) void;
+const SdlCreateTextureFn = *const fn (?*SdlRenderer, u32, c_int, c_int, c_int) callconv(.c) ?*SdlTexture;
+const SdlDestroyTextureFn = *const fn (?*SdlTexture) callconv(.c) void;
+const SdlUpdateTextureFn = *const fn (?*SdlTexture, ?*const anyopaque, *const anyopaque, c_int) callconv(.c) bool;
+const SdlSetRenderDrawColorFn = *const fn (?*SdlRenderer, u8, u8, u8, u8) callconv(.c) bool;
+const SdlRenderClearFn = *const fn (?*SdlRenderer) callconv(.c) bool;
+const SdlRenderTextureFn = *const fn (?*SdlRenderer, ?*SdlTexture, ?*const anyopaque, ?*const anyopaque) callconv(.c) bool;
+const SdlRenderPresentFn = *const fn (?*SdlRenderer) callconv(.c) bool;
+const SdlPollEventFn = *const fn (*SdlEvent) callconv(.c) bool;
+const SdlDelayFn = *const fn (u32) callconv(.c) void;
+
+const SdlApi = struct {
+    library: *anyopaque,
+    init: SdlInitFn,
+    quit: SdlQuitFn,
+    create_window: SdlCreateWindowFn,
+    destroy_window: SdlDestroyWindowFn,
+    create_renderer: SdlCreateRendererFn,
+    destroy_renderer: SdlDestroyRendererFn,
+    create_texture: SdlCreateTextureFn,
+    destroy_texture: SdlDestroyTextureFn,
+    update_texture: SdlUpdateTextureFn,
+    set_render_draw_color: SdlSetRenderDrawColorFn,
+    render_clear: SdlRenderClearFn,
+    render_texture: SdlRenderTextureFn,
+    render_present: SdlRenderPresentFn,
+    poll_event: SdlPollEventFn,
+    delay: SdlDelayFn,
+
+    fn load() ?SdlApi {
+        const library = openSdl3Library() orelse return null;
+        return .{
+            .library = library,
+            .init = loadSdlSymbol(SdlInitFn, library, "SDL_Init") orelse return closeAndFail(library),
+            .quit = loadSdlSymbol(SdlQuitFn, library, "SDL_Quit") orelse return closeAndFail(library),
+            .create_window = loadSdlSymbol(SdlCreateWindowFn, library, "SDL_CreateWindow") orelse return closeAndFail(library),
+            .destroy_window = loadSdlSymbol(SdlDestroyWindowFn, library, "SDL_DestroyWindow") orelse return closeAndFail(library),
+            .create_renderer = loadSdlSymbol(SdlCreateRendererFn, library, "SDL_CreateRenderer") orelse return closeAndFail(library),
+            .destroy_renderer = loadSdlSymbol(SdlDestroyRendererFn, library, "SDL_DestroyRenderer") orelse return closeAndFail(library),
+            .create_texture = loadSdlSymbol(SdlCreateTextureFn, library, "SDL_CreateTexture") orelse return closeAndFail(library),
+            .destroy_texture = loadSdlSymbol(SdlDestroyTextureFn, library, "SDL_DestroyTexture") orelse return closeAndFail(library),
+            .update_texture = loadSdlSymbol(SdlUpdateTextureFn, library, "SDL_UpdateTexture") orelse return closeAndFail(library),
+            .set_render_draw_color = loadSdlSymbol(SdlSetRenderDrawColorFn, library, "SDL_SetRenderDrawColor") orelse return closeAndFail(library),
+            .render_clear = loadSdlSymbol(SdlRenderClearFn, library, "SDL_RenderClear") orelse return closeAndFail(library),
+            .render_texture = loadSdlSymbol(SdlRenderTextureFn, library, "SDL_RenderTexture") orelse return closeAndFail(library),
+            .render_present = loadSdlSymbol(SdlRenderPresentFn, library, "SDL_RenderPresent") orelse return closeAndFail(library),
+            .poll_event = loadSdlSymbol(SdlPollEventFn, library, "SDL_PollEvent") orelse return closeAndFail(library),
+            .delay = loadSdlSymbol(SdlDelayFn, library, "SDL_Delay") orelse return closeAndFail(library),
+        };
+    }
+};
+
+fn closeAndFail(library: *anyopaque) ?SdlApi {
+    _ = dlclose(library);
+    return null;
+}
+
+fn loadSdlSymbol(comptime T: type, library: *anyopaque, name: [:0]const u8) ?T {
+    const symbol = dlsym(library, name.ptr) orelse return null;
+    return @ptrCast(symbol);
+}
+
+fn openSdl3Library() ?*anyopaque {
+    if (envGetOwned("HOMONCULI_SDL3_PATH")) |path| {
+        defer std.heap.page_allocator.free(path);
+        const path_z = std.heap.page_allocator.dupeZ(u8, path) catch return null;
+        defer std.heap.page_allocator.free(path_z);
+        return dlopen(path_z.ptr, rtld_now);
+    }
+    return dlopen("libSDL3.so.0", rtld_now) orelse dlopen("libSDL3.so", rtld_now);
+}
+
 pub export fn hmgba_dump_frame_raw(
     io: [*]const u8,
     palette: [*]const u8,
@@ -596,6 +699,80 @@ pub export fn hmgba_dump_frame_raw(
         if (written != rgba.len) return dump_error_write_failed;
     }
     return dump_ok;
+}
+
+pub export fn hmgba_run_sdl3_window(
+    io: [*]const u8,
+    palette: [*]const u8,
+    vram: [*]const u8,
+    oam: [*]const u8,
+) c_int {
+    const io_bytes: *const [1024]u8 = @ptrCast(io);
+    const palette_bytes: *const [1024]u8 = @ptrCast(palette);
+    const vram_bytes: *const [98304]u8 = @ptrCast(vram);
+    const oam_bytes: *const [1024]u8 = @ptrCast(oam);
+    var rgba: [rgba_len]u8 = undefined;
+    dumpFrameRgba(io_bytes, palette_bytes, vram_bytes, oam_bytes, &rgba) catch return dump_error_unsupported_video_mode;
+
+    const sdl = SdlApi.load() orelse return dump_error_sdl3_missing;
+    defer _ = dlclose(sdl.library);
+
+    if (!sdl.init(sdl_init_video)) return dump_error_sdl3_init_failed;
+    defer sdl.quit();
+
+    const window = sdl.create_window(
+        "Homonculi GBA",
+        frame_width * 3,
+        frame_height * 3,
+        sdl_window_resizable | sdl_window_high_pixel_density,
+    ) orelse return dump_error_sdl3_window_failed;
+    defer sdl.destroy_window(window);
+
+    const renderer = sdl.create_renderer(window, null) orelse return dump_error_sdl3_renderer_failed;
+    defer sdl.destroy_renderer(renderer);
+
+    const texture = sdl.create_texture(
+        renderer,
+        sdl_pixelformat_rgba32,
+        sdl_textureaccess_streaming,
+        frame_width,
+        frame_height,
+    ) orelse return dump_error_sdl3_texture_failed;
+    defer sdl.destroy_texture(texture);
+
+    if (!sdl.update_texture(texture, null, &rgba, frame_width * 4)) return dump_error_sdl3_render_failed;
+
+    var frames_presented: u64 = 0;
+    const autoclose_frames = windowAutocloseFrames();
+    var running = true;
+    while (running) {
+        var event: SdlEvent align(8) = undefined;
+        while (sdl.poll_event(&event)) {
+            if (event.type == sdl_event_quit) {
+                running = false;
+            }
+        }
+        if (!running) break;
+
+        if (!sdl.set_render_draw_color(renderer, 0, 0, 0, 255)) return dump_error_sdl3_render_failed;
+        if (!sdl.render_clear(renderer)) return dump_error_sdl3_render_failed;
+        if (!sdl.render_texture(renderer, texture, null, null)) return dump_error_sdl3_render_failed;
+        if (!sdl.render_present(renderer)) return dump_error_sdl3_render_failed;
+
+        frames_presented += 1;
+        if (autoclose_frames) |limit| {
+            if (frames_presented >= limit) break;
+        }
+        sdl.delay(16);
+    }
+
+    return dump_ok;
+}
+
+fn windowAutocloseFrames() ?u64 {
+    const value = envGetOwned("HOMONCULI_WINDOW_AUTOCLOSE_FRAMES") orelse return null;
+    defer std.heap.page_allocator.free(value);
+    return std.fmt.parseUnsigned(u64, value, 10) catch null;
 }
 
 test "mode4 renderer decodes active page into rgba pixels" {

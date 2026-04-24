@@ -8,6 +8,7 @@ pub const OutputMode = enum {
     arm_report,
     frame_raw,
     retired_count,
+    window,
 };
 
 pub const SaveHardware = enum {
@@ -614,6 +615,13 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("@.fmt_frame_missing_path = private unnamed_addr constant [42 x i8] c\"frame_raw requires HOMONCULI_OUTPUT_PATH\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_frame_bad_mode = private unnamed_addr constant [47 x i8] c\"frame_raw requires a supported GBA video mode\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_frame_write_failed = private unnamed_addr constant [24 x i8] c\"frame_raw write failed\\0A\\00\", align 1\n", .{});
+    try writer.print("@.fmt_window_bad_mode = private unnamed_addr constant [44 x i8] c\"window requires a supported GBA video mode\\0A\\00\", align 1\n", .{});
+    try writer.print("@.fmt_window_missing_sdl = private unnamed_addr constant [28 x i8] c\"window could not load SDL3\\0A\\00\", align 1\n", .{});
+    try writer.print("@.fmt_window_init_failed = private unnamed_addr constant [34 x i8] c\"window could not initialize SDL3\\0A\\00\", align 1\n", .{});
+    try writer.print("@.fmt_window_create_failed = private unnamed_addr constant [37 x i8] c\"window could not create SDL3 window\\0A\\00\", align 1\n", .{});
+    try writer.print("@.fmt_window_renderer_failed = private unnamed_addr constant [39 x i8] c\"window could not create SDL3 renderer\\0A\\00\", align 1\n", .{});
+    try writer.print("@.fmt_window_texture_failed = private unnamed_addr constant [38 x i8] c\"window could not create SDL3 texture\\0A\\00\", align 1\n", .{});
+    try writer.print("@.fmt_window_render_failed = private unnamed_addr constant [27 x i8] c\"window SDL3 render failed\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_retired = private unnamed_addr constant [14 x i8] c\"retired=%llu\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_irq_bad_ie = private unnamed_addr constant [64 x i8] c\"Unsupported interrupt source mask 0x%04x at 0x04000200 for gba\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_irq_multi_if = private unnamed_addr constant [58 x i8] c\"Unsupported pending IF mask 0x%04x at 0x04000202 for gba\\0A\\00\", align 1\n", .{});
@@ -626,6 +634,7 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("@.fmt_multiboot_stub = private unnamed_addr constant [41 x i8] c\"Unsupported BIOS shim MultiBoot for gba\\0A\\00\", align 1\n", .{});
     try writer.print("declare i32 @printf(ptr, ...)\n", .{});
     try writer.print("declare i32 @hmgba_dump_frame_raw(ptr, ptr, ptr, ptr)\n", .{});
+    try writer.print("declare i32 @hmgba_run_sdl3_window(ptr, ptr, ptr, ptr)\n", .{});
     try writer.print("declare i16 @hmgba_sample_keyinput_for_frame(i64)\n", .{});
     try writer.print("declare i64 @hm_runtime_max_instructions(i64)\n", .{});
     try writer.print("declare i32 @hm_runtime_output_mode_frame_raw()\n", .{});
@@ -2428,7 +2437,7 @@ fn emitMain(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
     try writer.print("  store i32 0, ptr %state_spsr_ptr, align 4\n", .{});
     try writer.print("  call void @llvm.memset.p0.i64(ptr align 4 %state_fiq_regs_ptr, i8 0, i64 28, i1 false)\n", .{});
     try writer.print("  call void @llvm.memset.p0.i64(ptr align 4 %state_irq_regs_ptr, i8 0, i64 8, i1 false)\n", .{});
-    if (program.output_mode == .frame_raw or program.output_mode == .retired_count) {
+    if (program.output_mode == .frame_raw or program.output_mode == .retired_count or program.output_mode == .window) {
         try writer.print("  %frame_budget = call i64 @hm_runtime_max_instructions(i64 {d})\n", .{program.instruction_limit orelse 0});
         try writer.print("  store i64 %frame_budget, ptr %state_instruction_budget_ptr, align 8\n", .{});
     } else {
@@ -2466,7 +2475,7 @@ fn emitMain(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
     try writer.print("  call void @hmn_call_guest_checked(ptr %state, i32 %nonlocal_target)\n", .{});
     try writer.print("  br label %nonlocal_dispatch_check\n", .{});
     try writer.print("nonlocal_dispatch_done:\n", .{});
-    if (program.output_mode == .frame_raw) {
+    if (program.output_mode == .frame_raw or program.output_mode == .window) {
         try writer.print("  %final_frame_index = call i64 @hmn_gba_advance_frame(ptr %state)\n", .{});
         try writer.print("  %final_keyinput = call i16 @hmgba_sample_keyinput_for_frame(i64 %final_frame_index)\n", .{});
         try writer.print("  store i16 %final_keyinput, ptr %state_keyinput_ptr, align 1\n", .{});
@@ -5044,6 +5053,62 @@ fn emitFinalOutput(writer: *Io.Writer, output_mode: OutputMode) Io.Writer.Error!
             try writer.print("  %retired_count_value = load i64, ptr %retired_count_done, align 8\n", .{});
             try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_retired, i64 %retired_count_value)\n", .{});
         },
+        .window => {
+            try writer.print(
+                "  %state_io_done = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+                .{guest_state_io_field},
+            );
+            try writer.print(
+                "  %state_palette_done = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+                .{guest_state_palette_field},
+            );
+            try writer.print(
+                "  %state_vram_done = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+                .{guest_state_vram_field},
+            );
+            try writer.print(
+                "  %state_oam_done = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+                .{guest_state_oam_field},
+            );
+            try writer.print(
+                "  %window_output_result = call i32 @hmgba_run_sdl3_window(ptr %state_io_done, ptr %state_palette_done, ptr %state_vram_done, ptr %state_oam_done)\n",
+                .{},
+            );
+            try writer.print("  %window_output_ok = icmp eq i32 %window_output_result, 0\n", .{});
+            try writer.print("  br i1 %window_output_ok, label %window_output_done, label %window_output_error\n", .{});
+            try writer.print("window_output_error:\n", .{});
+            try writer.print("  switch i32 %window_output_result, label %window_output_done [\n", .{});
+            try writer.print("    i32 2, label %window_output_bad_mode\n", .{});
+            try writer.print("    i32 4, label %window_output_missing_sdl\n", .{});
+            try writer.print("    i32 5, label %window_output_init_failed\n", .{});
+            try writer.print("    i32 6, label %window_output_create_failed\n", .{});
+            try writer.print("    i32 7, label %window_output_renderer_failed\n", .{});
+            try writer.print("    i32 8, label %window_output_texture_failed\n", .{});
+            try writer.print("    i32 9, label %window_output_render_failed\n", .{});
+            try writer.print("  ]\n", .{});
+            try writer.print("window_output_bad_mode:\n", .{});
+            try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_window_bad_mode)\n", .{});
+            try writer.print("  br label %window_output_done\n", .{});
+            try writer.print("window_output_missing_sdl:\n", .{});
+            try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_window_missing_sdl)\n", .{});
+            try writer.print("  br label %window_output_done\n", .{});
+            try writer.print("window_output_init_failed:\n", .{});
+            try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_window_init_failed)\n", .{});
+            try writer.print("  br label %window_output_done\n", .{});
+            try writer.print("window_output_create_failed:\n", .{});
+            try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_window_create_failed)\n", .{});
+            try writer.print("  br label %window_output_done\n", .{});
+            try writer.print("window_output_renderer_failed:\n", .{});
+            try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_window_renderer_failed)\n", .{});
+            try writer.print("  br label %window_output_done\n", .{});
+            try writer.print("window_output_texture_failed:\n", .{});
+            try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_window_texture_failed)\n", .{});
+            try writer.print("  br label %window_output_done\n", .{});
+            try writer.print("window_output_render_failed:\n", .{});
+            try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_window_render_failed)\n", .{});
+            try writer.print("  br label %window_output_done\n", .{});
+            try writer.print("window_output_done:\n", .{});
+        },
     }
 }
 
@@ -6400,4 +6465,34 @@ test "llvm frame_raw output performs a final vblank dispatch before dumping" {
     const dump_index = std.mem.indexOf(u8, llvm_bytes, "call i32 @hmgba_dump_frame_raw") orelse return error.TestExpectedEqual;
     try std.testing.expect(frame_index < dispatch_index);
     try std.testing.expect(dispatch_index < dump_index);
+}
+
+test "llvm window output performs a final vblank dispatch before presenting" {
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const program = Program{
+        .entry = .{ .address = 0x08000000, .isa = .arm },
+        .rom_base_address = 0x08000000,
+        .rom_bytes = &.{},
+        .save_hardware = .none,
+        .functions = &.{
+            .{
+                .entry = .{ .address = 0x08000000, .isa = .arm },
+                .instructions = &.{
+                    .{ .address = 0x08000000, .condition = .al, .size_bytes = 4, .instruction = .{ .bx_lr = {} } },
+                },
+            },
+        },
+        .output_mode = .window,
+        .instruction_limit = 100,
+    };
+    try emitModule(&output.writer, program);
+
+    const llvm_bytes = output.writer.buffered();
+    const frame_index = std.mem.indexOf(u8, llvm_bytes, "%final_frame_index = call i64 @hmn_gba_advance_frame(ptr %state)") orelse return error.TestExpectedEqual;
+    const dispatch_index = std.mem.lastIndexOf(u8, llvm_bytes, "call void @hmn_dispatch_vblank_irq(ptr %state)") orelse return error.TestExpectedEqual;
+    const window_index = std.mem.indexOf(u8, llvm_bytes, "call i32 @hmgba_run_sdl3_window") orelse return error.TestExpectedEqual;
+    try std.testing.expect(frame_index < dispatch_index);
+    try std.testing.expect(dispatch_index < window_index);
 }

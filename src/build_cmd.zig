@@ -181,6 +181,7 @@ fn liftRomWithOptions(
             .register_r0_decimal,
         .frame_raw => .frame_raw,
         .retired_count => .retired_count,
+        .window => .window,
     };
     const owned_functions = try functions.toOwnedSlice(allocator);
 
@@ -194,7 +195,7 @@ fn liftRomWithOptions(
         .save_hardware = detectSaveHardware(image.bytes),
         .functions = owned_functions,
         .output_mode = output_mode,
-        .instruction_limit = if (requested_output_mode == .frame_raw or requested_output_mode == .retired_count)
+        .instruction_limit = if (requested_output_mode == .frame_raw or requested_output_mode == .retired_count or requested_output_mode == .window)
             max_instructions
         else
             null,
@@ -4363,6 +4364,9 @@ fn compileLlvm(
     if (maybe_target_flag) |target_flag| {
         try argv.append(allocator, target_flag);
     }
+    if (shouldLinkDl(options)) {
+        try argv.append(allocator, "-ldl");
+    }
     try argv.append(allocator, "-o");
     try argv.append(allocator, options.output_path);
 
@@ -4381,6 +4385,12 @@ fn compileLlvm(
         }
         return error.ToolFailed;
     }
+}
+
+fn shouldLinkDl(options: BuildOptions) bool {
+    if (options.output_mode != .window) return false;
+    const target = options.target orelse return true;
+    return std.mem.indexOf(u8, target, "linux") != null;
 }
 
 fn compileRuntimeHelper(
@@ -4628,6 +4638,7 @@ fn buildFixtureNativeViaCli(
     const output_mode_arg = switch (output_mode) {
         .frame_raw => "frame_raw",
         .retired_count => "retired_count",
+        .window => "window",
         .auto => unreachable,
     };
     const max_instructions_arg = try std.fmt.allocPrint(allocator, "{d}", .{max_instructions});
@@ -8342,6 +8353,51 @@ test "build emits frame_raw llvm hooks when requested" {
     try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "@hmgba_dump_frame_raw") != null);
     try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "@hm_runtime_max_instructions") != null);
     try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "call i32 @hmgba_dump_frame_raw") != null);
+}
+
+test "build emits window llvm hooks when requested" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/real/jsmolka/ppu-hello.gba",
+        std.testing.allocator,
+        .limited(1024 * 1024),
+    );
+    defer std.testing.allocator.free(rom);
+    try tmp.dir.writeFile(io, .{ .sub_path = "ppu-hello.gba", .data = rom });
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "ppu-hello.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_mode = .window,
+            .max_instructions = 1_000_000,
+            .output_path = "ppu-hello-window-native",
+        },
+    );
+
+    const llvm_bytes = try tmp.dir.readFileAlloc(
+        io,
+        "ppu-hello-window-native.ll",
+        std.testing.allocator,
+        .limited(2 * 1024 * 1024),
+    );
+    defer std.testing.allocator.free(llvm_bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "@hmgba_run_sdl3_window") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "@hm_runtime_max_instructions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "call i32 @hmgba_run_sdl3_window") != null);
 }
 
 test "build keeps frame_raw runtime helper artifacts under .zig-cache" {

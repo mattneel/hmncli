@@ -15,11 +15,12 @@ This is not an emulator. There is no interpreter, no JIT, no runtime recompilati
 - `irq_demo` remains intentionally deferred: its current first blocker is `Unsupported opcode 0x0000468F at 0x08002240 for armv4t`, and its upstream shape exceeds the current VBlank-only interrupt model.
 - A `frame_raw` dump path exists for framebuffer inspection: Mode 4, Mode 0 regular BG0-BG3 tile backgrounds, BG priority layering, 4bpp and 8bpp regular tiles, screenblock selection, tile flips, and the current regular/affine OBJ subset.
 - Mode 0 rendering now uses a per-pixel layer compositor, so OBJ priority is resolved against BG priority instead of relying on incidental draw order.
+- An SDL3 `window` output path now exists. It dynamically loads `libSDL3.so`/`libSDL3.so.0` or `HOMONCULI_SDL3_PATH` and presents the final rendered GBA frame in a host window.
 - mGBA-backed raw frame goldens now exist for the green `tonc` demos: `sbb_reg`, `obj_demo`, and `key_demo`.
 - Deterministic scripted KEYINPUT exists for bring-up smoke tests.
 - Local-only commercial probing is active. Developer-supplied commercial ROMs live under `.zig-cache/local-commercial-roms/` and are never committed.
 - The current local Kirby probe reaches and renders the story/title sequence frame through `frame_raw`, including tiled BG layers and OAM sprites. This is a local bring-up checkpoint, not a committed commercial fixture or compatibility claim.
-- There is still no SDL/window backend, no audio backend, and no second machine target.
+- The SDL3 path is a final-frame presenter, not a live animated/playable runtime loop yet. There is still no audio backend and no second machine target.
 
 ## Quickstart
 
@@ -76,6 +77,32 @@ If you want a PNG for inspection:
 magick -size 240x160 -depth 8 rgba:/tmp/ppu-hello.rgba /tmp/ppu-hello.png
 ```
 
+### Open the final frame in an SDL3 window
+
+```bash
+zig build run -- build tests/fixtures/real/jsmolka/ppu-hello.gba \
+  --machine gba \
+  --target x86_64-linux \
+  --output window \
+  --max-instructions 5000 \
+  --opt release \
+  -o /tmp/ppu-hello-window
+
+/tmp/ppu-hello-window
+```
+
+If SDL3 is not on the system library path, point the generated binary at a local shared library:
+
+```bash
+HOMONCULI_SDL3_PATH=/path/to/libSDL3.so /tmp/ppu-hello-window
+```
+
+For scripted smoke runs that should not leave a window open:
+
+```bash
+HOMONCULI_WINDOW_AUTOCLOSE_FRAMES=1 /tmp/ppu-hello-window
+```
+
 ## CLI
 
 ### `build`
@@ -91,6 +118,7 @@ Supported output modes today:
 - default numeric or verdict-style program output
 - `--output frame_raw --max-instructions N`
 - `--output retired_count --max-instructions N`
+- `--output window --max-instructions N`
 
 Optimization modes:
 

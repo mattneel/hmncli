@@ -9,6 +9,7 @@ pub const OutputMode = enum {
     auto,
     frame_raw,
     retired_count,
+    window,
 };
 
 pub const OptimizeMode = enum {
@@ -84,6 +85,10 @@ fn parseBuild(args: []const []const u8) ParseError!Command {
                 build.output_mode = .retired_count;
                 continue;
             }
+            if (std.mem.eql(u8, value, "window")) {
+                build.output_mode = .window;
+                continue;
+            }
             return error.InvalidCommand;
         }
         if (std.mem.eql(u8, flag, "--max-instructions")) {
@@ -113,7 +118,7 @@ fn parseBuild(args: []const []const u8) ParseError!Command {
     }
 
     if (build.machine_name.len == 0 or build.output_path.len == 0) return error.InvalidCommand;
-    if ((build.output_mode == .frame_raw or build.output_mode == .retired_count) and build.max_instructions == null) {
+    if ((build.output_mode == .frame_raw or build.output_mode == .retired_count or build.output_mode == .window) and build.max_instructions == null) {
         return error.InvalidCommand;
     }
     return .{ .build = build };
@@ -249,6 +254,53 @@ test "parse rejects retired_count build without an instruction cap" {
             "retired_count",
             "-o",
             "zig-out/bin/gba-div-retired",
+        }),
+    );
+}
+
+test "parse accepts window build output and instruction cap" {
+    try std.testing.expectEqualDeep(
+        Command{ .build = .{
+            .rom_path = "tests/fixtures/real/jsmolka/ppu-hello.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "zig-out/bin/ppu-hello-window",
+            .output_mode = .window,
+            .max_instructions = 1_000_000,
+        } },
+        try parse(&.{
+            "hmncli",
+            "build",
+            "tests/fixtures/real/jsmolka/ppu-hello.gba",
+            "--machine",
+            "gba",
+            "--target",
+            "x86_64-linux",
+            "--output",
+            "window",
+            "--max-instructions",
+            "1000000",
+            "-o",
+            "zig-out/bin/ppu-hello-window",
+        }),
+    );
+}
+
+test "parse rejects window build without an instruction cap" {
+    try std.testing.expectError(
+        error.InvalidCommand,
+        parse(&.{
+            "hmncli",
+            "build",
+            "tests/fixtures/real/jsmolka/ppu-hello.gba",
+            "--machine",
+            "gba",
+            "--target",
+            "x86_64-linux",
+            "--output",
+            "window",
+            "-o",
+            "zig-out/bin/ppu-hello-window",
         }),
     );
 }
