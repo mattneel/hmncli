@@ -157,6 +157,29 @@ pub const shims: []const shim_mod.ShimDecl = &.{
         .id = .{
             .kind = .shim,
             .namespace = "gba",
+            .name = "RegisterRamReset",
+        },
+        .state = .implemented,
+        .args = &.{
+            .{ .name = "control", .ty = .u32 },
+        },
+        .returns = .i32,
+        .effects = .memory_write,
+        .tests = &.{},
+        .doc_refs = &.{
+            .{
+                .label = "GBATEK BIOS RegisterRamReset",
+                .url = "https://problemkaputt.de/gbatek.htm#biosresetfunctions",
+            },
+        },
+        .notes = &.{
+            "Commercial BIOS reset shim used by Kirby; clears guest memory and IO regions selected by the control mask.",
+        },
+    },
+    .{
+        .id = .{
+            .kind = .shim,
+            .namespace = "gba",
             .name = "CpuFastSet",
         },
         .state = .implemented,
@@ -176,6 +199,123 @@ pub const shims: []const shim_mod.ShimDecl = &.{
         },
         .notes = &.{
             "Commercial BIOS fast memory-copy shim used by Kirby; word-only GBA subset with count multiple-of-8 enforcement.",
+        },
+    },
+    .{
+        .id = .{
+            .kind = .shim,
+            .namespace = "gba",
+            .name = "LZ77UnCompVram",
+        },
+        .state = .implemented,
+        .args = &.{
+            .{ .name = "source", .ty = .guest_ptr },
+            .{ .name = "dest", .ty = .guest_ptr },
+        },
+        .returns = .i32,
+        .effects = .memory_write,
+        .tests = &.{},
+        .doc_refs = &.{
+            .{
+                .label = "GBATEK BIOS LZ77UnCompVram",
+                .url = "https://problemkaputt.de/gbatek.htm#biosdecompressionfunctions",
+            },
+        },
+        .notes = &.{
+            "Commercial title-screen decompression shim; implements byte-visible LZ77 output through guest memory helpers.",
+        },
+    },
+    .{
+        .id = .{
+            .kind = .shim,
+            .namespace = "gba",
+            .name = "LZ77UnCompWram",
+        },
+        .state = .implemented,
+        .args = &.{
+            .{ .name = "source", .ty = .guest_ptr },
+            .{ .name = "dest", .ty = .guest_ptr },
+        },
+        .returns = .i32,
+        .effects = .memory_write,
+        .tests = &.{},
+        .doc_refs = &.{
+            .{
+                .label = "GBATEK BIOS LZ77UnCompWram",
+                .url = "https://problemkaputt.de/gbatek.htm#biosdecompressionfunctions",
+            },
+        },
+        .notes = &.{
+            "Commercial title-screen decompression shim; shares the byte-visible LZ77 implementation used by the VRAM variant.",
+        },
+    },
+    .{
+        .id = .{
+            .kind = .shim,
+            .namespace = "gba",
+            .name = "HuffUnComp",
+        },
+        .state = .stubbed,
+        .args = &.{
+            .{ .name = "source", .ty = .guest_ptr },
+            .{ .name = "dest", .ty = .guest_ptr },
+        },
+        .returns = .i32,
+        .effects = .memory_write,
+        .tests = &.{},
+        .doc_refs = &.{
+            .{
+                .label = "GBATEK BIOS HuffUnComp",
+                .url = "https://problemkaputt.de/gbatek.htm#biosdecompressionfunctions",
+            },
+        },
+        .notes = &.{
+            "Build-visible commercial BIOS decompression surface. Runtime emits a structured diagnostic until a fixture proves it is needed.",
+        },
+    },
+    .{
+        .id = .{
+            .kind = .shim,
+            .namespace = "gba",
+            .name = "MultiBoot",
+        },
+        .state = .stubbed,
+        .args = &.{
+            .{ .name = "param", .ty = .guest_ptr },
+            .{ .name = "mode", .ty = .u32 },
+        },
+        .returns = .i32,
+        .effects = .device_io,
+        .tests = &.{},
+        .doc_refs = &.{
+            .{
+                .label = "GBATEK BIOS MultiBoot",
+                .url = "https://problemkaputt.de/gbatek.htm#biosmultibootsinglegamepak",
+            },
+        },
+        .notes = &.{
+            "Build-visible commercial BIOS wrapper. Runtime emits a structured diagnostic unless a future fixture proves it is needed.",
+        },
+    },
+    .{
+        .id = .{
+            .kind = .shim,
+            .namespace = "gba",
+            .name = "SoundDriverVSyncOff",
+        },
+        .state = .implemented,
+        .args = &.{},
+        .returns = .i32,
+        .effects = .device_io,
+        .tests = &.{},
+        .doc_refs = &.{
+            .{
+                .label = "GBATEK BIOS SoundDriverVSyncOff",
+                .url = "https://problemkaputt.de/gbatek.htm#biossoundfunctions",
+            },
+        },
+        .notes = &.{
+            "Commercial title-screen bring-up shim; modeled as a no-op because audio is outside this milestone.",
         },
     },
     .{
@@ -420,6 +560,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .id = .{
             .kind = .instruction,
             .namespace = "armv4t",
+            .name = "and_reg_shift",
+        },
+        .isa = .armv4t,
+        .mnemonic = "and",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Kirby IRQ handler surface for ARM register AND with an immediate-shifted register operand."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
             .name = "add_imm",
         },
         .isa = .armv4t,
@@ -611,6 +765,20 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .tests = &.{},
         .doc_refs = &.{},
         .notes = &.{"Phase 1 helper surface for non-flag subtract-immediate arithmetic."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "sub_reg",
+        },
+        .isa = .armv4t,
+        .mnemonic = "sub",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Kirby overlay ARM arithmetic surface for non-flag register subtraction."},
     },
     .{
         .id = .{
@@ -1199,6 +1367,48 @@ pub const instructions: []const instruction_mod.InstructionDecl = &.{
         .tests = &.{},
         .doc_refs = &.{},
         .notes = &.{"Phase 1 Thumb memory surface for sign-extending byte loads with register offsets."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "ldr_signed_byte_post_imm",
+        },
+        .isa = .armv4t,
+        .mnemonic = "ldrsb",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Kirby overlay ARM memory surface for post-index sign-extending byte loads."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "ldr_signed_byte_pre_imm",
+        },
+        .isa = .armv4t,
+        .mnemonic = "ldrsb",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Kirby overlay ARM memory surface for pre-index sign-extending byte loads with writeback."},
+    },
+    .{
+        .id = .{
+            .kind = .instruction,
+            .namespace = "armv4t",
+            .name = "ldr_signed_byte_pre_reg",
+        },
+        .isa = .armv4t,
+        .mnemonic = "ldrsb",
+        .encoding = .fixed32,
+        .state = .implemented,
+        .tests = &.{},
+        .doc_refs = &.{},
+        .notes = &.{"Kirby overlay ARM memory surface for pre-index register sign-extending byte loads with writeback."},
     },
     .{
         .id = .{

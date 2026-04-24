@@ -81,17 +81,43 @@ fn tilePixel4bpp(
     return if ((x & 1) == 0) packed_pixels & 0x0F else packed_pixels >> 4;
 }
 
-fn renderRegularBg0(
+fn tilePixel8bpp(
+    vram: *const [98304]u8,
+    charblock: usize,
+    tile_id: u16,
+    x: usize,
+    y: usize,
+) u8 {
+    const tile_base = (charblock * 0x4000) + (@as(usize, tile_id) * 64);
+    return vram[tile_base + (y * 8) + x];
+}
+
+fn regularBgScreenblockOffset(size: u2, tile_x: usize, tile_y: usize) usize {
+    return switch (size) {
+        0 => 0,
+        1 => if (tile_x >= 32) 1 else 0,
+        2 => if (tile_y >= 32) 1 else 0,
+        3 => (if (tile_x >= 32) @as(usize, 1) else 0) + (if (tile_y >= 32) @as(usize, 2) else 0),
+    };
+}
+
+fn renderRegularBg(
     io: *const [1024]u8,
     palette: *const [1024]u8,
     vram: *const [98304]u8,
     rgba: *[rgba_len]u8,
+    bg_index: usize,
 ) void {
-    const bgcnt = std.mem.readInt(u16, io[8..10], .little);
+    const bgcnt_offset = 0x08 + (bg_index * 2);
+    const hofs_offset = 0x10 + (bg_index * 4);
+    const vofs_offset = hofs_offset + 2;
+    const bgcnt = std.mem.readInt(u16, io[bgcnt_offset..][0..2], .little);
     const cbb: usize = @intCast((bgcnt >> 2) & 0x3);
     const sbb: usize = @intCast((bgcnt >> 8) & 0x1F);
-    const hofs = std.mem.readInt(u16, io[16..18], .little) & 0x01FF;
-    const vofs = std.mem.readInt(u16, io[18..20], .little) & 0x01FF;
+    const color_256 = (bgcnt & 0x0080) != 0;
+    const size: u2 = @truncate((bgcnt >> 14) & 0x3);
+    const hofs = std.mem.readInt(u16, io[hofs_offset..][0..2], .little) & 0x01FF;
+    const vofs = std.mem.readInt(u16, io[vofs_offset..][0..2], .little) & 0x01FF;
 
     for (0..frame_height) |y| {
         for (0..frame_width) |x| {
@@ -99,14 +125,21 @@ fn renderRegularBg0(
             const bg_y = (y + vofs) & 0x01FF;
             const tile_x = bg_x >> 3;
             const tile_y = bg_y >> 3;
+            const screenblock = sbb + regularBgScreenblockOffset(size, tile_x, tile_y);
             const entry_offset = ((tile_y & 31) * 32) + (tile_x & 31);
-            const entry_addr = (sbb * 0x800) + (entry_offset * 2);
+            const entry_addr = (screenblock * 0x800) + (entry_offset * 2);
             const entry = std.mem.readInt(u16, vram[entry_addr..][0..2], .little);
             const tile_id: u16 = @truncate(entry & 0x03FF);
             const palbank: usize = @intCast((entry >> 12) & 0x0F);
-            const color_index = tilePixel4bpp(vram, cbb, tile_id, bg_x & 7, bg_y & 7);
+            const source_x = if ((entry & 0x0400) != 0) 7 - (bg_x & 7) else bg_x & 7;
+            const source_y = if ((entry & 0x0800) != 0) 7 - (bg_y & 7) else bg_y & 7;
+            const color_index = if (color_256)
+                tilePixel8bpp(vram, cbb, tile_id, source_x, source_y)
+            else
+                tilePixel4bpp(vram, cbb, tile_id, source_x, source_y);
             if (color_index == 0) continue;
-            writePaletteColor(rgba, palette, x, y, (palbank * 16) + color_index);
+            const palette_index = if (color_256) color_index else (palbank * 16) + color_index;
+            writePaletteColor(rgba, palette, x, y, palette_index);
         }
     }
 }
@@ -120,8 +153,18 @@ fn dumpMode0Rgba(
 ) void {
     const dispcnt = std.mem.readInt(u16, io[0..2], .little);
     fillBackdrop(palette, rgba);
-    if ((dispcnt & 0x0100) != 0) {
-        renderRegularBg0(io, palette, vram, rgba);
+    var priority: i32 = 3;
+    while (priority >= 0) : (priority -= 1) {
+        var bg_index: i32 = 3;
+        while (bg_index >= 0) : (bg_index -= 1) {
+            const bg: usize = @intCast(bg_index);
+            const enable_bit = @as(u16, 0x0100) << @intCast(bg);
+            if ((dispcnt & enable_bit) == 0) continue;
+            const bgcnt_offset = 0x08 + (bg * 2);
+            const bgcnt = std.mem.readInt(u16, io[bgcnt_offset..][0..2], .little);
+            if (@as(i32, @intCast(bgcnt & 0x0003)) != priority) continue;
+            renderRegularBg(io, palette, vram, rgba, bg);
+        }
     }
     if ((dispcnt & 0x1000) != 0) {
         renderObjLayer(io, palette, vram, oam, rgba);
@@ -171,17 +214,38 @@ fn objTilePixel4bpp(
     vram: *const [98304]u8,
     tile_id: usize,
     obj_width: usize,
+    one_dimensional: bool,
     x: usize,
     y: usize,
 ) u8 {
-    const tiles_per_row = obj_width / 8;
-    const tile_index = tile_id + ((y / 8) * tiles_per_row) + (x / 8);
-    const tile_base = 0x10000 + (tile_index * 32);
     const tile_x = x & 7;
     const tile_y = y & 7;
+    const tile_index = if (one_dimensional) blk: {
+        const tiles_per_row = obj_width / 8;
+        break :blk tile_id + ((y / 8) * tiles_per_row) + (x / 8);
+    } else tile_id + ((y / 8) * 32) + (x / 8);
+    const tile_base = 0x10000 + (tile_index * 32);
     const row_offset = tile_base + (tile_y * 4) + (tile_x / 2);
     const packed_pixels = vram[row_offset];
     return if ((tile_x & 1) == 0) packed_pixels & 0x0F else packed_pixels >> 4;
+}
+
+fn objTilePixel8bpp(
+    vram: *const [98304]u8,
+    tile_id: usize,
+    obj_width: usize,
+    one_dimensional: bool,
+    x: usize,
+    y: usize,
+) u8 {
+    const tile_x = x & 7;
+    const tile_y = y & 7;
+    const tile_index = if (one_dimensional) blk: {
+        const tiles_per_row = obj_width / 8;
+        break :blk tile_id + (((y / 8) * tiles_per_row) + (x / 8)) * 2;
+    } else tile_id + ((y / 8) * 32) + ((x / 8) * 2);
+    const tile_base = 0x10000 + (tile_index * 32);
+    return vram[tile_base + (tile_y * 8) + tile_x];
 }
 
 fn renderRegular4bppObj(
@@ -191,6 +255,7 @@ fn renderRegular4bppObj(
     attr0: u16,
     attr1: u16,
     attr2: u16,
+    one_dimensional: bool,
 ) void {
     const size = decodeRegularObjSize(attr0, attr1) orelse return;
     const obj_x = signedObjX(attr1);
@@ -208,9 +273,98 @@ fn renderRegular4bppObj(
 
             const source_x = if (hflip) size.width - 1 - px else px;
             const source_y = if (vflip) size.height - 1 - py else py;
-            const color_index = objTilePixel4bpp(vram, tile_id, size.width, source_x, source_y);
+            const color_index = objTilePixel4bpp(vram, tile_id, size.width, one_dimensional, source_x, source_y);
             if (color_index == 0) continue;
             writeObjPaletteColor(rgba, palette, @intCast(screen_x), @intCast(screen_y), (palbank * 16) + color_index);
+        }
+    }
+}
+
+fn renderRegular8bppObj(
+    palette: *const [1024]u8,
+    vram: *const [98304]u8,
+    rgba: *[rgba_len]u8,
+    attr0: u16,
+    attr1: u16,
+    attr2: u16,
+    one_dimensional: bool,
+) void {
+    const size = decodeRegularObjSize(attr0, attr1) orelse return;
+    const obj_x = signedObjX(attr1);
+    const obj_y = signedObjY(attr0);
+    const tile_id: usize = @intCast(attr2 & 0x03FF);
+    const hflip = (attr1 & 0x1000) != 0;
+    const vflip = (attr1 & 0x2000) != 0;
+
+    for (0..size.height) |py| {
+        for (0..size.width) |px| {
+            const screen_x = obj_x + @as(i32, @intCast(px));
+            const screen_y = obj_y + @as(i32, @intCast(py));
+            if (screen_x < 0 or screen_x >= frame_width or screen_y < 0 or screen_y >= frame_height) continue;
+
+            const source_x = if (hflip) size.width - 1 - px else px;
+            const source_y = if (vflip) size.height - 1 - py else py;
+            const color_index = objTilePixel8bpp(vram, tile_id, size.width, one_dimensional, source_x, source_y);
+            if (color_index == 0) continue;
+            writeObjPaletteColor(rgba, palette, @intCast(screen_x), @intCast(screen_y), color_index);
+        }
+    }
+}
+
+fn objAffineParam(oam: *const [1024]u8, affine_index: usize, param_index: usize) i32 {
+    const offsets = [_]usize{ 6, 14, 22, 30 };
+    const offset = (affine_index * 32) + offsets[param_index];
+    return @intCast(std.mem.readInt(i16, oam[offset..][0..2], .little));
+}
+
+fn renderAffine8bppObj(
+    palette: *const [1024]u8,
+    vram: *const [98304]u8,
+    oam: *const [1024]u8,
+    rgba: *[rgba_len]u8,
+    attr0: u16,
+    attr1: u16,
+    attr2: u16,
+    one_dimensional: bool,
+) void {
+    const size = decodeRegularObjSize(attr0, attr1) orelse return;
+    const obj_x = signedObjX(attr1);
+    const obj_y = signedObjY(attr0);
+    const tile_id: usize = @intCast(attr2 & 0x03FF);
+    const affine_index: usize = @intCast((attr1 >> 9) & 0x1F);
+    const display_width = if ((attr0 & 0x0200) != 0) size.width * 2 else size.width;
+    const display_height = if ((attr0 & 0x0200) != 0) size.height * 2 else size.height;
+    const display_half_width: i32 = @intCast(display_width / 2);
+    const display_half_height: i32 = @intCast(display_height / 2);
+    const source_half_width: i32 = @intCast(size.width / 2);
+    const source_half_height: i32 = @intCast(size.height / 2);
+    const pa = objAffineParam(oam, affine_index, 0);
+    const pb = objAffineParam(oam, affine_index, 1);
+    const pc = objAffineParam(oam, affine_index, 2);
+    const pd = objAffineParam(oam, affine_index, 3);
+
+    for (0..display_height) |py| {
+        for (0..display_width) |px| {
+            const screen_x = obj_x + @as(i32, @intCast(px));
+            const screen_y = obj_y + @as(i32, @intCast(py));
+            if (screen_x < 0 or screen_x >= frame_width or screen_y < 0 or screen_y >= frame_height) continue;
+
+            const local_x: i32 = @as(i32, @intCast(px)) - display_half_width;
+            const local_y: i32 = @as(i32, @intCast(py)) - display_half_height;
+            const source_x = ((pa * local_x + pb * local_y) >> 8) + source_half_width;
+            const source_y = ((pc * local_x + pd * local_y) >> 8) + source_half_height;
+            if (source_x < 0 or source_x >= size.width or source_y < 0 or source_y >= size.height) continue;
+
+            const color_index = objTilePixel8bpp(
+                vram,
+                tile_id,
+                size.width,
+                one_dimensional,
+                @intCast(source_x),
+                @intCast(source_y),
+            );
+            if (color_index == 0) continue;
+            writeObjPaletteColor(rgba, palette, @intCast(screen_x), @intCast(screen_y), color_index);
         }
     }
 }
@@ -223,7 +377,7 @@ fn renderObjLayer(
     rgba: *[rgba_len]u8,
 ) void {
     const dispcnt = std.mem.readInt(u16, io[0..2], .little);
-    if ((dispcnt & 0x0040) == 0) return;
+    const one_dimensional = (dispcnt & 0x0040) != 0;
 
     for (0..128) |obj_index| {
         const attr_offset = obj_index * 8;
@@ -231,12 +385,17 @@ fn renderObjLayer(
         const attr1 = std.mem.readInt(u16, oam[attr_offset + 2 ..][0..2], .little);
         const attr2 = std.mem.readInt(u16, oam[attr_offset + 4 ..][0..2], .little);
 
-        if ((attr0 & 0x0100) != 0) continue; // affine / rot-scale not in this slice
-        if ((attr0 & 0x0200) != 0) continue; // regular OBJ disabled
+        const affine = (attr0 & 0x0100) != 0;
+        if (!affine and (attr0 & 0x0200) != 0) continue; // regular OBJ disabled
         if (((attr0 >> 10) & 0x3) != 0) continue; // no semi-transparent / OBJ-window
-        if ((attr0 & 0x2000) != 0) continue; // 8bpp OBJ not in this slice
 
-        renderRegular4bppObj(palette, vram, rgba, attr0, attr1, attr2);
+        if (affine and (attr0 & 0x2000) != 0) {
+            renderAffine8bppObj(palette, vram, oam, rgba, attr0, attr1, attr2, one_dimensional);
+        } else if ((attr0 & 0x2000) != 0) {
+            renderRegular8bppObj(palette, vram, rgba, attr0, attr1, attr2, one_dimensional);
+        } else {
+            renderRegular4bppObj(palette, vram, rgba, attr0, attr1, attr2, one_dimensional);
+        }
     }
 }
 
@@ -402,6 +561,107 @@ test "mode0 renderer decodes a regular 4bpp bg0 tilemap" {
     try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, rgba[4..8]);
 }
 
+test "mode0 renderer decodes enabled bg1 tilemap" {
+    var io: [1024]u8 = std.mem.zeroes([1024]u8);
+    var palette: [1024]u8 = std.mem.zeroes([1024]u8);
+    var vram: [98304]u8 = std.mem.zeroes([98304]u8);
+    var oam: [1024]u8 = std.mem.zeroes([1024]u8);
+    var rgba: [rgba_len]u8 = undefined;
+
+    std.mem.writeInt(u16, io[0..2], 0x0200, .little); // mode 0 + BG1
+    std.mem.writeInt(u16, io[10..12], 0x0100, .little); // BG1: CBB0, SBB1, 4bpp
+    std.mem.writeInt(u16, vram[0x800..][0..2], 0x0000, .little);
+    vram[0] = 0x01;
+    std.mem.writeInt(u16, palette[2..4], 0x001F, .little);
+
+    try dumpFrameRgba(&io, &palette, &vram, &oam, &rgba);
+
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, rgba[0..4]);
+}
+
+test "mode0 renderer layers regular backgrounds by priority" {
+    var io: [1024]u8 = std.mem.zeroes([1024]u8);
+    var palette: [1024]u8 = std.mem.zeroes([1024]u8);
+    var vram: [98304]u8 = std.mem.zeroes([98304]u8);
+    var oam: [1024]u8 = std.mem.zeroes([1024]u8);
+    var rgba: [rgba_len]u8 = undefined;
+
+    std.mem.writeInt(u16, io[0..2], 0x0300, .little); // mode 0 + BG0 + BG1
+    std.mem.writeInt(u16, io[8..10], 0x0101, .little); // BG0: priority 1, SBB1
+    std.mem.writeInt(u16, io[10..12], 0x0200, .little); // BG1: priority 0, SBB2
+    std.mem.writeInt(u16, vram[0x800..][0..2], 0x0000, .little);
+    std.mem.writeInt(u16, vram[0x1000..][0..2], 0x0001, .little);
+    vram[0] = 0x01;
+    vram[32] = 0x02;
+    std.mem.writeInt(u16, palette[2..4], 0x001F, .little);
+    std.mem.writeInt(u16, palette[4..6], 0x03E0, .little);
+
+    try dumpFrameRgba(&io, &palette, &vram, &oam, &rgba);
+
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, rgba[0..4]);
+}
+
+test "mode0 renderer decodes regular 8bpp background tiles" {
+    var io: [1024]u8 = std.mem.zeroes([1024]u8);
+    var palette: [1024]u8 = std.mem.zeroes([1024]u8);
+    var vram: [98304]u8 = std.mem.zeroes([98304]u8);
+    var oam: [1024]u8 = std.mem.zeroes([1024]u8);
+    var rgba: [rgba_len]u8 = undefined;
+
+    std.mem.writeInt(u16, io[0..2], 0x0100, .little); // mode 0 + BG0
+    std.mem.writeInt(u16, io[8..10], 0x0180, .little); // BG0: CBB0, SBB1, 8bpp
+    std.mem.writeInt(u16, vram[0x800..][0..2], 0x0000, .little);
+    vram[0] = 33;
+    std.mem.writeInt(u16, palette[2..4], 0x001F, .little);
+    std.mem.writeInt(u16, palette[66..68], 0x03E0, .little);
+
+    try dumpFrameRgba(&io, &palette, &vram, &oam, &rgba);
+
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, rgba[0..4]);
+}
+
+test "mode0 renderer selects screenblocks for 512-wide regular backgrounds" {
+    var io: [1024]u8 = std.mem.zeroes([1024]u8);
+    var palette: [1024]u8 = std.mem.zeroes([1024]u8);
+    var vram: [98304]u8 = std.mem.zeroes([98304]u8);
+    var oam: [1024]u8 = std.mem.zeroes([1024]u8);
+    var rgba: [rgba_len]u8 = undefined;
+
+    std.mem.writeInt(u16, io[0..2], 0x0100, .little); // mode 0 + BG0
+    std.mem.writeInt(u16, io[8..10], 0x4100, .little); // BG0: SBB1, size 512x256
+    std.mem.writeInt(u16, io[16..18], 256, .little); // BG0HOFS
+    std.mem.writeInt(u16, vram[0x800..][0..2], 0x0000, .little);
+    std.mem.writeInt(u16, vram[0x1000..][0..2], 0x0001, .little);
+    vram[0] = 0x01;
+    vram[32] = 0x02;
+    std.mem.writeInt(u16, palette[2..4], 0x001F, .little);
+    std.mem.writeInt(u16, palette[4..6], 0x03E0, .little);
+
+    try dumpFrameRgba(&io, &palette, &vram, &oam, &rgba);
+
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, rgba[0..4]);
+}
+
+test "mode0 renderer applies regular background tile flips" {
+    var io: [1024]u8 = std.mem.zeroes([1024]u8);
+    var palette: [1024]u8 = std.mem.zeroes([1024]u8);
+    var vram: [98304]u8 = std.mem.zeroes([98304]u8);
+    var oam: [1024]u8 = std.mem.zeroes([1024]u8);
+    var rgba: [rgba_len]u8 = undefined;
+
+    std.mem.writeInt(u16, io[0..2], 0x0100, .little); // mode 0 + BG0
+    std.mem.writeInt(u16, io[8..10], 0x0100, .little); // BG0: SBB1
+    std.mem.writeInt(u16, vram[0x800..][0..2], 0x0400, .little); // tile 0, horizontal flip
+    vram[0] = 0x01;
+    vram[3] = 0x20;
+    std.mem.writeInt(u16, palette[2..4], 0x001F, .little);
+    std.mem.writeInt(u16, palette[4..6], 0x03E0, .little);
+
+    try dumpFrameRgba(&io, &palette, &vram, &oam, &rgba);
+
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, rgba[0..4]);
+}
+
 test "mode0 renderer composites a regular 4bpp obj in 1d mapping" {
     var io: [1024]u8 = std.mem.zeroes([1024]u8);
     var palette: [1024]u8 = std.mem.zeroes([1024]u8);
@@ -422,6 +682,56 @@ test "mode0 renderer composites a regular 4bpp obj in 1d mapping" {
 
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, rgba[((20 * frame_width) + 10) * 4 ..][0..4]);
     try std.testing.expectEqualSlices(u8, &.{ 0, 66, 0, 255 }, rgba[((20 * frame_width) + 11) * 4 ..][0..4]);
+}
+
+test "mode0 renderer composites a regular 8bpp obj in 2d mapping" {
+    var io: [1024]u8 = std.mem.zeroes([1024]u8);
+    var palette: [1024]u8 = std.mem.zeroes([1024]u8);
+    var vram: [98304]u8 = std.mem.zeroes([98304]u8);
+    var oam: [1024]u8 = std.mem.zeroes([1024]u8);
+    var rgba: [rgba_len]u8 = undefined;
+
+    std.mem.writeInt(u16, io[0..2], 0x1000, .little); // mode 0 + OBJ, 2D mapping
+    std.mem.writeInt(u16, palette[0..2], 0x0000, .little);
+    std.mem.writeInt(u16, palette[0x202..][0..2], 0x001F, .little);
+    vram[0x10000] = 0; // transparent
+    vram[0x10001] = 1; // OBJ palette index 1
+
+    std.mem.writeInt(u16, oam[0..2], 20 | 0x2000, .little); // y + 8bpp
+    std.mem.writeInt(u16, oam[2..4], 10, .little); // x
+    std.mem.writeInt(u16, oam[4..6], 0, .little); // tile 0
+
+    try dumpFrameRgba(&io, &palette, &vram, &oam, &rgba);
+
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, rgba[((20 * frame_width) + 10) * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, rgba[((20 * frame_width) + 11) * 4 ..][0..4]);
+}
+
+test "mode0 renderer composites an identity affine 8bpp obj" {
+    var io: [1024]u8 = std.mem.zeroes([1024]u8);
+    var palette: [1024]u8 = std.mem.zeroes([1024]u8);
+    var vram: [98304]u8 = std.mem.zeroes([98304]u8);
+    var oam: [1024]u8 = std.mem.zeroes([1024]u8);
+    var rgba: [rgba_len]u8 = undefined;
+
+    std.mem.writeInt(u16, io[0..2], 0x1000, .little); // mode 0 + OBJ, 2D mapping
+    std.mem.writeInt(u16, palette[0..2], 0x0000, .little);
+    std.mem.writeInt(u16, palette[0x202..][0..2], 0x03E0, .little);
+    vram[0x10000] = 0;
+    vram[0x10001] = 1;
+
+    std.mem.writeInt(u16, oam[0..2], 20 | 0x0100 | 0x2000, .little); // y + affine + 8bpp
+    std.mem.writeInt(u16, oam[2..4], 10, .little); // x, affine matrix 0
+    std.mem.writeInt(u16, oam[4..6], 0, .little); // tile 0
+    std.mem.writeInt(i16, oam[6..8], 0x0100, .little); // pa
+    std.mem.writeInt(i16, oam[14..16], 0, .little); // pb
+    std.mem.writeInt(i16, oam[22..24], 0, .little); // pc
+    std.mem.writeInt(i16, oam[30..32], 0x0100, .little); // pd
+
+    try dumpFrameRgba(&io, &palette, &vram, &oam, &rgba);
+
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, rgba[((20 * frame_width) + 10) * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, rgba[((20 * frame_width) + 11) * 4 ..][0..4]);
 }
 
 test "gba keyinput helper replays comma-separated active-low samples" {

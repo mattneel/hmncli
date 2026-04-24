@@ -182,6 +182,13 @@ pub const DecodedInstruction = union(enum) {
         rm: u4,
         update_flags: bool,
     },
+    and_shift_reg: struct {
+        rd: u4,
+        rn: u4,
+        rm: u4,
+        shift: ShiftImm,
+        update_flags: bool,
+    },
     add_imm: struct {
         rd: u4,
         rn: u4,
@@ -256,6 +263,11 @@ pub const DecodedInstruction = union(enum) {
         rd: u4,
         rn: u4,
         imm: u32,
+    },
+    sub_reg: struct {
+        rd: u4,
+        rn: u4,
+        rm: u4,
     },
     subs_imm: struct {
         rd: u4,
@@ -465,6 +477,21 @@ pub const DecodedInstruction = union(enum) {
         rd: u4,
         base: u4,
         offset: u32,
+    },
+    ldr_signed_byte_post_imm: struct {
+        rd: u4,
+        base: u4,
+        offset: u32,
+    },
+    ldr_signed_byte_pre_index_imm: struct {
+        rd: u4,
+        base: u4,
+        offset: u32,
+    },
+    ldr_signed_byte_pre_index_reg: struct {
+        rd: u4,
+        base: u4,
+        rm: u4,
     },
     ldr_signed_byte_reg: struct {
         rd: u4,
@@ -1010,7 +1037,13 @@ fn parseAlu3(
                     .update_flags = insn.update_flags,
                 } }
             else
-                error.UnsupportedOpcode,
+                .{ .and_shift_reg = .{
+                    .rd = rd,
+                    .rn = rn,
+                    .rm = try parseRegisterId(reg),
+                    .shift = try parseShiftImm(source),
+                    .update_flags = insn.update_flags,
+                } },
             else => error.UnsupportedOpcode,
         },
         .subs_imm => switch (source.value) {
@@ -1199,19 +1232,46 @@ fn parseRsc(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
 }
 
 fn parseSub(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
-    const rd, const rn = switch (insn.operand_count) {
+    const rd, const rn, const source = switch (insn.operand_count) {
         2 => blk: {
             const dest = try operandRegister(insn, 0);
-            break :blk .{ dest, dest };
+            break :blk .{ dest, dest, operandAt(insn, 1) };
         },
-        3 => .{ try operandRegister(insn, 0), try operandRegister(insn, 1) },
+        3 => .{ try operandRegister(insn, 0), try operandRegister(insn, 1), operandAt(insn, 2) },
         else => return error.UnsupportedOpcode,
     };
-    return .{ .sub_imm = .{
-        .rd = rd,
-        .rn = rn,
-        .imm = try operandImmediateU32(insn, insn.operand_count - 1),
-    } };
+    if (source.subtracted) return error.UnsupportedOpcode;
+
+    return switch (source.value) {
+        .imm => |imm| if (insn.update_flags)
+            .{ .subs_imm = .{
+                .rd = rd,
+                .rn = rn,
+                .imm = try parseU32Immediate(imm),
+            } }
+        else
+            .{ .sub_imm = .{
+                .rd = rd,
+                .rn = rn,
+                .imm = try parseU32Immediate(imm),
+            } },
+        .reg => |reg| if (source.shift_type == c.ARM_SFT_INVALID)
+            if (insn.update_flags)
+                .{ .subs_reg = .{
+                    .rd = rd,
+                    .rn = rn,
+                    .rm = try parseRegisterId(reg),
+                } }
+            else
+                .{ .sub_reg = .{
+                    .rd = rd,
+                    .rn = rn,
+                    .rm = try parseRegisterId(reg),
+                } }
+        else
+            error.UnsupportedOpcode,
+        else => error.UnsupportedOpcode,
+    };
 }
 
 fn parseShift(insn: capstone_api.ArmInstruction) DecodeError!DecodedInstruction {
@@ -1660,7 +1720,14 @@ fn parseSignedByteLoad(insn: capstone_api.ArmInstruction) DecodeError!DecodedIns
 
     if (mem.index != c.ARM_REG_INVALID) {
         if (mem.disp != 0) return error.UnsupportedOpcode;
-        if (insn.post_index or insn.writeback) return error.UnsupportedOpcode;
+        if (insn.post_index) return error.UnsupportedOpcode;
+        if (insn.writeback) {
+            return .{ .ldr_signed_byte_pre_index_reg = .{
+                .rd = rd,
+                .base = try parseRegisterId(mem.base),
+                .rm = try parseRegisterId(mem.index),
+            } };
+        }
         return .{ .ldr_signed_byte_reg = .{
             .rd = rd,
             .base = try parseRegisterId(mem.base),
@@ -1669,7 +1736,20 @@ fn parseSignedByteLoad(insn: capstone_api.ArmInstruction) DecodeError!DecodedIns
     }
     if (mem.disp < 0) return error.UnsupportedOpcode;
     if (mem.scale != 0 and mem.scale != 1) return error.UnsupportedOpcode;
-    if (insn.post_index or insn.writeback) return error.UnsupportedOpcode;
+    if (insn.post_index) {
+        return .{ .ldr_signed_byte_post_imm = .{
+            .rd = rd,
+            .base = try parseRegisterId(mem.base),
+            .offset = @intCast(mem.disp),
+        } };
+    }
+    if (insn.writeback) {
+        return .{ .ldr_signed_byte_pre_index_imm = .{
+            .rd = rd,
+            .base = try parseRegisterId(mem.base),
+            .offset = @intCast(mem.disp),
+        } };
+    }
 
     return .{ .ldr_signed_byte_imm = .{
         .rd = rd,
@@ -2121,6 +2201,18 @@ test "decode reads sub immediate without flag updates" {
     );
 }
 
+test "decode reads sub register without flag updates" {
+    const decoded = try decode(0xE0411000, 0x03007440);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .sub_reg = .{
+            .rd = 1,
+            .rn = 1,
+            .rm = 0,
+        } },
+        decoded,
+    );
+}
+
 test "decode reads thumb adds immediate with implicit source register" {
     const decoded = try decodeThumb(0x3001, 0x08000158);
     try std.testing.expectEqualDeep(
@@ -2546,6 +2638,42 @@ test "decode reads ldr byte post-index immediate" {
     );
 }
 
+test "decode reads ldr signed byte post-index immediate" {
+    const decoded = try decode(0xE0D710D1, 0x03007180);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .ldr_signed_byte_post_imm = .{
+            .rd = 1,
+            .base = 7,
+            .offset = 1,
+        } },
+        decoded,
+    );
+}
+
+test "decode reads ldr signed byte pre-index immediate" {
+    const decoded = try decode(0xE1F310D1, 0x0300743C);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .ldr_signed_byte_pre_index_imm = .{
+            .rd = 1,
+            .base = 3,
+            .offset = 1,
+        } },
+        decoded,
+    );
+}
+
+test "decode reads ldr signed byte pre-index register" {
+    const decoded = try decode(0x11B300D9, 0x0300748C);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .ldr_signed_byte_pre_index_reg = .{
+            .rd = 0,
+            .base = 3,
+            .rm = 9,
+        } },
+        decoded,
+    );
+}
+
 test "decode reads ldr halfword immediate" {
     const decoded = try decode(0xE1DB10B0, 0x08001414);
     try std.testing.expectEqualDeep(
@@ -2962,6 +3090,23 @@ test "decode reads and immediate" {
             .rd = 3,
             .rn = 0,
             .imm = 1,
+        } },
+        decoded,
+    );
+}
+
+test "decode reads and register with logical-shift-right immediate" {
+    const decoded = try decode(0xE0021822, 0x03001050);
+    try std.testing.expectEqualDeep(
+        DecodedInstruction{ .and_shift_reg = .{
+            .rd = 1,
+            .rn = 2,
+            .rm = 2,
+            .shift = .{
+                .kind = .lsr,
+                .amount = 16,
+            },
+            .update_flags = false,
         } },
         decoded,
     );

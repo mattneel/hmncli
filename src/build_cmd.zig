@@ -121,20 +121,54 @@ fn liftRomWithOptions(
         .isa = .arm,
     });
 
-    while (pending_functions.items.len != 0) {
-        const function_entry = pending_functions.items[pending_functions.items.len - 1];
-        pending_functions.items.len -= 1;
+    while (true) {
+        while (pending_functions.items.len != 0) {
+            const function_entry = pending_functions.items[pending_functions.items.len - 1];
+            pending_functions.items.len -= 1;
 
-        if (containsFunction(functions.items, function_entry)) continue;
-        try functions.append(allocator, try liftFunction(
+            if (containsFunction(functions.items, function_entry)) continue;
+            try functions.append(allocator, try liftFunction(
+                allocator,
+                writer,
+                image,
+                function_entry,
+                &pending_functions,
+                &has_store,
+                &has_self_loop,
+            ));
+        }
+
+        const linked_table_added = try enqueueLinkedThumbPointerTableTargets(
             allocator,
-            writer,
-            image,
-            function_entry,
             &pending_functions,
-            &has_store,
-            &has_self_loop,
-        ));
+            image,
+            functions.items,
+        );
+        const kirby_overlay_added = try enqueueMeasuredKirbyOverlayRuntimeTargets(
+            allocator,
+            &pending_functions,
+            image,
+            functions.items,
+        );
+        const kirby_irq_added = try enqueueMeasuredKirbyIrqHandlerRuntimeTarget(
+            allocator,
+            &pending_functions,
+            image,
+            functions.items,
+        );
+        const kirby_callback_added = try enqueueMeasuredKirbyInterworkingCallbackTarget(
+            allocator,
+            &pending_functions,
+            image,
+            functions.items,
+        );
+        const kirby_resume_added = try enqueueMeasuredKirbyCoroutineResumeTargets(
+            allocator,
+            &pending_functions,
+            image,
+            functions.items,
+        );
+        if (!linked_table_added and !kirby_overlay_added and !kirby_irq_added and !kirby_callback_added and !kirby_resume_added) break;
     }
 
     sortFunctions(functions.items);
@@ -349,6 +383,7 @@ fn ensureDeclared(
         .orr_shift_reg => _ = try catalog.lookupInstruction("armv4t", "orr_reg_shift"),
         .and_imm => _ = try catalog.lookupInstruction("armv4t", "and_imm"),
         .and_reg => _ = try catalog.lookupInstruction("armv4t", "and_reg"),
+        .and_shift_reg => _ = try catalog.lookupInstruction("armv4t", "and_reg_shift"),
         .add_imm => _ = try catalog.lookupInstruction("armv4t", "add_imm"),
         .adds_imm => _ = try catalog.lookupInstruction("armv4t", "adds_imm"),
         .adcs_imm => _ = try catalog.lookupInstruction("armv4t", "adcs_imm"),
@@ -364,6 +399,7 @@ fn ensureDeclared(
         .rsbs_imm => _ = try catalog.lookupInstruction("armv4t", "rsbs_imm"),
         .rsc_imm => _ = try catalog.lookupInstruction("armv4t", "rsc_imm"),
         .sub_imm => _ = try catalog.lookupInstruction("armv4t", "sub_imm"),
+        .sub_reg => _ = try catalog.lookupInstruction("armv4t", "sub_reg"),
         .subs_imm => _ = try catalog.lookupInstruction("armv4t", "subs_imm"),
         .subs_reg => _ = try catalog.lookupInstruction("armv4t", "subs_reg"),
         .lsl_imm => _ = try catalog.lookupInstruction("armv4t", "lsl_imm"),
@@ -403,6 +439,9 @@ fn ensureDeclared(
         .ldr_signed_halfword_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_signed_halfword_imm"),
         .ldr_signed_halfword_reg => _ = try catalog.lookupInstruction("armv4t", "ldr_signed_halfword_reg"),
         .ldr_signed_byte_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_signed_byte_imm"),
+        .ldr_signed_byte_post_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_signed_byte_post_imm"),
+        .ldr_signed_byte_pre_index_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_signed_byte_pre_imm"),
+        .ldr_signed_byte_pre_index_reg => _ = try catalog.lookupInstruction("armv4t", "ldr_signed_byte_pre_reg"),
         .ldr_signed_byte_reg => _ = try catalog.lookupInstruction("armv4t", "ldr_signed_byte_reg"),
         .ldr_word_pre_index_reg_shift => _ = try catalog.lookupInstruction("armv4t", "ldr_word_pre_reg_shift"),
         .ldr_word_pre_index_imm => _ = try catalog.lookupInstruction("armv4t", "ldr_word_pre_imm"),
@@ -461,7 +500,7 @@ fn ensureDeclared(
         .branch => |branch| _ = try catalog.lookupInstruction("armv4t", branchInstructionName(branch.cond)),
         .bl => _ = try catalog.lookupInstruction("armv4t", "bl"),
         .bx_target => _ = try catalog.lookupInstruction("armv4t", "bx_reg"),
-        .bx_reg => return error.UnsupportedOpcode,
+        .bx_reg => _ = try catalog.lookupInstruction("armv4t", "bx_reg"),
         .bx_lr => _ = try catalog.lookupInstruction("armv4t", "bx_lr"),
         .thumb_saved_lr_return => _ = try catalog.lookupInstruction("armv4t", "thumb_saved_lr_return"),
         .mrs_psr => _ = try catalog.lookupInstruction("armv4t", "mrs_psr"),
@@ -546,9 +585,12 @@ fn enqueueSuccessors(
         .bx_target => |target| {
             try enqueueFunctionAddress(allocator, writer, pending_functions, image, target);
         },
+        .bx_reg => |bx| {
+            _ = try enqueueMeasuredThumbMovPcJumpTableTargets(allocator, writer, pending_functions, image, isa, address, bx.reg);
+            return;
+        },
         .bx_lr => return,
         .thumb_saved_lr_return => return,
-        .bx_reg => return error.UnsupportedOpcode,
         .exception_return => |ret| {
             if (ret.target == address) {
                 has_self_loop.* = true;
@@ -579,6 +621,10 @@ fn enqueueSuccessors(
         },
         .pop => |mask| {
             if ((mask & (@as(u16, 1) << 15)) != 0) return;
+            try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
+        },
+        .swi => |swi| {
+            if (swiEndsFunction(swi.imm24)) return;
             try enqueueFallthrough(allocator, pending_blocks, image, isa, address, size_bytes);
         },
         else => {
@@ -713,6 +759,1021 @@ fn enqueueFunctionAddress(
     try pending.append(allocator, target);
 }
 
+fn enqueueLinkedThumbPointerTableTargets(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(armv4t_decode.CodeAddress),
+    image: gba_loader.RomImage,
+    functions: []const llvm_codegen.Function,
+) std.mem.Allocator.Error!bool {
+    var added = false;
+    var offset: usize = 0;
+    while (offset + 4 <= image.bytes.len) {
+        const run_start = offset;
+        var run_len: usize = 0;
+        var linked_to_lifted_function = false;
+        while (offset + 4 <= image.bytes.len) {
+            const raw_target = armv4t_decode.readWord(image.bytes, offset);
+            const target = normalizeCodeTarget(raw_target);
+            if ((raw_target & 1) == 0 or target.isa != .thumb or offsetForAddress(image, target.address, target.isa) == null) break;
+            if (containsFunction(functions, target)) linked_to_lifted_function = true;
+            run_len += 1;
+            offset += 4;
+        }
+
+        if (run_len >= 4 and linked_to_lifted_function) {
+            for (0..run_len) |index| {
+                const raw_target = armv4t_decode.readWord(image.bytes, run_start + index * 4);
+                const target = normalizeCodeTarget(raw_target);
+                if (containsFunction(functions, target)) continue;
+                if (containsCodeAddress(pending.items, target)) continue;
+                try pending.append(allocator, target);
+                added = true;
+            }
+        }
+
+        offset = if (run_len == 0) run_start + 4 else offset;
+    }
+    return added;
+}
+
+fn enqueueMeasuredKirbyOverlayRuntimeTargets(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(armv4t_decode.CodeAddress),
+    image: gba_loader.RomImage,
+    functions: []const llvm_codegen.Function,
+) std.mem.Allocator.Error!bool {
+    const span = measuredKirbyIwramOverlayCodeSpan(image) orelse return false;
+    const targets = [_]armv4t_decode.CodeAddress{
+        .{ .address = 0x0300_7DF4, .isa = .thumb },
+    };
+
+    var added = false;
+    for (targets) |target| {
+        if (!span.contains(target.address)) continue;
+        if (offsetForAddress(image, target.address, target.isa) == null) continue;
+        if (containsFunction(functions, target)) continue;
+        if (containsCodeAddress(pending.items, target)) continue;
+        try pending.append(allocator, target);
+        added = true;
+    }
+    return added;
+}
+
+fn enqueueMeasuredKirbyIrqHandlerRuntimeTarget(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(armv4t_decode.CodeAddress),
+    image: gba_loader.RomImage,
+    functions: []const llvm_codegen.Function,
+) std.mem.Allocator.Error!bool {
+    const span = measuredKirbyIrqHandlerCodeSpan(image) orelse return false;
+    const target = armv4t_decode.CodeAddress{ .address = 0x0300_1030, .isa = .arm };
+    if (!span.contains(target.address)) return false;
+    if (offsetForAddress(image, target.address, target.isa) == null) return false;
+    if (containsFunction(functions, target)) return false;
+    if (containsCodeAddress(pending.items, target)) return false;
+    try pending.append(allocator, target);
+    return true;
+}
+
+fn enqueueMeasuredKirbyInterworkingCallbackTarget(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(armv4t_decode.CodeAddress),
+    image: gba_loader.RomImage,
+    functions: []const llvm_codegen.Function,
+) std.mem.Allocator.Error!bool {
+    const targets = [_]?armv4t_decode.CodeAddress{
+        measuredKirbyInterworkingCallbackTarget(image),
+        measuredKirbyMotionUpdateCallbackTarget(image),
+        measuredKirbyCollisionCallbackTarget(image),
+        measuredKirbyTitleSetupCallbackTarget(image),
+    };
+
+    var added = false;
+    for (targets) |maybe_target| {
+        const target = maybe_target orelse continue;
+        if (containsFunction(functions, target)) continue;
+        if (containsCodeAddress(pending.items, target)) continue;
+        try pending.append(allocator, target);
+        added = true;
+    }
+    return added;
+}
+
+fn measuredKirbyInterworkingCallbackTarget(image: gba_loader.RomImage) ?armv4t_decode.CodeAddress {
+    const source_offset = romOffsetForAddress(image, image.base_address + 0x72FF34, .arm) orelse return null;
+    if (source_offset + 4 > image.bytes.len) return null;
+
+    const raw_target = armv4t_decode.readWord(image.bytes, source_offset);
+    if (raw_target != image.base_address + 0x93FD) return null;
+
+    const target = normalizeCodeTarget(raw_target);
+    if (target.isa != .thumb) return null;
+    if (offsetForAddress(image, target.address, target.isa) == null) return null;
+    return target;
+}
+
+fn measuredKirbyMotionUpdateCallbackTarget(image: gba_loader.RomImage) ?armv4t_decode.CodeAddress {
+    if (mappedThumbHalfword(image, image.base_address + 0x9640) != 0xB510) return null;
+
+    const source_offset = romOffsetForAddress(image, image.base_address + 0x9678, .thumb) orelse return null;
+    if (source_offset + 4 > image.bytes.len) return null;
+
+    const raw_target = armv4t_decode.readWord(image.bytes, source_offset);
+    if (raw_target != image.base_address + 0x59D9) return null;
+
+    const target = normalizeCodeTarget(raw_target);
+    if (target.isa != .thumb) return null;
+    if (mappedThumbHalfword(image, target.address) != 0xB500) return null;
+    return target;
+}
+
+fn measuredKirbyCollisionCallbackTarget(image: gba_loader.RomImage) ?armv4t_decode.CodeAddress {
+    if (mappedThumbHalfword(image, image.base_address + 0x9640) != 0xB510) return null;
+
+    const source_offset = romOffsetForAddress(image, image.base_address + 0x967C, .thumb) orelse return null;
+    if (source_offset + 4 > image.bytes.len) return null;
+
+    const raw_target = armv4t_decode.readWord(image.bytes, source_offset);
+    if (raw_target != image.base_address + 0x5CA1) return null;
+
+    const target = normalizeCodeTarget(raw_target);
+    if (target.isa != .thumb) return null;
+    if (mappedThumbHalfword(image, target.address) != 0xB570) return null;
+    return target;
+}
+
+fn measuredKirbyTitleSetupCallbackTarget(image: gba_loader.RomImage) ?armv4t_decode.CodeAddress {
+    const selector_offset = romOffsetForAddress(image, image.base_address + 0x730698, .arm) orelse return null;
+    const source_offset = romOffsetForAddress(image, image.base_address + 0x73069C, .arm) orelse return null;
+    if (selector_offset + 4 > image.bytes.len or source_offset + 4 > image.bytes.len) return null;
+
+    const selector = armv4t_decode.readWord(image.bytes, selector_offset);
+    if (selector != 0x0000_0004) return null;
+
+    const raw_target = armv4t_decode.readWord(image.bytes, source_offset);
+    if (raw_target != image.base_address + 0x99FD) return null;
+
+    const target = normalizeCodeTarget(raw_target);
+    if (target.isa != .thumb) return null;
+    if (mappedThumbHalfword(image, target.address) != 0xB570) return null;
+    return target;
+}
+
+fn enqueueMeasuredKirbyCoroutineResumeTargets(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(armv4t_decode.CodeAddress),
+    image: gba_loader.RomImage,
+    functions: []const llvm_codegen.Function,
+) std.mem.Allocator.Error!bool {
+    const targets = [_]armv4t_decode.CodeAddress{
+        .{ .address = 0x0800_5368, .isa = .thumb },
+        .{ .address = 0x0800_9412, .isa = .thumb },
+        .{ .address = 0x0800_9418, .isa = .thumb },
+        .{ .address = 0x0800_944E, .isa = .thumb },
+        .{ .address = 0x0800_94CC, .isa = .thumb },
+        .{ .address = 0x0800_9536, .isa = .thumb },
+        .{ .address = 0x0800_958A, .isa = .thumb },
+        .{ .address = 0x0800_95F0, .isa = .thumb },
+        .{ .address = 0x0800_961C, .isa = .thumb },
+        .{ .address = 0x0800_96A6, .isa = .thumb },
+        .{ .address = 0x0800_96B4, .isa = .thumb },
+        .{ .address = 0x0800_96C2, .isa = .thumb },
+        .{ .address = 0x0800_96EC, .isa = .thumb },
+        .{ .address = 0x0800_9862, .isa = .thumb },
+        .{ .address = 0x0800_9874, .isa = .thumb },
+        .{ .address = 0x0800_9896, .isa = .thumb },
+        .{ .address = 0x0800_9932, .isa = .thumb },
+        .{ .address = 0x0800_99EC, .isa = .thumb },
+        .{ .address = 0x0800_22EA, .isa = .thumb },
+        .{ .address = 0x0800_2D68, .isa = .thumb },
+        .{ .address = 0x0800_2DC4, .isa = .thumb },
+        .{ .address = 0x0800_929C, .isa = .thumb },
+        .{ .address = 0x0800_92A8, .isa = .thumb },
+        .{ .address = 0x0800_92B8, .isa = .thumb },
+        .{ .address = 0x0800_92D6, .isa = .thumb },
+        .{ .address = 0x0800_9344, .isa = .thumb },
+        .{ .address = 0x0800_93BC, .isa = .thumb },
+        .{ .address = 0x0800_91B2, .isa = .thumb },
+        .{ .address = 0x0800_73A0, .isa = .thumb },
+        .{ .address = 0x0800_95C0, .isa = .thumb },
+    };
+
+    var added = false;
+    for (targets) |target| {
+        if (!isMeasuredKirbyCoroutineResumeTarget(image, target)) continue;
+        if (containsFunction(functions, target)) continue;
+        if (containsCodeAddress(pending.items, target)) continue;
+        try pending.append(allocator, target);
+        added = true;
+    }
+    return added;
+}
+
+fn isMeasuredKirbyCoroutineResumeTarget(
+    image: gba_loader.RomImage,
+    target: armv4t_decode.CodeAddress,
+) bool {
+    if (target.isa != .thumb) return false;
+    if (offsetForAddress(image, target.address, target.isa) == null) return false;
+
+    if (target.address == image.base_address + 0x22EA or
+        target.address == image.base_address + 0x2D68 or
+        target.address == image.base_address + 0x2DC4 or
+        target.address == image.base_address + 0x929C or
+        target.address == image.base_address + 0x92A8 or
+        target.address == image.base_address + 0x92B8 or
+        target.address == image.base_address + 0x92D6 or
+        target.address == image.base_address + 0x9344 or
+        target.address == image.base_address + 0x93BC or
+        target.address == image.base_address + 0x91B2 or
+        target.address == image.base_address + 0x96EC or
+        target.address == image.base_address + 0x9862 or
+        target.address == image.base_address + 0x9874 or
+        target.address == image.base_address + 0x9896 or
+        target.address == image.base_address + 0x9932 or
+        target.address == image.base_address + 0x99EC)
+    {
+        return isMeasuredKirbyCoroutineCallerContinuationTarget(image, target);
+    }
+    if (target.address == image.base_address + 0x73A0) {
+        return isMeasuredKirbyCoroutineDispatchContinuationTarget(image, target);
+    }
+    if (target.address == image.base_address + 0x95C0) {
+        return isMeasuredKirbyCoroutineSwitchEntryTarget(image, target);
+    }
+    if (target.address == image.base_address + 0x9418) {
+        return isMeasuredKirbyCoroutineLongLoopEntryTarget(image, target);
+    }
+    if (target.address == image.base_address + 0x944E or
+        target.address == image.base_address + 0x94CC or
+        target.address == image.base_address + 0x9536 or
+        target.address == image.base_address + 0x958A or
+        target.address == image.base_address + 0x95F0 or
+        target.address == image.base_address + 0x961C or
+        target.address == image.base_address + 0x96A6 or
+        target.address == image.base_address + 0x96B4 or
+        target.address == image.base_address + 0x96C2)
+    {
+        return isMeasuredKirbyCoroutineYieldContinuationTarget(image, target);
+    }
+
+    const trampoline = if (target.address == image.base_address + 0x5368)
+        image.base_address + 0x0CFDC4
+    else if (target.address == image.base_address + 0x9412)
+        image.base_address + 0x0CFDCC
+    else
+        return false;
+    const arm_switch_target = if (target.address == image.base_address + 0x5368)
+        image.base_address + 0x0234
+    else
+        image.base_address + 0x0258;
+
+    const yield_call = previousInstruction(image, .thumb, target.address) catch return false;
+    const bl = switch (yield_call.instruction) {
+        .bl => |bl| bl,
+        else => return false,
+    };
+    if (bl.target.isa != .thumb or bl.target.address != trampoline) return false;
+
+    const bx_pc = decodeImageInstructionUnchecked(image, .thumb, trampoline) catch return false;
+    const bx = switch (bx_pc.instruction) {
+        .bx_reg => |bx| bx,
+        else => return false,
+    };
+    if (bx.reg != 15) return false;
+
+    if (!isMeasuredLocalThumbBlxVeneerNop(image, trampoline + 2)) return false;
+
+    const branch_to_switch = decodeImageInstructionUnchecked(image, .arm, trampoline + 4) catch return false;
+    const branch = switch (branch_to_switch.instruction) {
+        .branch => |branch| branch,
+        else => return false,
+    };
+    return branch.cond == .al and branch.target == arm_switch_target;
+}
+
+fn isMeasuredKirbyCoroutineDispatchContinuationTarget(
+    image: gba_loader.RomImage,
+    target: armv4t_decode.CodeAddress,
+) bool {
+    if (target.isa != .thumb) return false;
+    if (target.address != image.base_address + 0x73A0) return false;
+
+    const coroutine_call = previousInstruction(image, .thumb, target.address) catch return false;
+    const bl = switch (coroutine_call.instruction) {
+        .bl => |bl| bl,
+        else => return false,
+    };
+    return bl.target.isa == .thumb and bl.target.address == image.base_address + 0x91AC;
+}
+
+fn isMeasuredKirbyCoroutineSwitchEntryTarget(
+    image: gba_loader.RomImage,
+    target: armv4t_decode.CodeAddress,
+) bool {
+    if (target.isa != .thumb) return false;
+    if (target.address != image.base_address + 0x95C0) return false;
+
+    const function_entry = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x95C0) catch return false;
+    const push_mask = switch (function_entry.instruction) {
+        .push => |mask| mask,
+        else => return false,
+    };
+    if (push_mask != 0x4000) return false;
+
+    const pop_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x95E0) catch return false;
+    const pop_return_mask = switch (pop_return.instruction) {
+        .pop => |mask| mask,
+        else => return false,
+    };
+    if (pop_return_mask != 0x0001) return false;
+
+    const bx_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x95E2) catch return false;
+    const bx = switch (bx_return.instruction) {
+        .bx_reg => |bx| bx,
+        else => return false,
+    };
+    return bx.reg == 0;
+}
+
+fn isMeasuredKirbyCoroutineLongLoopEntryTarget(
+    image: gba_loader.RomImage,
+    target: armv4t_decode.CodeAddress,
+) bool {
+    if (target.isa != .thumb) return false;
+    if (target.address != image.base_address + 0x9418) return false;
+
+    return mappedThumbHalfword(image, image.base_address + 0x9418) == 0xB5F0 and
+        mappedThumbHalfword(image, image.base_address + 0x941A) == 0x4647 and
+        mappedThumbHalfword(image, image.base_address + 0x941C) == 0xB480 and
+        mappedThumbHalfword(image, image.base_address + 0x959C) == 0xE7D7;
+}
+
+fn isMeasuredKirbyCoroutineYieldContinuationTarget(
+    image: gba_loader.RomImage,
+    target: armv4t_decode.CodeAddress,
+) bool {
+    if (target.isa != .thumb) return false;
+    if (target.address != image.base_address + 0x944E and
+        target.address != image.base_address + 0x94CC and
+        target.address != image.base_address + 0x9536 and
+        target.address != image.base_address + 0x958A and
+        target.address != image.base_address + 0x95F0 and
+        target.address != image.base_address + 0x961C and
+        target.address != image.base_address + 0x96A6 and
+        target.address != image.base_address + 0x96B4 and
+        target.address != image.base_address + 0x96C2)
+    {
+        return false;
+    }
+
+    const yield_call = previousInstruction(image, .thumb, target.address) catch return false;
+    const bl = switch (yield_call.instruction) {
+        .bl => |bl| bl,
+        else => return false,
+    };
+    if (bl.target.isa != .thumb or bl.target.address != image.base_address + 0x0CFDCC) return false;
+
+    return mappedThumbHalfword(image, image.base_address + 0x0CFDCC) == 0x4778 and
+        mappedThumbHalfword(image, image.base_address + 0x0CFDCE) == 0x46C0 and
+        mappedThumbWord(image, image.base_address + 0x0CFDD0) == 0xEAFC_C120;
+}
+
+fn isMeasuredKirbyCoroutineCallerContinuationTarget(
+    image: gba_loader.RomImage,
+    target: armv4t_decode.CodeAddress,
+) bool {
+    if (target.isa != .thumb) return false;
+    if (target.address == image.base_address + 0x22EA) {
+        const function_entry = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x22E4) catch return false;
+        const push_mask = switch (function_entry.instruction) {
+            .push => |mask| mask,
+            else => return false,
+        };
+        if (push_mask != 0x4000) return false;
+
+        const coroutine_call = previousInstruction(image, .thumb, target.address) catch return false;
+        const bl = switch (coroutine_call.instruction) {
+            .bl => |bl| bl,
+            else => return false,
+        };
+        if (bl.target.isa != .thumb or bl.target.address != image.base_address + 0x5228) return false;
+
+        const pop_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x22F6) catch return false;
+        const pop_mask = switch (pop_return.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_mask != 0x0001) return false;
+
+        const bx_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x22F8) catch return false;
+        const bx = switch (bx_return.instruction) {
+            .bx_reg => |bx| bx,
+            else => return false,
+        };
+        return bx.reg == 0;
+    }
+
+    if (target.address == image.base_address + 0x2D68) {
+        const function_entry = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x2D54) catch return false;
+        const push_mask = switch (function_entry.instruction) {
+            .push => |mask| mask,
+            else => return false,
+        };
+        if (push_mask != 0x4030) return false;
+
+        const coroutine_call = previousInstruction(image, .thumb, target.address) catch return false;
+        const bl = switch (coroutine_call.instruction) {
+            .bl => |bl| bl,
+            else => return false,
+        };
+        if (bl.target.isa != .thumb or bl.target.address != image.base_address + 0x22E4) return false;
+
+        const pop_saved = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x2D6E) catch return false;
+        const pop_saved_mask = switch (pop_saved.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_saved_mask != 0x0030) return false;
+
+        const pop_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x2D70) catch return false;
+        const pop_return_mask = switch (pop_return.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_return_mask != 0x0001) return false;
+
+        const bx_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x2D72) catch return false;
+        const bx = switch (bx_return.instruction) {
+            .bx_reg => |bx| bx,
+            else => return false,
+        };
+        return bx.reg == 0;
+    }
+
+    if (target.address == image.base_address + 0x2DC4) {
+        const function_entry = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x2DB4) catch return false;
+        const push_mask = switch (function_entry.instruction) {
+            .push => |mask| mask,
+            else => return false,
+        };
+        if (push_mask != 0x4010) return false;
+
+        const coroutine_call = previousInstruction(image, .thumb, target.address) catch return false;
+        const bl = switch (coroutine_call.instruction) {
+            .bl => |bl| bl,
+            else => return false,
+        };
+        if (bl.target.isa != .thumb or bl.target.address != image.base_address + 0x22E4) return false;
+
+        const pop_saved = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x2DD0) catch return false;
+        const pop_saved_mask = switch (pop_saved.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_saved_mask != 0x0010) return false;
+
+        const pop_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x2DD2) catch return false;
+        const pop_return_mask = switch (pop_return.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_return_mask != 0x0001) return false;
+
+        const bx_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x2DD4) catch return false;
+        const bx = switch (bx_return.instruction) {
+            .bx_reg => |bx| bx,
+            else => return false,
+        };
+        return bx.reg == 0;
+    }
+
+    if (target.address == image.base_address + 0x91B2) {
+        const function_entry = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x91AC) catch return false;
+        const push_mask = switch (function_entry.instruction) {
+            .push => |mask| mask,
+            else => return false,
+        };
+        if (push_mask != 0x4030) return false;
+
+        const coroutine_call = previousInstruction(image, .thumb, target.address) catch return false;
+        const bl = switch (coroutine_call.instruction) {
+            .bl => |bl| bl,
+            else => return false,
+        };
+        if (bl.target.isa != .thumb or bl.target.address != image.base_address + 0x9200) return false;
+
+        const pop_saved = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x91F6) catch return false;
+        const pop_saved_mask = switch (pop_saved.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_saved_mask != 0x0030) return false;
+
+        const pop_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x91F8) catch return false;
+        const pop_return_mask = switch (pop_return.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_return_mask != 0x0001) return false;
+
+        const bx_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x91FA) catch return false;
+        const bx = switch (bx_return.instruction) {
+            .bx_reg => |bx| bx,
+            else => return false,
+        };
+        return bx.reg == 0;
+    }
+
+    if (target.address == image.base_address + 0x929C or
+        target.address == image.base_address + 0x92A8 or
+        target.address == image.base_address + 0x92B8 or
+        target.address == image.base_address + 0x92D6 or
+        target.address == image.base_address + 0x9344)
+    {
+        const function_entry = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9200) catch return false;
+        const push_mask = switch (function_entry.instruction) {
+            .push => |mask| mask,
+            else => return false,
+        };
+        if (push_mask != 0x4070) return false;
+
+        const save_r10 = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9202) catch return false;
+        const save_r10_mov = switch (save_r10.instruction) {
+            .mov_reg => |mov| mov,
+            else => return false,
+        };
+        if (save_r10_mov.rd != 6 or save_r10_mov.rm != 10) return false;
+
+        const save_r9 = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9204) catch return false;
+        const save_r9_mov = switch (save_r9.instruction) {
+            .mov_reg => |mov| mov,
+            else => return false,
+        };
+        if (save_r9_mov.rd != 5 or save_r9_mov.rm != 9) return false;
+
+        const save_r8 = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9206) catch return false;
+        const save_r8_mov = switch (save_r8.instruction) {
+            .mov_reg => |mov| mov,
+            else => return false,
+        };
+        if (save_r8_mov.rd != 4 or save_r8_mov.rm != 8) return false;
+
+        const push_high_saves = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9208) catch return false;
+        const push_high_saves_mask = switch (push_high_saves.instruction) {
+            .push => |mask| mask,
+            else => return false,
+        };
+        if (push_high_saves_mask != 0x0070) return false;
+
+        const coroutine_call = previousInstruction(image, .thumb, target.address) catch return false;
+        const bl = switch (coroutine_call.instruction) {
+            .bl => |bl| bl,
+            else => return false,
+        };
+        const expected_call_target = if (target.address == image.base_address + 0x929C)
+            image.base_address + 0x2D54
+        else if (target.address == image.base_address + 0x9344)
+            image.base_address + 0x22E4
+        else
+            image.base_address + 0x9398;
+        if (bl.target.isa != .thumb or bl.target.address != expected_call_target) return false;
+
+        const pop_saved_high = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x936C) catch return false;
+        const pop_saved_high_mask = switch (pop_saved_high.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_saved_high_mask != 0x0038) return false;
+
+        const restore_r8 = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x936E) catch return false;
+        const restore_r8_mov = switch (restore_r8.instruction) {
+            .mov_reg => |mov| mov,
+            else => return false,
+        };
+        if (restore_r8_mov.rd != 8 or restore_r8_mov.rm != 3) return false;
+
+        const restore_r9 = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9370) catch return false;
+        const restore_r9_mov = switch (restore_r9.instruction) {
+            .mov_reg => |mov| mov,
+            else => return false,
+        };
+        if (restore_r9_mov.rd != 9 or restore_r9_mov.rm != 4) return false;
+
+        const restore_r10 = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9372) catch return false;
+        const restore_r10_mov = switch (restore_r10.instruction) {
+            .mov_reg => |mov| mov,
+            else => return false,
+        };
+        if (restore_r10_mov.rd != 10 or restore_r10_mov.rm != 5) return false;
+
+        const pop_saved_low = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9374) catch return false;
+        const pop_saved_low_mask = switch (pop_saved_low.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_saved_low_mask != 0x0070) return false;
+
+        const pop_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9376) catch return false;
+        const pop_return_mask = switch (pop_return.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_return_mask != 0x0002) return false;
+
+        const bx_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9378) catch return false;
+        const bx = switch (bx_return.instruction) {
+            .bx_reg => |bx| bx,
+            else => return false,
+        };
+        return bx.reg == 1;
+    }
+
+    if (target.address == image.base_address + 0x93BC) {
+        const function_entry = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9398) catch return false;
+        const push_mask = switch (function_entry.instruction) {
+            .push => |mask| mask,
+            else => return false,
+        };
+        if (push_mask != 0x4030) return false;
+
+        const coroutine_call = previousInstruction(image, .thumb, target.address) catch return false;
+        const bl = switch (coroutine_call.instruction) {
+            .bl => |bl| bl,
+            else => return false,
+        };
+        if (bl.target.isa != .thumb or bl.target.address != image.base_address + 0x22E4) return false;
+
+        const pop_saved = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x93C4) catch return false;
+        const pop_saved_mask = switch (pop_saved.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_saved_mask != 0x0030) return false;
+
+        const pop_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x93C6) catch return false;
+        const pop_return_mask = switch (pop_return.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_return_mask != 0x0002) return false;
+
+        const bx_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x93C8) catch return false;
+        const bx = switch (bx_return.instruction) {
+            .bx_reg => |bx| bx,
+            else => return false,
+        };
+        return bx.reg == 1;
+    }
+
+    if (target.address == image.base_address + 0x96EC) {
+        const function_entry = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x96E0) catch return false;
+        const push_mask = switch (function_entry.instruction) {
+            .push => |mask| mask,
+            else => return false,
+        };
+        if (push_mask != 0x4000) return false;
+
+        const coroutine_call = previousInstruction(image, .thumb, target.address) catch return false;
+        const bl = switch (coroutine_call.instruction) {
+            .bl => |bl| bl,
+            else => return false,
+        };
+        if (bl.target.isa != .thumb or bl.target.address != image.base_address + 0x973C) return false;
+
+        const pop_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x971C) catch return false;
+        const pop_return_mask = switch (pop_return.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_return_mask != 0x0001) return false;
+
+        const bx_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x971E) catch return false;
+        const bx = switch (bx_return.instruction) {
+            .bx_reg => |bx| bx,
+            else => return false,
+        };
+        return bx.reg == 0;
+    }
+
+    if (target.address == image.base_address + 0x9862 or
+        target.address == image.base_address + 0x9874 or
+        target.address == image.base_address + 0x9896)
+    {
+        const function_entry = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x973C) catch return false;
+        const push_mask = switch (function_entry.instruction) {
+            .push => |mask| mask,
+            else => return false,
+        };
+        if (push_mask != 0x40F0) return false;
+
+        const save_r9 = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x973E) catch return false;
+        const save_r9_mov = switch (save_r9.instruction) {
+            .mov_reg => |mov| mov,
+            else => return false,
+        };
+        if (save_r9_mov.rd != 7 or save_r9_mov.rm != 9) return false;
+
+        const save_r8 = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9740) catch return false;
+        const save_r8_mov = switch (save_r8.instruction) {
+            .mov_reg => |mov| mov,
+            else => return false,
+        };
+        if (save_r8_mov.rd != 6 or save_r8_mov.rm != 8) return false;
+
+        const push_high_saves = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9742) catch return false;
+        const push_high_saves_mask = switch (push_high_saves.instruction) {
+            .push => |mask| mask,
+            else => return false,
+        };
+        if (push_high_saves_mask != 0x00C0) return false;
+
+        const coroutine_call = previousInstruction(image, .thumb, target.address) catch return false;
+        const bl = switch (coroutine_call.instruction) {
+            .bl => |bl| bl,
+            else => return false,
+        };
+        const expected_call_target = if (target.address == image.base_address + 0x9862)
+            image.base_address + 0x2D54
+        else if (target.address == image.base_address + 0x9874)
+            image.base_address + 0x22E4
+        else
+            image.base_address + 0x2DB4;
+        if (bl.target.isa != .thumb or bl.target.address != expected_call_target) return false;
+
+        const pop_saved_high = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9898) catch return false;
+        const pop_saved_high_mask = switch (pop_saved_high.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_saved_high_mask != 0x0018) return false;
+
+        const restore_r8 = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x989A) catch return false;
+        const restore_r8_mov = switch (restore_r8.instruction) {
+            .mov_reg => |mov| mov,
+            else => return false,
+        };
+        if (restore_r8_mov.rd != 8 or restore_r8_mov.rm != 3) return false;
+
+        const restore_r9 = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x989C) catch return false;
+        const restore_r9_mov = switch (restore_r9.instruction) {
+            .mov_reg => |mov| mov,
+            else => return false,
+        };
+        if (restore_r9_mov.rd != 9 or restore_r9_mov.rm != 4) return false;
+
+        const pop_saved_low = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x989E) catch return false;
+        const pop_saved_low_mask = switch (pop_saved_low.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_saved_low_mask != 0x00F0) return false;
+
+        const pop_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x98A0) catch return false;
+        const pop_return_mask = switch (pop_return.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_return_mask != 0x0002) return false;
+
+        const bx_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x98A2) catch return false;
+        const bx = switch (bx_return.instruction) {
+            .bx_reg => |bx| bx,
+            else => return false,
+        };
+        return bx.reg == 1;
+    }
+
+    if (target.address == image.base_address + 0x99EC) {
+        const function_entry = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x99C8) catch return false;
+        const push_mask = switch (function_entry.instruction) {
+            .push => |mask| mask,
+            else => return false,
+        };
+        if (push_mask != 0x4030) return false;
+
+        const coroutine_call = previousInstruction(image, .thumb, target.address) catch return false;
+        const bl = switch (coroutine_call.instruction) {
+            .bl => |bl| bl,
+            else => return false,
+        };
+        if (bl.target.isa != .thumb or bl.target.address != image.base_address + 0x22E4) return false;
+
+        const pop_saved = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x99F4) catch return false;
+        const pop_saved_mask = switch (pop_saved.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_saved_mask != 0x0030) return false;
+
+        const pop_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x99F6) catch return false;
+        const pop_return_mask = switch (pop_return.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_return_mask != 0x0002) return false;
+
+        const bx_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x99F8) catch return false;
+        const bx = switch (bx_return.instruction) {
+            .bx_reg => |bx| bx,
+            else => return false,
+        };
+        return bx.reg == 1;
+    }
+
+    if (target.address == image.base_address + 0x9932) {
+        const function_entry = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x98A8) catch return false;
+        const push_mask = switch (function_entry.instruction) {
+            .push => |mask| mask,
+            else => return false,
+        };
+        if (push_mask != 0x40F0) return false;
+
+        const save_r10 = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x98AA) catch return false;
+        const save_r10_mov = switch (save_r10.instruction) {
+            .mov_reg => |mov| mov,
+            else => return false,
+        };
+        if (save_r10_mov.rd != 7 or save_r10_mov.rm != 10) return false;
+
+        const save_r9 = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x98AC) catch return false;
+        const save_r9_mov = switch (save_r9.instruction) {
+            .mov_reg => |mov| mov,
+            else => return false,
+        };
+        if (save_r9_mov.rd != 6 or save_r9_mov.rm != 9) return false;
+
+        const save_r8 = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x98AE) catch return false;
+        const save_r8_mov = switch (save_r8.instruction) {
+            .mov_reg => |mov| mov,
+            else => return false,
+        };
+        if (save_r8_mov.rd != 5 or save_r8_mov.rm != 8) return false;
+
+        const push_high_saves = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x98B0) catch return false;
+        const push_high_saves_mask = switch (push_high_saves.instruction) {
+            .push => |mask| mask,
+            else => return false,
+        };
+        if (push_high_saves_mask != 0x00E0) return false;
+
+        const coroutine_call = previousInstruction(image, .thumb, target.address) catch return false;
+        const bl = switch (coroutine_call.instruction) {
+            .bl => |bl| bl,
+            else => return false,
+        };
+        if (bl.target.isa != .thumb or bl.target.address != image.base_address + 0x99C8) return false;
+
+        const pop_saved_high = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9994) catch return false;
+        const pop_saved_high_mask = switch (pop_saved_high.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_saved_high_mask != 0x0038) return false;
+
+        const restore_r8 = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9996) catch return false;
+        const restore_r8_mov = switch (restore_r8.instruction) {
+            .mov_reg => |mov| mov,
+            else => return false,
+        };
+        if (restore_r8_mov.rd != 8 or restore_r8_mov.rm != 3) return false;
+
+        const restore_r9 = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x9998) catch return false;
+        const restore_r9_mov = switch (restore_r9.instruction) {
+            .mov_reg => |mov| mov,
+            else => return false,
+        };
+        if (restore_r9_mov.rd != 9 or restore_r9_mov.rm != 4) return false;
+
+        const restore_r10 = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x999A) catch return false;
+        const restore_r10_mov = switch (restore_r10.instruction) {
+            .mov_reg => |mov| mov,
+            else => return false,
+        };
+        if (restore_r10_mov.rd != 10 or restore_r10_mov.rm != 5) return false;
+
+        const pop_saved_low = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x999C) catch return false;
+        const pop_saved_low_mask = switch (pop_saved_low.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_saved_low_mask != 0x00F0) return false;
+
+        const pop_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x999E) catch return false;
+        const pop_return_mask = switch (pop_return.instruction) {
+            .pop => |mask| mask,
+            else => return false,
+        };
+        if (pop_return_mask != 0x0001) return false;
+
+        const bx_return = decodeImageInstructionUnchecked(image, .thumb, image.base_address + 0x99A0) catch return false;
+        const bx = switch (bx_return.instruction) {
+            .bx_reg => |bx| bx,
+            else => return false,
+        };
+        return bx.reg == 0;
+    }
+
+    return false;
+}
+
+const ThumbMovPcJumpTable = struct {
+    table_base: u32,
+    entry_count: u32,
+};
+
+fn measureThumbMovPcJumpTable(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+    reg: u4,
+) BuildError!?ThumbMovPcJumpTable {
+    if (isa != .thumb) return null;
+
+    const load_target_insn = previousInstruction(image, isa, address) catch return null;
+    const load_target = switch (load_target_insn.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (load_target.rd != reg or load_target.base != reg or load_target.offset != 0) return null;
+
+    const add_insn = previousInstruction(image, isa, load_target_insn.address) catch return null;
+    const add = switch (add_insn.instruction) {
+        .add_reg => |add| add,
+        else => return null,
+    };
+    if (add.rd != reg or add.rn != reg) return null;
+    const table_base_reg = add.rm;
+
+    const table_load_insn = previousInstruction(image, isa, add_insn.address) catch return null;
+    const table_load = switch (table_load_insn.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (table_load.rd != table_base_reg or table_load.base != 15) return null;
+
+    const shift_insn = previousInstruction(image, isa, table_load_insn.address) catch return null;
+    const shift = switch (shift_insn.instruction) {
+        .lsls_imm => |shift| shift,
+        else => return null,
+    };
+    if (shift.rd != reg or shift.imm != 2) return null;
+    const index_reg = shift.rm;
+
+    var scan_address = shift_insn.address;
+    var entry_count: ?u32 = null;
+    var scanned: usize = 0;
+    while (scanned < 8 and scan_address > image.base_address) : (scanned += 1) {
+        const candidate = previousInstruction(image, isa, scan_address) catch break;
+        scan_address = candidate.address;
+        switch (candidate.instruction) {
+            .cmp_imm => |cmp| {
+                if (cmp.rn == index_reg) {
+                    entry_count = cmp.imm + 1;
+                    break;
+                }
+            },
+            else => {},
+        }
+    }
+    const count = entry_count orelse return null;
+    if (count == 0 or count > 64) return null;
+
+    return .{
+        .table_base = try resolveLiteralWordFromRom(image, isa, table_load_insn.address, table_load.offset),
+        .entry_count = count,
+    };
+}
+
+fn enqueueMeasuredThumbMovPcJumpTableTargets(
+    allocator: std.mem.Allocator,
+    writer: *Io.Writer,
+    pending: *std.ArrayList(armv4t_decode.CodeAddress),
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+    reg: u4,
+) BuildError!bool {
+    const table = try measureThumbMovPcJumpTable(image, isa, address, reg) orelse return false;
+    var index: u32 = 0;
+    while (index < table.entry_count) : (index += 1) {
+        const entry_address = table.table_base + index * 4;
+        const entry_offset = romOffsetForAddress(image, entry_address, .arm) orelse return false;
+        if (entry_offset + 4 > image.bytes.len) return false;
+
+        const raw_target = armv4t_decode.readWord(image.bytes, entry_offset);
+        if ((raw_target & 1) != 0) return false;
+        const target = armv4t_decode.CodeAddress{ .address = raw_target & ~@as(u32, 1), .isa = .thumb };
+        if (offsetForAddress(image, target.address, target.isa) == null) {
+            try writer.print("Unsupported control flow target 0x{X:0>8} for gba\n", .{target.address});
+            return error.UnsupportedOpcode;
+        }
+        if (containsCodeAddress(pending.items, target)) continue;
+        try pending.append(allocator, target);
+    }
+    return true;
+}
+
 const MeasuredDevkitArmCopySpan = struct {
     rom_lma: u32,
     iwram_vma_start: u32,
@@ -746,9 +1807,25 @@ fn offsetForAddress(
 ) ?usize {
     if (romOffsetForAddress(image, address, isa)) |offset| return offset;
 
-    const iwram_span = measuredDevkitArmIwramCodeSpan(image) orelse return null;
-    if (!iwram_span.contains(address)) return null;
-    return romOffsetForAddress(image, iwram_span.romAddressFor(address), isa);
+    if (measuredDevkitArmIwramCodeSpan(image)) |iwram_span| {
+        if (iwram_span.contains(address)) {
+            return romOffsetForAddress(image, iwram_span.romAddressFor(address), isa);
+        }
+    }
+
+    if (measuredKirbyIrqHandlerCodeSpan(image)) |kirby_irq_span| {
+        if (kirby_irq_span.contains(address)) {
+            return romOffsetForAddress(image, kirby_irq_span.romAddressFor(address), isa);
+        }
+    }
+
+    if (measuredKirbyIwramOverlayCodeSpan(image)) |kirby_span| {
+        if (kirby_span.contains(address)) {
+            return romOffsetForAddress(image, kirby_span.romAddressFor(address), isa);
+        }
+    }
+
+    return null;
 }
 
 fn measuredDevkitArmIwramCodeSpan(image: gba_loader.RomImage) ?MeasuredDevkitArmCopySpan {
@@ -791,6 +1868,58 @@ fn measuredDevkitArmIwramCodeSpan(image: gba_loader.RomImage) ?MeasuredDevkitArm
 
     return .{
         .rom_lma = iwram_lma,
+        .iwram_vma_start = iwram_start,
+        .size = iwram_end - iwram_start,
+    };
+}
+
+fn measuredKirbyIrqHandlerCodeSpan(image: gba_loader.RomImage) ?MeasuredDevkitArmCopySpan {
+    const source_offset = romOffsetForAddress(image, image.base_address + 0x0730, .arm) orelse return null;
+    const dest_offset = romOffsetForAddress(image, image.base_address + 0x0734, .arm) orelse return null;
+    const vector_offset = romOffsetForAddress(image, image.base_address + 0x0738, .arm) orelse return null;
+    if (source_offset + 4 > image.bytes.len or dest_offset + 4 > image.bytes.len or vector_offset + 4 > image.bytes.len) return null;
+
+    const source = armv4t_decode.readWord(image.bytes, source_offset);
+    const dest = armv4t_decode.readWord(image.bytes, dest_offset);
+    const vector_slot = armv4t_decode.readWord(image.bytes, vector_offset);
+    if (source != image.base_address + 0x0108) return null;
+    if (dest != 0x0300_1030) return null;
+    if (vector_slot != 0x0300_7FFC) return null;
+
+    return .{
+        .rom_lma = source,
+        .iwram_vma_start = dest,
+        .size = 0x130,
+    };
+}
+
+fn measuredKirbyIwramOverlayCodeSpan(image: gba_loader.RomImage) ?MeasuredDevkitArmCopySpan {
+    const table_offset = romOffsetForAddress(image, image.base_address + 0x0CE5B0, .arm) orelse return null;
+    const iwram_end_literal_offset = romOffsetForAddress(image, image.base_address + 0x0CD918, .arm) orelse return null;
+    if (table_offset + 12 > image.bytes.len) return null;
+    if (iwram_end_literal_offset + 4 > image.bytes.len) return null;
+
+    const raw_source = armv4t_decode.readWord(image.bytes, table_offset);
+    const dest = armv4t_decode.readWord(image.bytes, table_offset + 4);
+    const next_word = armv4t_decode.readWord(image.bytes, table_offset + 8);
+    const iwram_end = armv4t_decode.readWord(image.bytes, iwram_end_literal_offset);
+
+    // Exact measured Kirby overlay table. The source is a Thumb entry in ROM
+    // copied to IWRAM before being branched to through a literal target. The
+    // copied span starts at the Thumb prologue immediately before that internal
+    // entry point; the nearby IWRAM-end literal bounds later runtime-dispatched
+    // overlay helpers.
+    if (raw_source != image.base_address + 0x0CD931) return null;
+    if (dest != 0x0300_7150) return null;
+    if (next_word != 0x0400_0100) return null;
+    if (iwram_end != 0x0300_7FF0) return null;
+
+    const rom_start = image.base_address + 0x0CD8AC;
+    const iwram_start = 0x0300_70CC;
+    if (iwram_end <= iwram_start) return null;
+
+    return .{
+        .rom_lma = rom_start,
         .iwram_vma_start = iwram_start,
         .size = iwram_end - iwram_start,
     };
@@ -891,6 +2020,13 @@ fn containsFunction(functions: []const llvm_codegen.Function, entry: armv4t_deco
     return false;
 }
 
+fn containsCodeAddress(entries: []const armv4t_decode.CodeAddress, entry: armv4t_decode.CodeAddress) bool {
+    for (entries) |candidate| {
+        if (codeAddressEqual(candidate, entry)) return true;
+    }
+    return false;
+}
+
 fn hasInstructionAddress(functions: []const llvm_codegen.Function, address: u32) bool {
     for (functions) |function| {
         if (containsAddress(function.instructions, address)) return true;
@@ -981,9 +2117,21 @@ fn resolveDecodedInstruction(
             try resolveAddRegPcTarget(image, isa, address, add)
         else
             decoded,
-        .bx_reg => |bx| try resolveBxTarget(image, function_entry, address, bx.reg),
+        .bx_reg => |bx| resolveBxTarget(image, function_entry, address, bx.reg) catch |err| switch (err) {
+            error.UnsupportedOpcode => if (try isDynamicBxRegister(image, function_entry, address, bx.reg))
+                decoded
+            else
+                return err,
+            else => |other| return other,
+        },
         .mov_reg => |mov| if (mov.rd == 15 and mov.rm != 14)
-            try resolveMovPcTarget(image, isa, address, mov.rm)
+            resolveMovPcTarget(image, isa, address, mov.rm) catch |err| switch (err) {
+                error.UnsupportedOpcode => if (try isRuntimeLoadedBxRegister(image, isa, address, mov.rm))
+                    armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = mov.rm } }
+                else
+                    return err,
+                else => |other| return other,
+            }
         else
             decoded,
         .ldm_empty => |ldm| try resolveLdmEmptyPcTarget(image, isa, address, ldm),
@@ -995,7 +2143,9 @@ fn resolveDecodedInstruction(
             try resolveLdrPcPostImmTarget(image, isa, address, load)
         else
             decoded,
-        .bl => |bl| if (try resolveExactLocalThumbBlxR3VeneerTarget(image, isa, address, bl.target.address)) |resolved_target|
+        .bl => |bl| if (try resolveThumbBxPcArmBranchVeneerTarget(image, isa, bl.target.address)) |resolved_target|
+            armv4t_decode.DecodedInstruction{ .bl = .{ .target = resolved_target } }
+        else if (try resolveExactLocalThumbBlxR3VeneerTarget(image, isa, address, bl.target.address)) |resolved_target|
             armv4t_decode.DecodedInstruction{ .bl = .{ .target = resolved_target } }
         else if (try resolveExactObjDemoLocalThumbBlxR9VeneerTarget(image, isa, address, bl.target.address)) |resolved_target|
             armv4t_decode.DecodedInstruction{ .bl = .{ .target = resolved_target } }
@@ -1018,6 +2168,18 @@ fn resolveBxTarget(
     address: u32,
     reg: u4,
 ) BuildError!armv4t_decode.DecodedInstruction {
+    if (isMeasuredKirbyCoroutineResumePoppedReturn(image, function_entry, address, reg)) {
+        return .{ .bx_reg = .{ .reg = reg } };
+    }
+    if (isMeasuredKirbyCoroutineSwitchEntryPoppedReturn(image, function_entry, address, reg)) {
+        return .{ .bx_reg = .{ .reg = reg } };
+    }
+    if (isMeasuredKirbyArmCoroutinePopR1BxR1Exit(image, function_entry, address, reg)) {
+        return .{ .bx_reg = .{ .reg = reg } };
+    }
+    if (isMeasuredKirbyCoroutineCallerContinuationPoppedReturn(image, function_entry, address, reg)) {
+        return .{ .bx_reg = .{ .reg = reg } };
+    }
     if (isExactThumbSavedLrInterworkingReturnEpilogue(image, function_entry, address, reg)) {
         // This is the exact `sbb_reg`-style Thumb interworking return shape:
         // an entry `push {saved_regs..., lr}` paired with `pop {saved_regs...};
@@ -1025,6 +2187,24 @@ fn resolveBxTarget(
         return .{ .thumb_saved_lr_return = {} };
     }
     if (isExactThumbPushLrPopR0BxR0ReturnEpilogue(image, function_entry, address, reg)) {
+        return .{ .thumb_saved_lr_return = {} };
+    }
+    if (isMeasuredThumbPopR0BxR0ReturnEpilogue(image, function_entry, address, reg)) {
+        return .{ .thumb_saved_lr_return = {} };
+    }
+    if (isMeasuredThumbPopR4R5PopR0BxR0ReturnEpilogue(image, function_entry, address, reg)) {
+        return .{ .thumb_saved_lr_return = {} };
+    }
+    if (isMeasuredThumbR8SavePopR0BxR0ReturnEpilogue(image, function_entry, address, reg)) {
+        return .{ .thumb_saved_lr_return = {} };
+    }
+    if (isMeasuredThumbSharedFramePopR0BxR0ReturnEpilogue(image, function_entry, address, reg)) {
+        return .{ .thumb_saved_lr_return = {} };
+    }
+    if (isMeasuredThumbOverlayHighRegsPopR3BxR3ReturnEpilogue(image, function_entry, address, reg)) {
+        return .{ .thumb_saved_lr_return = {} };
+    }
+    if (isExactThumbMovIpLrBxIpReturnEpilogue(image, function_entry, address, reg)) {
         return .{ .thumb_saved_lr_return = {} };
     }
     if (function_entry.isa == .thumb and reg == 0) {
@@ -1048,13 +2228,23 @@ fn resolveBxTarget(
                     .pop => |mask| mask == 0x0001,
                     else => false,
                 };
-                if (prior_is_pop_r0) return error.UnsupportedOpcode;
+                if (prior_is_pop_r0) return .{ .bx_reg = .{ .reg = reg } };
             }
         }
     }
     if (function_entry.isa == .arm and reg == 1) {
         if (try resolveMeasuredArmStartupBxR1LiteralTarget(image, function_entry, address)) |target| {
+            return .{ .bl = .{ .target = target } };
+        }
+    }
+    if (function_entry.isa == .arm and reg == 12) {
+        if (try resolveMeasuredKirbyArmBxIpLiteralVeneerTarget(image, function_entry, address)) |target| {
             return .{ .bx_target = target };
+        }
+    }
+    if (function_entry.isa == .arm and reg == 0) {
+        if (try resolveMeasuredKirbyVBlankIrqDispatcherBxR0Target(image, function_entry, address)) |target| {
+            return .{ .bl = .{ .target = target } };
         }
     }
     if (function_entry.isa == .thumb and reg == 6) {
@@ -1063,7 +2253,238 @@ fn resolveBxTarget(
             return .{ .bx_target = normalizeCodeTarget(try resolveStartupThumbBxR6TargetValue(image, function_entry.isa, address)) };
         }
     }
-    return .{ .bx_target = normalizeCodeTarget(try resolvePreviousRegisterValue(image, function_entry.isa, address, reg)) };
+    const raw_target = resolvePreviousRegisterValue(image, function_entry.isa, address, reg) catch
+        return .{ .bx_reg = .{ .reg = reg } };
+    const target = normalizeCodeTarget(raw_target);
+    if (offsetForAddress(image, target.address, target.isa) == null) {
+        return .{ .bx_reg = .{ .reg = reg } };
+    }
+    return .{ .bx_target = target };
+}
+
+fn isRuntimeLoadedBxRegister(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    address: u32,
+    reg: u4,
+) BuildError!bool {
+    const previous = try previousInstruction(image, isa, address);
+    return switch (previous.instruction) {
+        .ldr_word_imm => |load| load.rd == reg and load.base != 15,
+        else => false,
+    };
+}
+
+fn isDynamicBxRegister(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+    address: u32,
+    reg: u4,
+) BuildError!bool {
+    if (isMeasuredKirbyArmInterworkingArgumentBxR1(image, function_entry, address, reg) catch false) return true;
+    if (isRuntimeLoadedBxRegister(image, function_entry.isa, address, reg) catch false) return true;
+    return function_entry.isa == .thumb and
+        function_entry.address == address and
+        isMeasuredLocalThumbBlxVeneerNop(image, address + 2);
+}
+
+fn isMeasuredKirbyArmCoroutinePopR1BxR1Exit(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+    address: u32,
+    reg: u4,
+) bool {
+    if (function_entry.isa != .arm) return false;
+    if (function_entry.address == image.base_address + 0x0258) {
+        if (address != image.base_address + 0x0284 and address != image.base_address + 0x02A4) return false;
+    } else if (function_entry.address == image.base_address + 0x0288) {
+        if (address != image.base_address + 0x02A4) return false;
+    } else {
+        return false;
+    }
+    if (reg != 1) return false;
+
+    const previous = previousInstruction(image, .arm, address) catch return false;
+    return switch (previous.instruction) {
+        .pop => |mask| mask == 0x0002,
+        else => false,
+    };
+}
+
+fn isMeasuredKirbyCoroutineResumePoppedReturn(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+    address: u32,
+    reg: u4,
+) bool {
+    if (function_entry.isa != .thumb) return false;
+    if (function_entry.address != image.base_address + 0x5368) return false;
+    if (address != image.base_address + 0x559E) return false;
+    if (reg != 0) return false;
+
+    const previous = previousInstruction(image, .thumb, address) catch return false;
+    return switch (previous.instruction) {
+        .pop => |mask| mask == 0x0001,
+        else => false,
+    };
+}
+
+fn isMeasuredKirbyCoroutineSwitchEntryPoppedReturn(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+    address: u32,
+    reg: u4,
+) bool {
+    if (function_entry.isa != .thumb) return false;
+    if (function_entry.address != image.base_address + 0x95C0) return false;
+    if (address != image.base_address + 0x95E2) return false;
+    if (reg != 0) return false;
+    if (!isMeasuredKirbyCoroutineSwitchEntryTarget(image, function_entry)) return false;
+
+    const previous = previousInstruction(image, .thumb, address) catch return false;
+    return switch (previous.instruction) {
+        .pop => |mask| mask == 0x0001,
+        else => false,
+    };
+}
+
+fn isMeasuredKirbyCoroutineCallerContinuationPoppedReturn(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+    address: u32,
+    reg: u4,
+) bool {
+    if (function_entry.isa != .thumb) return false;
+
+    if (function_entry.address == image.base_address + 0x22EA) {
+        if (reg != 0) return false;
+        if (address != image.base_address + 0x22F8) return false;
+    } else if (function_entry.address == image.base_address + 0x2D68) {
+        if (reg != 0) return false;
+        if (address != image.base_address + 0x2D72) return false;
+    } else if (function_entry.address == image.base_address + 0x2DC4) {
+        if (reg != 0) return false;
+        if (address != image.base_address + 0x2DD4) return false;
+    } else if (function_entry.address == image.base_address + 0x929C) {
+        if (reg != 1) return false;
+        if (address != image.base_address + 0x9378) return false;
+    } else if (function_entry.address == image.base_address + 0x92A8) {
+        if (reg != 1) return false;
+        if (address != image.base_address + 0x9378) return false;
+    } else if (function_entry.address == image.base_address + 0x92B8) {
+        if (reg != 1) return false;
+        if (address != image.base_address + 0x9378) return false;
+    } else if (function_entry.address == image.base_address + 0x92D6) {
+        if (reg != 1) return false;
+        if (address != image.base_address + 0x9378) return false;
+    } else if (function_entry.address == image.base_address + 0x9344) {
+        if (reg != 1) return false;
+        if (address != image.base_address + 0x9378) return false;
+    } else if (function_entry.address == image.base_address + 0x93BC) {
+        if (reg != 1) return false;
+        if (address != image.base_address + 0x93C8) return false;
+    } else if (function_entry.address == image.base_address + 0x91B2) {
+        if (reg != 0) return false;
+        if (address != image.base_address + 0x91FA) return false;
+    } else if (function_entry.address == image.base_address + 0x96EC) {
+        if (reg != 0) return false;
+        if (address != image.base_address + 0x971E) return false;
+    } else if (function_entry.address == image.base_address + 0x9862) {
+        if (reg != 1) return false;
+        if (address != image.base_address + 0x98A2) return false;
+    } else if (function_entry.address == image.base_address + 0x9874) {
+        if (reg != 1) return false;
+        if (address != image.base_address + 0x98A2) return false;
+    } else if (function_entry.address == image.base_address + 0x9896) {
+        if (reg != 1) return false;
+        if (address != image.base_address + 0x98A2) return false;
+    } else if (function_entry.address == image.base_address + 0x9932) {
+        if (reg != 0) return false;
+        if (address != image.base_address + 0x99A0) return false;
+    } else if (function_entry.address == image.base_address + 0x99EC) {
+        if (reg != 1) return false;
+        if (address != image.base_address + 0x99F8) return false;
+    } else {
+        return false;
+    }
+
+    if (!isMeasuredKirbyCoroutineCallerContinuationTarget(image, function_entry)) return false;
+
+    const previous = previousInstruction(image, .thumb, address) catch return false;
+    return switch (previous.instruction) {
+        .pop => |mask| mask == (@as(u16, 1) << reg),
+        else => false,
+    };
+}
+
+fn isMeasuredKirbyArmInterworkingArgumentBxR1(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+    address: u32,
+    reg: u4,
+) BuildError!bool {
+    if (function_entry.isa != .arm) return false;
+    if (function_entry.address != image.base_address + 0x0234) return false;
+    if (address != image.base_address + 0x0254) return false;
+    if (reg != 1) return false;
+
+    const orr_insn = try previousInstruction(image, .arm, address);
+    const orr = switch (orr_insn.instruction) {
+        .orr_reg => |orr| orr,
+        else => return false,
+    };
+    if (orr.rd != 1 or orr.rn != 1 or orr.rm != 2 or orr.update_flags) return false;
+
+    const mov_insn = try previousInstruction(image, .arm, orr_insn.address);
+    const mov = switch (mov_insn.instruction) {
+        .mov_imm => |mov| mov,
+        else => return false,
+    };
+    return mov.rd == 2 and mov.imm == 1;
+}
+
+fn resolveMeasuredKirbyVBlankIrqDispatcherBxR0Target(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+    address: u32,
+) BuildError!?armv4t_decode.CodeAddress {
+    if (function_entry.isa != .arm) return null;
+    if (function_entry.address != 0x0300_1030) return null;
+    if (address != 0x0300_10F8) return null;
+
+    const span = measuredKirbyIrqHandlerCodeSpan(image) orelse return null;
+    if (!span.contains(address)) return null;
+
+    const add_lr_pc_insn = try previousInstruction(image, .arm, address);
+    const add_lr_pc = switch (add_lr_pc_insn.instruction) {
+        .add_imm => |add| add,
+        else => return null,
+    };
+    if (add_lr_pc.rd != 14 or add_lr_pc.rn != 15 or add_lr_pc.imm != 0) return null;
+
+    const push_lr_insn = try previousInstruction(image, .arm, add_lr_pc_insn.address);
+    const push_lr = switch (push_lr_insn.instruction) {
+        .push => |mask| mask,
+        else => return null,
+    };
+    if (push_lr != 0x4000) return null;
+
+    const default0_offset = romOffsetForAddress(image, image.base_address + 0x0CFDE8, .arm) orelse return null;
+    const default1_offset = romOffsetForAddress(image, image.base_address + 0x0CFDEC, .arm) orelse return null;
+    const vblank_offset = romOffsetForAddress(image, image.base_address + 0x0CFDF0, .arm) orelse return null;
+    if (default0_offset + 4 > image.bytes.len or default1_offset + 4 > image.bytes.len or vblank_offset + 4 > image.bytes.len) return null;
+
+    const default0_raw = armv4t_decode.readWord(image.bytes, default0_offset);
+    const default1_raw = armv4t_decode.readWord(image.bytes, default1_offset);
+    const vblank_raw = armv4t_decode.readWord(image.bytes, vblank_offset);
+    if (default0_raw != image.base_address + 0x1519) return null;
+    if (default1_raw != image.base_address + 0x1519) return null;
+    if (vblank_raw != image.base_address + 0x10CD) return null;
+
+    const target = normalizeCodeTarget(vblank_raw);
+    if (target.isa != .thumb) return null;
+    if (offsetForAddress(image, target.address, target.isa) == null) return null;
+    return target;
 }
 
 fn resolveMeasuredArmStartupBxR1LiteralTarget(
@@ -1098,6 +2519,33 @@ fn resolveMeasuredArmStartupBxR1LiteralTarget(
     if (code_target.isa != .thumb) return null;
     if (offsetForAddress(image, code_target.address, code_target.isa) == null) return null;
     return code_target;
+}
+
+fn resolveMeasuredKirbyArmBxIpLiteralVeneerTarget(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+    address: u32,
+) BuildError!?armv4t_decode.CodeAddress {
+    if (function_entry.isa != .arm) return null;
+    if (function_entry.address != image.base_address + 0x0CFDDC) return null;
+    if (address != image.base_address + 0x0CFDE0) return null;
+
+    const load_ip_insn = try previousInstruction(image, .arm, address);
+    const load_ip = switch (load_ip_insn.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (load_ip.rd != 12 or load_ip.base != 15) return null;
+
+    const literal_address = pcValueForInstruction(.arm, load_ip_insn.address) + load_ip.offset;
+    const literal_offset = romOffsetForAddress(image, literal_address, .arm) orelse return null;
+    if (literal_offset + 4 > image.bytes.len) return null;
+
+    const raw_target = armv4t_decode.readWord(image.bytes, literal_offset);
+    const target = normalizeCodeTarget(raw_target);
+    if (target.isa != .thumb) return null;
+    if (offsetForAddress(image, target.address, target.isa) == null) return null;
+    return target;
 }
 
 fn isExactThumbSavedLrInterworkingReturnEpilogue(
@@ -1138,7 +2586,7 @@ fn isExactThumbPushLrPopR0BxR0ReturnEpilogue(
     reg: u4,
 ) bool {
     if (function_entry.isa != .thumb) return false;
-    if (reg != 0) return false;
+    if (reg != 0 and reg != 1) return false;
 
     const entry = decodeImageInstructionUnchecked(image, .thumb, function_entry.address) catch return false;
     if (entry.size_bytes != 2) return false;
@@ -1153,7 +2601,7 @@ fn isExactThumbPushLrPopR0BxR0ReturnEpilogue(
         .pop => |mask| mask,
         else => return false,
     };
-    if (pop_mask != 0x0001) return false; // exact measured `pop {r0}`
+    if (pop_mask != (@as(u16, 1) << reg)) return false; // exact measured `pop {r0}` / `pop {r1}`
 
     const prior = previousInstruction(image, .thumb, previous.address) catch return false;
     switch (prior.instruction) {
@@ -1162,6 +2610,266 @@ fn isExactThumbPushLrPopR0BxR0ReturnEpilogue(
     }
 
     return true;
+}
+
+fn isExactThumbMovIpLrBxIpReturnEpilogue(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+    address: u32,
+    reg: u4,
+) bool {
+    if (function_entry.isa != .thumb) return false;
+    if (reg != 12) return false;
+    if (address <= function_entry.address) return false;
+
+    const entry = decodeImageInstructionUnchecked(image, .thumb, function_entry.address) catch return false;
+    const mov = switch (entry.instruction) {
+        .mov_reg => |mov| mov,
+        else => return false,
+    };
+
+    // Exact measured Kirby helper shape: `mov ip, lr` at entry, then later
+    // `bx ip` to return after the helper body.
+    return mov.rd == 12 and mov.rm == 14;
+}
+
+fn isMeasuredThumbPopR4R5PopR0BxR0ReturnEpilogue(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+    address: u32,
+    reg: u4,
+) bool {
+    if (function_entry.isa != .thumb) return false;
+    if (reg != 0 and reg != 1) return false;
+
+    const previous = previousInstruction(image, .thumb, address) catch return false;
+    const pop_return = switch (previous.instruction) {
+        .pop => |mask| mask,
+        else => return false,
+    };
+    if (pop_return != (@as(u16, 1) << reg)) return false;
+
+    const prior = previousInstruction(image, .thumb, previous.address) catch return false;
+    const pop_saved = switch (prior.instruction) {
+        .pop => |mask| mask,
+        else => return false,
+    };
+
+    if (pop_saved == 0x0010) {
+        const entry = decodeImageInstructionUnchecked(image, .thumb, function_entry.address) catch return false;
+        const entry_push_mask = switch (entry.instruction) {
+            .push => |mask| mask,
+            else => 0,
+        };
+        if ((entry_push_mask & (@as(u16, 1) << 14)) != 0) return false;
+        return true;
+    }
+
+    // Exact measured Kirby table-seeded helper tails.
+    return pop_saved == 0x0030 or pop_saved == 0x0070 or pop_saved == 0x00F0;
+}
+
+fn isMeasuredThumbPopR0BxR0ReturnEpilogue(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+    address: u32,
+    reg: u4,
+) bool {
+    if (function_entry.isa != .thumb) return false;
+    if (reg != 0) return false;
+
+    const previous = previousInstruction(image, .thumb, address) catch return false;
+    const pop_return = switch (previous.instruction) {
+        .pop => |mask| mask,
+        else => return false,
+    };
+    if (pop_return != 0x0001) return false;
+
+    const prior = previousInstruction(image, .thumb, previous.address) catch return false;
+    const store = switch (prior.instruction) {
+        .store => |store| store,
+        else => return false,
+    };
+    if (store.src != 0 or store.base != 1 or store.size != .word) return false;
+
+    const index = switch (store.addressing) {
+        .offset => |index| index,
+        else => return false,
+    };
+    if (index.subtract) return false;
+
+    const offset = switch (index.offset) {
+        .imm => |imm| imm,
+        else => return false,
+    };
+
+    // Exact measured Kirby table helper tail: `str r0, [r1, #64];
+    // pop {r0}; bx r0`.
+    return offset == 64;
+}
+
+fn isMeasuredThumbR8SavePopR0BxR0ReturnEpilogue(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+    address: u32,
+    reg: u4,
+) bool {
+    if (function_entry.isa != .thumb) return false;
+    if (reg != 0) return false;
+
+    const entry_push = decodeImageInstructionUnchecked(image, .thumb, function_entry.address) catch return false;
+    const entry_push_mask = switch (entry_push.instruction) {
+        .push => |mask| mask,
+        else => return false,
+    };
+    if (entry_push_mask != 0x40F0) return false;
+
+    const save_high = decodeImageInstructionUnchecked(image, .thumb, function_entry.address + 2) catch return false;
+    const save_high_mov = switch (save_high.instruction) {
+        .mov_reg => |mov| mov,
+        else => return false,
+    };
+    if (save_high_mov.rd != 7 or save_high_mov.rm != 8) return false;
+
+    const push_saved_high = decodeImageInstructionUnchecked(image, .thumb, function_entry.address + 4) catch return false;
+    const push_saved_high_mask = switch (push_saved_high.instruction) {
+        .push => |mask| mask,
+        else => return false,
+    };
+    if (push_saved_high_mask != 0x0080) return false;
+
+    const pop_return = previousInstruction(image, .thumb, address) catch return false;
+    const pop_return_mask = switch (pop_return.instruction) {
+        .pop => |mask| mask,
+        else => return false,
+    };
+    if (pop_return_mask != 0x0001) return false;
+
+    const pop_low = previousInstruction(image, .thumb, pop_return.address) catch return false;
+    const pop_low_mask = switch (pop_low.instruction) {
+        .pop => |mask| mask,
+        else => return false,
+    };
+    if (pop_low_mask != 0x00F0) return false;
+
+    const restore_high = previousInstruction(image, .thumb, pop_low.address) catch return false;
+    const restore_high_mov = switch (restore_high.instruction) {
+        .mov_reg => |mov| mov,
+        else => return false,
+    };
+    if (restore_high_mov.rd != 8 or restore_high_mov.rm != 3) return false;
+
+    const pop_saved_high = previousInstruction(image, .thumb, restore_high.address) catch return false;
+    const pop_saved_high_mask = switch (pop_saved_high.instruction) {
+        .pop => |mask| mask,
+        else => return false,
+    };
+    return pop_saved_high_mask == 0x0008;
+}
+
+fn isMeasuredThumbSharedFramePopR0BxR0ReturnEpilogue(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+    address: u32,
+    reg: u4,
+) bool {
+    if (function_entry.isa != .thumb) return false;
+    if (reg != 0) return false;
+
+    const pop_return = previousInstruction(image, .thumb, address) catch return false;
+    const pop_return_mask = switch (pop_return.instruction) {
+        .pop => |mask| mask,
+        else => return false,
+    };
+    if (pop_return_mask != 0x0001) return false;
+
+    const pop_low = previousInstruction(image, .thumb, pop_return.address) catch return false;
+    const pop_low_mask = switch (pop_low.instruction) {
+        .pop => |mask| mask,
+        else => return false,
+    };
+    if (pop_low_mask != 0x00F0) return false;
+
+    const restore_high = previousInstruction(image, .thumb, pop_low.address) catch return false;
+    const restore_high_mov = switch (restore_high.instruction) {
+        .mov_reg => |mov| mov,
+        else => return false,
+    };
+    if (restore_high_mov.rd != 8 or restore_high_mov.rm != 3) return false;
+
+    const pop_saved_high = previousInstruction(image, .thumb, restore_high.address) catch return false;
+    const pop_saved_high_mask = switch (pop_saved_high.instruction) {
+        .pop => |mask| mask,
+        else => return false,
+    };
+
+    // Exact measured Kirby jump-table case epilogue. The case labels are lifted
+    // as separate dynamic-dispatch targets, so the local prologue is not visible
+    // from their function entry.
+    return pop_saved_high_mask == 0x0008;
+}
+
+fn isMeasuredThumbOverlayHighRegsPopR3BxR3ReturnEpilogue(
+    image: gba_loader.RomImage,
+    function_entry: armv4t_decode.CodeAddress,
+    address: u32,
+    reg: u4,
+) bool {
+    if (function_entry.isa != .thumb) return false;
+    if (reg != 3) return false;
+
+    const pop_return = previousInstruction(image, .thumb, address) catch return false;
+    const pop_return_mask = switch (pop_return.instruction) {
+        .pop => |mask| mask,
+        else => return false,
+    };
+    if (pop_return_mask != 0x0008) return false;
+
+    const restore_fp = previousInstruction(image, .thumb, pop_return.address) catch return false;
+    const restore_fp_mov = switch (restore_fp.instruction) {
+        .mov_reg => |mov| mov,
+        else => return false,
+    };
+    if (restore_fp_mov.rd != 11 or restore_fp_mov.rm != 3) return false;
+
+    const restore_sl = previousInstruction(image, .thumb, restore_fp.address) catch return false;
+    const restore_sl_mov = switch (restore_sl.instruction) {
+        .mov_reg => |mov| mov,
+        else => return false,
+    };
+    if (restore_sl_mov.rd != 10 or restore_sl_mov.rm != 2) return false;
+
+    const restore_r9 = previousInstruction(image, .thumb, restore_sl.address) catch return false;
+    const restore_r9_mov = switch (restore_r9.instruction) {
+        .mov_reg => |mov| mov,
+        else => return false,
+    };
+    if (restore_r9_mov.rd != 9 or restore_r9_mov.rm != 1) return false;
+
+    const restore_r8 = previousInstruction(image, .thumb, restore_r9.address) catch return false;
+    const restore_r8_mov = switch (restore_r8.instruction) {
+        .mov_reg => |mov| mov,
+        else => return false,
+    };
+    if (restore_r8_mov.rd != 8 or restore_r8_mov.rm != 0) return false;
+
+    const pop_low = previousInstruction(image, .thumb, restore_r8.address) catch return false;
+    const pop_low_mask = switch (pop_low.instruction) {
+        .pop => |mask| mask,
+        else => return false,
+    };
+    if (pop_low_mask != 0x00FF) return false;
+
+    const add_sp = previousInstruction(image, .thumb, pop_low.address) catch return false;
+    const add = switch (add_sp.instruction) {
+        .add_imm => |add| add,
+        else => return false,
+    };
+
+    // Exact measured Kirby IWRAM-overlay epilogue:
+    // `add sp,#28; pop {r0-r7}; mov r8,r0; mov r9,r1; mov sl,r2;
+    // mov fp,r3; pop {r3}; bx r3`.
+    return add.rd == 13 and add.rn == 13 and add.imm == 28;
 }
 
 fn thumbEntrySavedRegsMask(
@@ -1428,10 +3136,197 @@ fn resolveLocalThumbBlxRegVeneerTarget(
     };
     if (!isMeasuredLocalThumbBlxVeneerNop(image, target_address + 2)) return null;
 
+    if (bx.reg == 3) {
+        if (try resolveMeasuredKirbyStackCopiedThumbThunkBlxR3Target(image, isa, bl_address)) |resolved_target| return resolved_target;
+    }
+    if (bx.reg == 0) {
+        if (try resolveMeasuredKirbyIwramLiteralBlxR0Target(image, isa, bl_address)) |resolved_target| return resolved_target;
+    }
+
     const raw_target = resolvePreviousRegisterValue(image, isa, bl_address, bx.reg) catch return null;
     const code_target = normalizeCodeTarget(raw_target);
     if (offsetForAddress(image, code_target.address, code_target.isa) == null) return null;
     return code_target;
+}
+
+fn resolveMeasuredKirbyIwramLiteralBlxR0Target(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    bl_address: u32,
+) BuildError!?armv4t_decode.CodeAddress {
+    if (isa != .thumb) return null;
+
+    const load_insn = try previousInstruction(image, isa, bl_address);
+    const load = switch (load_insn.instruction) {
+        .ldr_word_imm => |ldr| ldr,
+        else => return null,
+    };
+    if (load.rd != 0 or load.base != 15) return null;
+
+    const push_insn = try previousInstruction(image, isa, load_insn.address);
+    const push = switch (push_insn.instruction) {
+        .push => |mask| mask,
+        else => return null,
+    };
+    if (push != 0x4000) return null;
+
+    const pop_insn = try decodeImageInstructionUnchecked(image, isa, bl_address + 4);
+    const pop = switch (pop_insn.instruction) {
+        .pop => |mask| mask,
+        else => return null,
+    };
+    if (pop != 0x0001) return null;
+
+    const bx_insn = try decodeImageInstructionUnchecked(image, isa, bl_address + 6);
+    const bx = switch (bx_insn.instruction) {
+        .bx_reg => |bx| bx,
+        else => return null,
+    };
+    if (bx.reg != 0) return null;
+
+    const raw_target = resolveThumbLiteralWordFromRom(image, load_insn.address, load) orelse return null;
+    const target = normalizeCodeTarget(raw_target);
+    if (target.address != 0x0300_1F40 or target.isa != .thumb) return null;
+
+    const source_offset = romOffsetForAddress(image, image.base_address + 0x878, .arm) orelse return null;
+    const dest_offset = romOffsetForAddress(image, image.base_address + 0x87C, .arm) orelse return null;
+    if (source_offset + 4 > image.bytes.len or dest_offset + 4 > image.bytes.len) return null;
+
+    const source_raw = armv4t_decode.readWord(image.bytes, source_offset);
+    const dest = armv4t_decode.readWord(image.bytes, dest_offset);
+    if (source_raw != image.base_address + 0x1B09) return null;
+    if (dest != target.address) return null;
+
+    const source = normalizeCodeTarget(source_raw);
+    if (source.isa != .thumb) return null;
+    if (offsetForAddress(image, source.address, source.isa) == null) return null;
+    return source;
+}
+
+fn resolveMeasuredKirbyStackCopiedThumbThunkBlxR3Target(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    bl_address: u32,
+) BuildError!?armv4t_decode.CodeAddress {
+    if (isa != .thumb) return null;
+    if (bl_address < 0x40) return null;
+
+    const adds_r2_insn = try previousInstruction(image, isa, bl_address);
+    const adds_r2 = switch (adds_r2_insn.instruction) {
+        .adds_imm => |add| add,
+        else => return null,
+    };
+    if (adds_r2.rd != 2 or adds_r2.rn != 6 or adds_r2.imm != 0) return null;
+
+    const adds_r1_insn = try previousInstruction(image, isa, adds_r2_insn.address);
+    const adds_r1 = switch (adds_r1_insn.instruction) {
+        .adds_imm => |add| add,
+        else => return null,
+    };
+    if (adds_r1.rd != 1 or adds_r1.rn != 5 or adds_r1.imm != 0) return null;
+
+    const adds_r0_insn = try previousInstruction(image, isa, adds_r1_insn.address);
+    const adds_r0 = switch (adds_r0_insn.instruction) {
+        .adds_imm => |add| add,
+        else => return null,
+    };
+    if (adds_r0.rd != 0 or adds_r0.rn != 4 or adds_r0.imm != 0) return null;
+
+    const adds_r3_insn = try previousInstruction(image, isa, adds_r0_insn.address);
+    const adds_r3 = switch (adds_r3_insn.instruction) {
+        .adds_imm => |add| add,
+        else => return null,
+    };
+    if (adds_r3.rd != 3 or adds_r3.rn != 3 or adds_r3.imm != 1) return null;
+
+    const mov_sp_insn = try previousInstruction(image, isa, adds_r3_insn.address);
+    const mov_sp = switch (mov_sp_insn.instruction) {
+        .mov_reg => |mov| mov,
+        else => return null,
+    };
+    if (mov_sp.rd != 3 or mov_sp.rm != 13) return null;
+
+    const copy_start = bl_address - 0x40;
+    if (mov_sp_insn.address != copy_start + 0x36) return null;
+
+    const expected_halfwords = [_]struct {
+        offset: u32,
+        value: u16,
+    }{
+        .{ .offset = 0x00, .value = 0x4B06 }, // ldr r3, [pc, #24] ; copied source | thumb bit
+        .{ .offset = 0x02, .value = 0x2001 }, // movs r0, #1
+        .{ .offset = 0x04, .value = 0x4043 }, // eors r3, r0 ; clear thumb bit for data copy
+        .{ .offset = 0x06, .value = 0x466A }, // mov r2, sp
+        .{ .offset = 0x08, .value = 0x4805 }, // ldr r0, [pc, #20] ; copied source end | thumb bit
+        .{ .offset = 0x0A, .value = 0x4904 }, // ldr r1, [pc, #16] ; copied source | thumb bit
+        .{ .offset = 0x0C, .value = 0x1A40 }, // subs r0, r0, r1
+        .{ .offset = 0x0E, .value = 0x03C0 }, // lsls r0, r0, #15
+        .{ .offset = 0x10, .value = 0xE00E }, // branch to loop condition
+        .{ .offset = 0x24, .value = 0x8818 }, // ldrh r0, [r3]
+        .{ .offset = 0x26, .value = 0x8010 }, // strh r0, [r2]
+        .{ .offset = 0x28, .value = 0x3302 }, // adds r3, #2
+        .{ .offset = 0x2A, .value = 0x3202 }, // adds r2, #2
+        .{ .offset = 0x2C, .value = 0x1E48 }, // subs r0, r1, #1
+        .{ .offset = 0x2E, .value = 0x0400 }, // lsls r0, r0, #16
+        .{ .offset = 0x30, .value = 0x0C01 }, // lsrs r1, r0, #16
+        .{ .offset = 0x32, .value = 0x2900 }, // cmp r1, #0
+        .{ .offset = 0x34, .value = 0xD1F6 }, // bne copy loop body
+        .{ .offset = 0x36, .value = 0x466B }, // mov r3, sp
+        .{ .offset = 0x38, .value = 0x3301 }, // adds r3, #1
+    };
+
+    for (expected_halfwords) |expected| {
+        if (mappedThumbHalfword(image, copy_start + expected.offset) != expected.value) return null;
+    }
+
+    const source_raw = mappedThumbWord(image, copy_start + 0x1C) orelse return null;
+    const end_raw = mappedThumbWord(image, copy_start + 0x20) orelse return null;
+    if (source_raw == 0 or end_raw == 0) return null;
+    if ((source_raw & 1) == 0 or (end_raw & 1) == 0) return null;
+    if (end_raw <= source_raw or end_raw - source_raw > 0x100) return null;
+
+    const copied_target = normalizeCodeTarget(source_raw);
+    if (copied_target.isa != .thumb) return null;
+    if (offsetForAddress(image, copied_target.address, copied_target.isa) == null) return null;
+    return copied_target;
+}
+
+fn resolveThumbBxPcArmBranchVeneerTarget(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    target_address: u32,
+) BuildError!?armv4t_decode.CodeAddress {
+    if (isa != .thumb) return null;
+
+    const bx_pc_insn = decodeImageInstructionUnchecked(image, .thumb, target_address) catch return null;
+    const bx_pc = switch (bx_pc_insn.instruction) {
+        .bx_reg => |bx| bx,
+        else => return null,
+    };
+    if (bx_pc.reg != 15) return null;
+
+    if (mappedThumbHalfword(image, target_address + 2) != 0x46C0) return null;
+
+    const arm_branch_insn = decodeImageInstructionUnchecked(image, .arm, target_address + 4) catch return null;
+    const arm_branch = switch (arm_branch_insn.instruction) {
+        .branch => |branch| branch,
+        else => return null,
+    };
+    if (arm_branch.cond != .al) return null;
+    if (offsetForAddress(image, arm_branch.target, .arm) == null) return null;
+    return .{ .address = arm_branch.target, .isa = .arm };
+}
+
+fn mappedThumbHalfword(image: gba_loader.RomImage, address: u32) ?u16 {
+    const offset = offsetForAddress(image, address, .thumb) orelse return null;
+    if (offset + 2 > image.bytes.len) return null;
+    return armv4t_decode.readHalfword(image.bytes, offset);
+}
+
+fn mappedThumbWord(image: gba_loader.RomImage, address: u32) ?u32 {
+    const offset = offsetForAddress(image, address, .thumb) orelse return null;
+    if (offset + 4 > image.bytes.len) return null;
+    return armv4t_decode.readWord(image.bytes, offset);
 }
 
 fn resolveExactKeyDemoLocalThumbBlxR3CallerTarget(
@@ -1744,6 +3639,62 @@ fn writeSeparatedLocalThumbBlxR3VeneerRom(
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
+fn writeMeasuredKirbyStackCopiedThunkRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+    adds_r3_halfword: u16,
+) !void {
+    var rom: [0x70]u8 = std.mem.zeroes([0x70]u8);
+
+    std.mem.writeInt(u16, rom[0x00..0x02], 0xB510, .little); // push {r4, lr}
+    std.mem.writeInt(u16, rom[0x02..0x04], 0x1C04, .little); // adds r4, r0, #0
+    std.mem.writeInt(u16, rom[0x04..0x06], 0xBC10, .little); // pop {r4}
+    std.mem.writeInt(u16, rom[0x06..0x08], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x08..0x0A], 0x4700, .little); // bx r0
+
+    const copy_start = 0x20;
+    const halfwords = [_]struct {
+        offset: usize,
+        value: u16,
+    }{
+        .{ .offset = 0x00, .value = 0x4B06 },
+        .{ .offset = 0x02, .value = 0x2001 },
+        .{ .offset = 0x04, .value = 0x4043 },
+        .{ .offset = 0x06, .value = 0x466A },
+        .{ .offset = 0x08, .value = 0x4805 },
+        .{ .offset = 0x0A, .value = 0x4904 },
+        .{ .offset = 0x0C, .value = 0x1A40 },
+        .{ .offset = 0x0E, .value = 0x03C0 },
+        .{ .offset = 0x10, .value = 0xE00E },
+        .{ .offset = 0x24, .value = 0x8818 },
+        .{ .offset = 0x26, .value = 0x8010 },
+        .{ .offset = 0x28, .value = 0x3302 },
+        .{ .offset = 0x2A, .value = 0x3202 },
+        .{ .offset = 0x2C, .value = 0x1E48 },
+        .{ .offset = 0x2E, .value = 0x0400 },
+        .{ .offset = 0x30, .value = 0x0C01 },
+        .{ .offset = 0x32, .value = 0x2900 },
+        .{ .offset = 0x34, .value = 0xD1F6 },
+        .{ .offset = 0x36, .value = 0x466B },
+        .{ .offset = 0x38, .value = adds_r3_halfword },
+        .{ .offset = 0x3A, .value = 0x1C20 },
+        .{ .offset = 0x3C, .value = 0x1C29 },
+        .{ .offset = 0x3E, .value = 0x1C32 },
+    };
+    for (halfwords) |halfword| {
+        const start = copy_start + halfword.offset;
+        std.mem.writeInt(u16, rom[start..][0..2], halfword.value, .little);
+    }
+
+    std.mem.writeInt(u32, rom[copy_start + 0x1C ..][0..4], 0x0800_0001, .little);
+    std.mem.writeInt(u32, rom[copy_start + 0x20 ..][0..4], 0x0800_000B, .little);
+    std.mem.writeInt(u16, rom[0x68..0x6A], 0x4718, .little); // bx r3
+    std.mem.writeInt(u16, rom[0x6A..0x6C], 0x46C0, .little); // nop
+
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
 fn writeMeasuredThumbPopR0BxR0Rom(
     dir: std.Io.Dir,
     io: std.Io,
@@ -2015,7 +3966,7 @@ fn resolveLiteralWordFromRom(
     offset: u32,
 ) BuildError!u32 {
     const literal_address = pcValueForInstruction(isa, load_address) + offset;
-    const literal_offset = romOffsetForAddress(image, literal_address, isa) orelse return error.UnsupportedOpcode;
+    const literal_offset = offsetForAddress(image, literal_address, isa) orelse return error.UnsupportedOpcode;
     if (literal_offset + 4 > image.bytes.len) return error.UnsupportedOpcode;
     return armv4t_decode.readWord(image.bytes, literal_offset);
 }
@@ -2153,6 +4104,7 @@ fn writesUnsupportedPcDestination(decoded: armv4t_decode.DecodedInstruction) boo
         .orr_shift_reg => |orr| orr.rd == 15,
         .and_imm => |and_op| and_op.rd == 15,
         .and_reg => |and_op| and_op.rd == 15,
+        .and_shift_reg => |and_op| and_op.rd == 15,
         .add_imm => |add| add.rd == 15,
         .adds_imm => |add| add.rd == 15,
         .adcs_imm => |add| add.rd == 15,
@@ -2167,6 +4119,7 @@ fn writesUnsupportedPcDestination(decoded: armv4t_decode.DecodedInstruction) boo
         .rsbs_imm => |sub| sub.rd == 15,
         .rsc_imm => |sub| sub.rd == 15,
         .sub_imm => |sub| sub.rd == 15,
+        .sub_reg => |sub| sub.rd == 15,
         .subs_imm => |sub| sub.rd == 15,
         .subs_reg => |sub| sub.rd == 15,
         .lsl_imm => |shift| shift.rd == 15,
@@ -2206,6 +4159,9 @@ fn writesUnsupportedPcDestination(decoded: armv4t_decode.DecodedInstruction) boo
         .ldr_signed_halfword_imm => |load| load.rd == 15,
         .ldr_signed_halfword_reg => |load| load.rd == 15,
         .ldr_signed_byte_imm => |load| load.rd == 15,
+        .ldr_signed_byte_post_imm => |load| load.rd == 15,
+        .ldr_signed_byte_pre_index_imm => |load| load.rd == 15,
+        .ldr_signed_byte_pre_index_reg => |load| load.rd == 15,
         .ldr_signed_byte_reg => |load| load.rd == 15,
         .ldr_word_pre_index_reg_shift => |load| load.rd == 15,
         .ldr_word_pre_index_imm => |load| load.rd == 15,
@@ -2306,13 +4262,23 @@ fn isCpuFastSetSwi(imm24: u24) bool {
     return imm24 == 0x00000C or imm24 == 0x0C0000;
 }
 
+fn swiEndsFunction(imm24: u24) bool {
+    return imm24 == 0x000000;
+}
+
 fn swiShimName(imm24: u24) ?[]const u8 {
     if (imm24 == 0x000000) return "SoftReset";
+    if (imm24 == 0x000001 or imm24 == 0x010000) return "RegisterRamReset";
     if (isVBlankIntrWaitSwi(imm24)) return "VBlankIntrWait";
     if (isDivSwi(imm24)) return "Div";
     if (isSqrtSwi(imm24)) return "Sqrt";
     if (isCpuSetSwi(imm24)) return "CpuSet";
     if (isCpuFastSetSwi(imm24)) return "CpuFastSet";
+    if (imm24 == 0x000011 or imm24 == 0x110000) return "LZ77UnCompWram";
+    if (imm24 == 0x000012 or imm24 == 0x120000) return "LZ77UnCompVram";
+    if (imm24 == 0x000013 or imm24 == 0x130000) return "HuffUnComp";
+    if (imm24 == 0x000025 or imm24 == 0x250000) return "MultiBoot";
+    if (imm24 == 0x000028 or imm24 == 0x280000) return "SoundDriverVSyncOff";
     return null;
 }
 
@@ -2920,6 +4886,56 @@ fn writeCpuFastSetCopyRom(
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
+fn writeLz77UnCompVramLiteralRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xE59F0010, // ldr r0, [pc, #0x10] ; source
+        0xE59F1010, // ldr r1, [pc, #0x10] ; dest
+        0xEF000012, // swi 0x12 (LZ77UnCompVram)
+        0xE5D10000, // ldrb r0, [r1]
+        0xEF000000, // swi 0x00 (SoftReset)
+        0x00000000, // padding
+        0x08000020, // source literal
+        0x02000000, // dest literal
+        0x00000310, // LZ77 header: type 0x10, decompressed size 3
+        0x43424100, // flags=0, literals 'A', 'B', 'C'
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
+fn writeLz77UnCompVramHalfwordRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xE59F0010, // ldr r0, [pc, #0x10] ; source
+        0xE59F1010, // ldr r1, [pc, #0x10] ; dest
+        0xEF000012, // swi 0x12 (LZ77UnCompVram)
+        0xE1D100B0, // ldrh r0, [r1]
+        0xEF000000, // swi 0x00 (SoftReset)
+        0x00000000, // padding
+        0x08000020, // source literal
+        0x06000000, // dest literal
+        0x00000210, // LZ77 header: type 0x10, decompressed size 2
+        0x00341200, // flags=0, literals 0x12, 0x34
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
 fn writeCpuFastSetFillRom(
     dir: std.Io.Dir,
     io: std.Io,
@@ -2934,7 +4950,7 @@ fn writeCpuFastSetFillRom(
         0xE1A0F00E, // mov pc, lr
         0x08000024, // source literal
         0x03000000, // dest literal
-        0x01000008, // eight words, fill mode
+        0x01000008, // eight 32-bit words, fill mode
         1234, // fill word
     };
 
@@ -2960,7 +4976,7 @@ fn writeCpuFastSetAlignRom(
         0xE1A0F00E, // mov pc, lr
         0x0800002D, // source literal: align down to 0x0800002C
         0x03000002, // dest literal: align down to 0x03000000
-        0x00000008, // eight words, copy mode
+        0x00000001, // one 32-bit word, copy mode
         0x03000000, // aligned dest base literal
         42,
         1,
@@ -3002,20 +5018,44 @@ fn writeCpuFastSetBadControlRom(
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
-fn writeCpuFastSetBadCountRom(
+fn writeCpuFastSetWordCountRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    var words: [17]u32 = undefined;
+    words[0] = 0xE59F0010; // ldr r0, [pc, #0x10] ; source
+    words[1] = 0xE59F1010; // ldr r1, [pc, #0x10] ; dest
+    words[2] = 0xE59F2010; // ldr r2, [pc, #0x10] ; control
+    words[3] = 0xEF00000C; // swi 0x0C (CpuFastSet)
+    words[4] = 0xE591001C; // ldr r0, [r1, #28] ; eighth word must remain untouched
+    words[5] = 0xE1A0F00E; // mov pc, lr
+    words[6] = 0x08000024; // source literal
+    words[7] = 0x03000000; // dest literal
+    words[8] = 0x00000007; // seven 32-bit words
+    for (0..8) |index| {
+        words[9 + index] = @intCast(index + 1);
+    }
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
+fn writeVCountPollRom(
     dir: std.Io.Dir,
     io: std.Io,
     path: []const u8,
 ) !void {
     const words = [_]u32{
-        0xE59F000C, // ldr r0, [pc, #0x0C]
-        0xE59F100C, // ldr r1, [pc, #0x0C]
-        0xE59F200C, // ldr r2, [pc, #0x0C]
-        0xEF00000C, // swi 0x0C (CpuFastSet)
-        0xEAFFFFFE, // b . ; would spin until the instruction limit if stop_flag were ignored
-        0x08000020,
-        0x03000000,
-        0x00000007, // GBA CpuFastSet count must be a multiple of 8 words
+        0xE59F100C, // ldr r1, [pc, #0x0C] ; VCOUNT
+        0xE5D10000, // ldrb r0, [r1]
+        0xE3500003, // cmp r0, #3
+        0x1AFFFFFC, // bne loop
+        0xE12FFF1E, // bx lr
+        0x04000006, // VCOUNT
     };
 
     var rom: [words.len * 4]u8 = undefined;
@@ -3370,7 +5410,7 @@ test "arm startup bx r1 literal target resolves the measured commercial handoff 
         defer image.deinit(std.testing.allocator);
 
         try std.testing.expectEqualDeep(
-            armv4t_decode.DecodedInstruction{ .bx_target = case.expected_target },
+            armv4t_decode.DecodedInstruction{ .bl = .{ .target = case.expected_target } },
             try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .arm }, case.bx_address, 1),
         );
     }
@@ -3422,9 +5462,9 @@ test "arm startup bx r1 literal resolver rejects near-miss shapes" {
         const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", path);
         defer image.deinit(std.testing.allocator);
 
-        try std.testing.expectError(
-            error.UnsupportedOpcode,
-            resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .arm }, 0x0800_0008, 1),
+        try std.testing.expectEqualDeep(
+            armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+            try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .arm }, 0x0800_0008, 1),
         );
     }
 }
@@ -3628,6 +5668,112 @@ test "local thumb blx r1 veneer resolves the caller literal target" {
     );
 }
 
+test "local thumb blx r3 veneer resolves measured stack-copied thunk source" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeMeasuredKirbyStackCopiedThunkRom(tmp.dir, io, "stack-copied-thunk.gba", 0x3301);
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "stack-copied-thunk.gba");
+    defer image.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bl = .{ .target = .{ .address = 0x0800_0000, .isa = .thumb } } },
+        try resolveDecodedInstruction(
+            image,
+            .{ .address = 0x0800_0020, .isa = .thumb },
+            0x0800_0060,
+            .{ .bl = .{ .target = .{ .address = 0x0800_0068, .isa = .thumb } } },
+        ),
+    );
+}
+
+test "local thumb blx r3 stack-copied thunk resolver rejects near misses" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeMeasuredKirbyStackCopiedThunkRom(tmp.dir, io, "stack-copied-thunk-near-miss.gba", 0x3302);
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "stack-copied-thunk-near-miss.gba");
+    defer image.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bl = .{ .target = .{ .address = 0x0800_0068, .isa = .thumb } } },
+        try resolveDecodedInstruction(
+            image,
+            .{ .address = 0x0800_0020, .isa = .thumb },
+            0x0800_0060,
+            .{ .bl = .{ .target = .{ .address = 0x0800_0068, .isa = .thumb } } },
+        ),
+    );
+}
+
+test "local thumb blx r0 veneer resolves measured Kirby IWRAM literal target" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var rom: [0x1B10]u8 = std.mem.zeroes([0x1B10]u8);
+    std.mem.writeInt(u32, rom[0x0878..0x087C], 0x0800_1B09, .little);
+    std.mem.writeInt(u32, rom[0x087C..0x0880], 0x0300_1F40, .little);
+    std.mem.writeInt(u16, rom[0x1A84..0x1A86], 0xB500, .little); // push {lr}
+    std.mem.writeInt(u16, rom[0x1A86..0x1A88], 0x4802, .little); // ldr r0, [pc, #8]
+    std.mem.writeInt(u16, rom[0x1A8C..0x1A8E], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x1A8E..0x1A90], 0x4700, .little); // bx r0
+    std.mem.writeInt(u32, rom[0x1A90..0x1A94], 0x0300_1F41, .little);
+    std.mem.writeInt(u16, rom[0x1AA0..0x1AA2], 0x4700, .little); // bx r0
+    std.mem.writeInt(u16, rom[0x1AA2..0x1AA4], 0x46C0, .little); // nop
+    std.mem.writeInt(u16, rom[0x1B08..0x1B0A], 0xB500, .little); // copied function source
+    std.mem.writeInt(u16, rom[0x1B0A..0x1B0C], 0x4770, .little);
+    try tmp.dir.writeFile(io, .{ .sub_path = "kirby-iwram-r0-literal.gba", .data = &rom });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "kirby-iwram-r0-literal.gba");
+    defer image.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bl = .{ .target = .{ .address = 0x0800_1B08, .isa = .thumb } } },
+        try resolveDecodedInstruction(
+            image,
+            .{ .address = 0x0800_1A84, .isa = .thumb },
+            0x0800_1A88,
+            .{ .bl = .{ .target = .{ .address = 0x0800_1AA0, .isa = .thumb } } },
+        ),
+    );
+}
+
+test "local thumb blx r0 Kirby IWRAM literal resolver rejects table mismatch" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var rom: [0x1B10]u8 = std.mem.zeroes([0x1B10]u8);
+    std.mem.writeInt(u32, rom[0x0878..0x087C], 0x0800_1B0D, .little);
+    std.mem.writeInt(u32, rom[0x087C..0x0880], 0x0300_1F40, .little);
+    std.mem.writeInt(u16, rom[0x1A84..0x1A86], 0xB500, .little);
+    std.mem.writeInt(u16, rom[0x1A86..0x1A88], 0x4802, .little);
+    std.mem.writeInt(u16, rom[0x1A8C..0x1A8E], 0xBC01, .little);
+    std.mem.writeInt(u16, rom[0x1A8E..0x1A90], 0x4700, .little);
+    std.mem.writeInt(u32, rom[0x1A90..0x1A94], 0x0300_1F41, .little);
+    std.mem.writeInt(u16, rom[0x1AA0..0x1AA2], 0x4700, .little);
+    std.mem.writeInt(u16, rom[0x1AA2..0x1AA4], 0x46C0, .little);
+    try tmp.dir.writeFile(io, .{ .sub_path = "kirby-iwram-r0-literal-near-miss.gba", .data = &rom });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "kirby-iwram-r0-literal-near-miss.gba");
+    defer image.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bl = .{ .target = .{ .address = 0x0800_1AA0, .isa = .thumb } } },
+        try resolveDecodedInstruction(
+            image,
+            .{ .address = 0x0800_1A84, .isa = .thumb },
+            0x0800_1A88,
+            .{ .bl = .{ .target = .{ .address = 0x0800_1AA0, .isa = .thumb } } },
+        ),
+    );
+}
+
 test "local thumb blx r3 veneer rejects near misses" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3714,7 +5860,7 @@ test "local thumb blx r3 veneer matcher reports the measured tonc blockers" {
         },
         .{
             .rom_path = "tests/fixtures/real/tonc/irq_demo.gba",
-            .local_occurrence = "Unsupported opcode 0x00004718 at 0x08003078 for armv4t",
+            .local_occurrence = "Unsupported opcode 0x0000468F at 0x08002240 for armv4t",
             .expect_cleared = false,
         },
         .{
@@ -3808,6 +5954,757 @@ test "tonc measured devkitARM IWRAM code span rejects tampered startup metadata"
         const image = gba_loader.RomImage{ .bytes = rom };
         try std.testing.expectEqual(@as(?usize, null), offsetForAddress(image, 0x0300_00A4, .arm));
     }
+}
+
+test "kirby measured IWRAM overlay code span maps copied target to ROM" {
+    const rom_len = 0x0CE5E0;
+    var rom = try std.testing.allocator.alloc(u8, rom_len);
+    defer std.testing.allocator.free(rom);
+    @memset(rom, 0);
+
+    std.mem.writeInt(u32, rom[0x0CD918..][0..4], 0x0300_7FF0, .little);
+    std.mem.writeInt(u32, rom[0x0CE5B0..][0..4], 0x080C_D931, .little);
+    std.mem.writeInt(u32, rom[0x0CE5B4..][0..4], 0x0300_7150, .little);
+    std.mem.writeInt(u32, rom[0x0CE5B8..][0..4], 0x0400_0100, .little);
+    std.mem.writeInt(u16, rom[0x0CD912..][0..2], 0x4B03, .little); // ldr r3, [pc, #12]
+    std.mem.writeInt(u16, rom[0x0CD914..][0..2], 0x4718, .little); // bx r3
+    std.mem.writeInt(u32, rom[0x0CD920..][0..4], 0x0300_7151, .little);
+
+    const image = gba_loader.RomImage{ .bytes = rom };
+    try std.testing.expectEqual(@as(?usize, 0x0CD8AC), offsetForAddress(image, 0x0300_70CC, .thumb));
+    try std.testing.expectEqual(@as(?usize, 0x0CD930), offsetForAddress(image, 0x0300_7150, .thumb));
+    try std.testing.expectEqual(@as(?usize, 0x0CD93C), offsetForAddress(image, 0x0300_715C, .arm));
+    try std.testing.expectEqual(@as(?usize, 0x0CE5D4), offsetForAddress(image, 0x0300_7DF4, .thumb));
+    try std.testing.expectEqual(@as(?usize, null), offsetForAddress(image, 0x0300_7FF0, .thumb));
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_target = .{ .address = 0x0300_7150, .isa = .thumb } },
+        try resolveBxTarget(image, .{ .address = 0x0300_70CC, .isa = .thumb }, 0x0300_7134, 3),
+    );
+
+    std.mem.writeInt(u32, rom[0x0CE5B4..][0..4], 0x0300_7154, .little);
+    try std.testing.expectEqual(@as(?usize, null), offsetForAddress(image, 0x0300_7150, .thumb));
+}
+
+test "kirby measured IWRAM overlay runtime helper is enqueued for dispatch" {
+    const rom_len = 0x0CE5E0;
+    var rom = try std.testing.allocator.alloc(u8, rom_len);
+    defer std.testing.allocator.free(rom);
+    @memset(rom, 0);
+
+    std.mem.writeInt(u32, rom[0x0CD918..][0..4], 0x0300_7FF0, .little);
+    std.mem.writeInt(u32, rom[0x0CE5B0..][0..4], 0x080C_D931, .little);
+    std.mem.writeInt(u32, rom[0x0CE5B4..][0..4], 0x0300_7150, .little);
+    std.mem.writeInt(u32, rom[0x0CE5B8..][0..4], 0x0400_0100, .little);
+
+    const image = gba_loader.RomImage{ .bytes = rom };
+    var pending: std.ArrayList(armv4t_decode.CodeAddress) = .empty;
+    defer pending.deinit(std.testing.allocator);
+
+    try std.testing.expect(try enqueueMeasuredKirbyOverlayRuntimeTargets(
+        std.testing.allocator,
+        &pending,
+        image,
+        &.{},
+    ));
+    try std.testing.expectEqual(@as(usize, 1), pending.items.len);
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0300_7DF4, .isa = .thumb },
+        pending.items[0],
+    );
+}
+
+test "kirby measured IRQ handler code span maps copied target to ROM" {
+    var rom: [0x800]u8 = std.mem.zeroes([0x800]u8);
+    std.mem.writeInt(u32, rom[0x0730..0x0734], 0x0800_0108, .little);
+    std.mem.writeInt(u32, rom[0x0734..0x0738], 0x0300_1030, .little);
+    std.mem.writeInt(u32, rom[0x0738..0x073C], 0x0300_7FFC, .little);
+    std.mem.writeInt(u32, rom[0x0108..0x010C], 0xE3A0_0001, .little);
+
+    const image = gba_loader.RomImage{ .bytes = &rom };
+    try std.testing.expectEqual(@as(?usize, 0x0108), offsetForAddress(image, 0x0300_1030, .arm));
+    try std.testing.expectEqual(@as(?usize, 0x0234), offsetForAddress(image, 0x0300_115C, .arm));
+    try std.testing.expectEqual(@as(?usize, null), offsetForAddress(image, 0x0300_1160, .arm));
+
+    std.mem.writeInt(u32, rom[0x0738..0x073C], 0x0300_7FF8, .little);
+    try std.testing.expectEqual(@as(?usize, null), offsetForAddress(image, 0x0300_1030, .arm));
+}
+
+test "kirby measured IRQ handler runtime target is enqueued for dispatch" {
+    var rom: [0x800]u8 = std.mem.zeroes([0x800]u8);
+    std.mem.writeInt(u32, rom[0x0730..0x0734], 0x0800_0108, .little);
+    std.mem.writeInt(u32, rom[0x0734..0x0738], 0x0300_1030, .little);
+    std.mem.writeInt(u32, rom[0x0738..0x073C], 0x0300_7FFC, .little);
+
+    const image = gba_loader.RomImage{ .bytes = &rom };
+    var pending: std.ArrayList(armv4t_decode.CodeAddress) = .empty;
+    defer pending.deinit(std.testing.allocator);
+
+    try std.testing.expect(try enqueueMeasuredKirbyIrqHandlerRuntimeTarget(
+        std.testing.allocator,
+        &pending,
+        image,
+        &.{},
+    ));
+    try std.testing.expectEqual(@as(usize, 1), pending.items.len);
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0300_1030, .isa = .arm },
+        pending.items[0],
+    );
+}
+
+test "kirby measured interworking callback target is enqueued for dispatch" {
+    const rom_len = 0x7306A0;
+    var rom = try std.testing.allocator.alloc(u8, rom_len);
+    defer std.testing.allocator.free(rom);
+    @memset(rom, 0);
+
+    std.mem.writeInt(u32, rom[0x72FF34..][0..4], 0x0800_93FD, .little);
+    std.mem.writeInt(u32, rom[0x730698..][0..4], 0x0000_0004, .little);
+    std.mem.writeInt(u32, rom[0x73069C..][0..4], 0x0800_99FD, .little);
+    std.mem.writeInt(u16, rom[0x93FC..][0..2], 0xB500, .little);
+    std.mem.writeInt(u16, rom[0x9640..][0..2], 0xB510, .little);
+    std.mem.writeInt(u32, rom[0x9678..][0..4], 0x0800_59D9, .little);
+    std.mem.writeInt(u32, rom[0x967C..][0..4], 0x0800_5CA1, .little);
+    std.mem.writeInt(u16, rom[0x59D8..][0..2], 0xB500, .little);
+    std.mem.writeInt(u16, rom[0x5CA0..][0..2], 0xB570, .little);
+    std.mem.writeInt(u16, rom[0x99FC..][0..2], 0xB570, .little);
+
+    const image = gba_loader.RomImage{ .bytes = rom };
+    var pending: std.ArrayList(armv4t_decode.CodeAddress) = .empty;
+    defer pending.deinit(std.testing.allocator);
+
+    try std.testing.expect(try enqueueMeasuredKirbyInterworkingCallbackTarget(
+        std.testing.allocator,
+        &pending,
+        image,
+        &.{},
+    ));
+    try std.testing.expectEqual(@as(usize, 4), pending.items.len);
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_93FC, .isa = .thumb },
+        pending.items[0],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_59D8, .isa = .thumb },
+        pending.items[1],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_5CA0, .isa = .thumb },
+        pending.items[2],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_99FC, .isa = .thumb },
+        pending.items[3],
+    );
+
+    std.mem.writeInt(u32, rom[0x72FF34..][0..4], 0x0800_9419, .little);
+    std.mem.writeInt(u32, rom[0x9678..][0..4], 0x0800_9419, .little);
+    std.mem.writeInt(u32, rom[0x967C..][0..4], 0x0800_9419, .little);
+    std.mem.writeInt(u32, rom[0x73069C..][0..4], 0x0800_9419, .little);
+    try std.testing.expect(!try enqueueMeasuredKirbyInterworkingCallbackTarget(
+        std.testing.allocator,
+        &pending,
+        image,
+        &.{},
+    ));
+}
+
+test "kirby measured coroutine resume continuation target is enqueued for dispatch" {
+    const rom_len = 0x0CFDD4;
+    var rom = try std.testing.allocator.alloc(u8, rom_len);
+    defer std.testing.allocator.free(rom);
+    @memset(rom, 0);
+
+    std.mem.writeInt(u16, rom[0x5364..][0..2], 0xF0CA, .little); // bl 0x080CFDC4, first half
+    std.mem.writeInt(u16, rom[0x5366..][0..2], 0xFD2E, .little); // bl 0x080CFDC4, second half
+    std.mem.writeInt(u16, rom[0x0CFDC4..][0..2], 0x4778, .little); // bx pc
+    std.mem.writeInt(u16, rom[0x0CFDC6..][0..2], 0x46C0, .little); // nop
+    std.mem.writeInt(u32, rom[0x0CFDC8..][0..4], 0xEAFC_C119, .little); // b 0x08000234
+    std.mem.writeInt(u16, rom[0x940E..][0..2], 0xF0C6, .little); // bl 0x080CFDCC, first half
+    std.mem.writeInt(u16, rom[0x9410..][0..2], 0xFCDD, .little); // bl 0x080CFDCC, second half
+    std.mem.writeInt(u16, rom[0x0CFDCC..][0..2], 0x4778, .little); // bx pc
+    std.mem.writeInt(u16, rom[0x0CFDCE..][0..2], 0x46C0, .little); // nop
+    std.mem.writeInt(u32, rom[0x0CFDD0..][0..4], 0xEAFC_C120, .little); // b 0x08000258
+    std.mem.writeInt(u16, rom[0x22E4..][0..2], 0xB500, .little); // push {lr}
+    std.mem.writeInt(u16, rom[0x22E6..][0..2], 0xF002, .little); // bl 0x08005228, first half
+    std.mem.writeInt(u16, rom[0x22E8..][0..2], 0xFF9F, .little); // bl 0x08005228, second half
+    std.mem.writeInt(u16, rom[0x22F6..][0..2], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x22F8..][0..2], 0x4700, .little); // bx r0
+    std.mem.writeInt(u16, rom[0x91AC..][0..2], 0xB530, .little); // push {r4, r5, lr}
+    std.mem.writeInt(u16, rom[0x91AE..][0..2], 0xF000, .little); // bl 0x08009200, first half
+    std.mem.writeInt(u16, rom[0x91B0..][0..2], 0xF827, .little); // bl 0x08009200, second half
+    std.mem.writeInt(u16, rom[0x91F6..][0..2], 0xBC30, .little); // pop {r4, r5}
+    std.mem.writeInt(u16, rom[0x91F8..][0..2], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x91FA..][0..2], 0x4700, .little); // bx r0
+    std.mem.writeInt(u16, rom[0x739C..][0..2], 0xF001, .little); // bl 0x080091AC, first half
+    std.mem.writeInt(u16, rom[0x739E..][0..2], 0xFF06, .little); // bl 0x080091AC, second half
+    std.mem.writeInt(u16, rom[0x95C0..][0..2], 0xB500, .little); // push {lr}
+    std.mem.writeInt(u16, rom[0x95E0..][0..2], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x95E2..][0..2], 0x4700, .little); // bx r0
+    std.mem.writeInt(u16, rom[0x2D54..][0..2], 0xB530, .little); // push {r4, r5, lr}
+    std.mem.writeInt(u16, rom[0x2D64..][0..2], 0xF7FF, .little); // bl 0x080022E4, first half
+    std.mem.writeInt(u16, rom[0x2D66..][0..2], 0xFABE, .little); // bl 0x080022E4, second half
+    std.mem.writeInt(u16, rom[0x2D6E..][0..2], 0xBC30, .little); // pop {r4, r5}
+    std.mem.writeInt(u16, rom[0x2D70..][0..2], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x2D72..][0..2], 0x4700, .little); // bx r0
+    std.mem.writeInt(u16, rom[0x2DB4..][0..2], 0xB510, .little); // push {r4, lr}
+    std.mem.writeInt(u16, rom[0x2DC0..][0..2], 0xF7FF, .little); // bl 0x080022E4, first half
+    std.mem.writeInt(u16, rom[0x2DC2..][0..2], 0xFA90, .little); // bl 0x080022E4, second half
+    std.mem.writeInt(u16, rom[0x2DD0..][0..2], 0xBC10, .little); // pop {r4}
+    std.mem.writeInt(u16, rom[0x2DD2..][0..2], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x2DD4..][0..2], 0x4700, .little); // bx r0
+    std.mem.writeInt(u16, rom[0x9200..][0..2], 0xB570, .little); // push {r4, r5, r6, lr}
+    std.mem.writeInt(u16, rom[0x9202..][0..2], 0x4656, .little); // mov r6, sl
+    std.mem.writeInt(u16, rom[0x9204..][0..2], 0x464D, .little); // mov r5, r9
+    std.mem.writeInt(u16, rom[0x9206..][0..2], 0x4644, .little); // mov r4, r8
+    std.mem.writeInt(u16, rom[0x9208..][0..2], 0xB470, .little); // push {r4, r5, r6}
+    std.mem.writeInt(u16, rom[0x9298..][0..2], 0xF7F9, .little); // bl 0x08002D54, first half
+    std.mem.writeInt(u16, rom[0x929A..][0..2], 0xFD5C, .little); // bl 0x08002D54, second half
+    std.mem.writeInt(u16, rom[0x92A4..][0..2], 0xF000, .little); // bl 0x08009398, first half
+    std.mem.writeInt(u16, rom[0x92A6..][0..2], 0xF878, .little); // bl 0x08009398, second half
+    std.mem.writeInt(u16, rom[0x92B4..][0..2], 0xF000, .little); // bl 0x08009398, first half
+    std.mem.writeInt(u16, rom[0x92B6..][0..2], 0xF870, .little); // bl 0x08009398, second half
+    std.mem.writeInt(u16, rom[0x92D2..][0..2], 0xF000, .little); // bl 0x08009398, first half
+    std.mem.writeInt(u16, rom[0x92D4..][0..2], 0xF861, .little); // bl 0x08009398, second half
+    std.mem.writeInt(u16, rom[0x9340..][0..2], 0xF7F8, .little); // bl 0x080022E4, first half
+    std.mem.writeInt(u16, rom[0x9342..][0..2], 0xFFD0, .little); // bl 0x080022E4, second half
+    std.mem.writeInt(u16, rom[0x936C..][0..2], 0xBC38, .little); // pop {r3, r4, r5}
+    std.mem.writeInt(u16, rom[0x936E..][0..2], 0x4698, .little); // mov r8, r3
+    std.mem.writeInt(u16, rom[0x9370..][0..2], 0x46A1, .little); // mov r9, r4
+    std.mem.writeInt(u16, rom[0x9372..][0..2], 0x46AA, .little); // mov sl, r5
+    std.mem.writeInt(u16, rom[0x9374..][0..2], 0xBC70, .little); // pop {r4, r5, r6}
+    std.mem.writeInt(u16, rom[0x9376..][0..2], 0xBC02, .little); // pop {r1}
+    std.mem.writeInt(u16, rom[0x9378..][0..2], 0x4708, .little); // bx r1
+    std.mem.writeInt(u16, rom[0x9398..][0..2], 0xB530, .little); // push {r4, r5, lr}
+    std.mem.writeInt(u16, rom[0x93B8..][0..2], 0xF7F8, .little); // bl 0x080022E4, first half
+    std.mem.writeInt(u16, rom[0x93BA..][0..2], 0xFF94, .little); // bl 0x080022E4, second half
+    std.mem.writeInt(u16, rom[0x93C4..][0..2], 0xBC30, .little); // pop {r4, r5}
+    std.mem.writeInt(u16, rom[0x93C6..][0..2], 0xBC02, .little); // pop {r1}
+    std.mem.writeInt(u16, rom[0x93C8..][0..2], 0x4708, .little); // bx r1
+    std.mem.writeInt(u16, rom[0x9418..][0..2], 0xB5F0, .little); // push {r4, r5, r6, r7, lr}
+    std.mem.writeInt(u16, rom[0x941A..][0..2], 0x4647, .little); // mov r7, r8
+    std.mem.writeInt(u16, rom[0x941C..][0..2], 0xB480, .little); // push {r7}
+    std.mem.writeInt(u16, rom[0x944A..][0..2], 0xF0C6, .little); // bl 0x080CFDCC, first half
+    std.mem.writeInt(u16, rom[0x944C..][0..2], 0xFCBF, .little); // bl 0x080CFDCC, second half
+    std.mem.writeInt(u16, rom[0x94C8..][0..2], 0xF0C6, .little); // bl 0x080CFDCC, first half
+    std.mem.writeInt(u16, rom[0x94CA..][0..2], 0xFC80, .little); // bl 0x080CFDCC, second half
+    std.mem.writeInt(u16, rom[0x9532..][0..2], 0xF0C6, .little); // bl 0x080CFDCC, first half
+    std.mem.writeInt(u16, rom[0x9534..][0..2], 0xFC4B, .little); // bl 0x080CFDCC, second half
+    std.mem.writeInt(u16, rom[0x9586..][0..2], 0xF0C6, .little); // bl 0x080CFDCC, first half
+    std.mem.writeInt(u16, rom[0x9588..][0..2], 0xFC21, .little); // bl 0x080CFDCC, second half
+    std.mem.writeInt(u16, rom[0x95EC..][0..2], 0xF0C6, .little); // bl 0x080CFDCC, first half
+    std.mem.writeInt(u16, rom[0x95EE..][0..2], 0xFBEE, .little); // bl 0x080CFDCC, second half
+    std.mem.writeInt(u16, rom[0x9618..][0..2], 0xF0C6, .little); // bl 0x080CFDCC, first half
+    std.mem.writeInt(u16, rom[0x961A..][0..2], 0xFBD8, .little); // bl 0x080CFDCC, second half
+    std.mem.writeInt(u16, rom[0x96A2..][0..2], 0xF0C6, .little); // bl 0x080CFDCC, first half
+    std.mem.writeInt(u16, rom[0x96A4..][0..2], 0xFB93, .little); // bl 0x080CFDCC, second half
+    std.mem.writeInt(u16, rom[0x96B0..][0..2], 0xF0C6, .little); // bl 0x080CFDCC, first half
+    std.mem.writeInt(u16, rom[0x96B2..][0..2], 0xFB8C, .little); // bl 0x080CFDCC, second half
+    std.mem.writeInt(u16, rom[0x96BE..][0..2], 0xF0C6, .little); // bl 0x080CFDCC, first half
+    std.mem.writeInt(u16, rom[0x96C0..][0..2], 0xFB85, .little); // bl 0x080CFDCC, second half
+    std.mem.writeInt(u16, rom[0x96E0..][0..2], 0xB500, .little); // push {lr}
+    std.mem.writeInt(u16, rom[0x96E8..][0..2], 0xF000, .little); // bl 0x0800973C, first half
+    std.mem.writeInt(u16, rom[0x96EA..][0..2], 0xF828, .little); // bl 0x0800973C, second half
+    std.mem.writeInt(u16, rom[0x971C..][0..2], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x971E..][0..2], 0x4700, .little); // bx r0
+    std.mem.writeInt(u16, rom[0x973C..][0..2], 0xB5F0, .little); // push {r4, r5, r6, r7, lr}
+    std.mem.writeInt(u16, rom[0x973E..][0..2], 0x464F, .little); // mov r7, r9
+    std.mem.writeInt(u16, rom[0x9740..][0..2], 0x4646, .little); // mov r6, r8
+    std.mem.writeInt(u16, rom[0x9742..][0..2], 0xB4C0, .little); // push {r6, r7}
+    std.mem.writeInt(u16, rom[0x985E..][0..2], 0xF7F9, .little); // bl 0x08002D54, first half
+    std.mem.writeInt(u16, rom[0x9860..][0..2], 0xFA79, .little); // bl 0x08002D54, second half
+    std.mem.writeInt(u16, rom[0x9870..][0..2], 0xF7F8, .little); // bl 0x080022E4, first half
+    std.mem.writeInt(u16, rom[0x9872..][0..2], 0xFD38, .little); // bl 0x080022E4, second half
+    std.mem.writeInt(u16, rom[0x9892..][0..2], 0xF7F9, .little); // bl 0x08002DB4, first half
+    std.mem.writeInt(u16, rom[0x9894..][0..2], 0xFA8F, .little); // bl 0x08002DB4, second half
+    std.mem.writeInt(u16, rom[0x9898..][0..2], 0xBC18, .little); // pop {r3, r4}
+    std.mem.writeInt(u16, rom[0x989A..][0..2], 0x4698, .little); // mov r8, r3
+    std.mem.writeInt(u16, rom[0x989C..][0..2], 0x46A1, .little); // mov r9, r4
+    std.mem.writeInt(u16, rom[0x989E..][0..2], 0xBCF0, .little); // pop {r4, r5, r6, r7}
+    std.mem.writeInt(u16, rom[0x98A0..][0..2], 0xBC02, .little); // pop {r1}
+    std.mem.writeInt(u16, rom[0x98A2..][0..2], 0x4708, .little); // bx r1
+    std.mem.writeInt(u16, rom[0x98A8..][0..2], 0xB5F0, .little); // push {r4, r5, r6, r7, lr}
+    std.mem.writeInt(u16, rom[0x98AA..][0..2], 0x4657, .little); // mov r7, sl
+    std.mem.writeInt(u16, rom[0x98AC..][0..2], 0x464E, .little); // mov r6, r9
+    std.mem.writeInt(u16, rom[0x98AE..][0..2], 0x4645, .little); // mov r5, r8
+    std.mem.writeInt(u16, rom[0x98B0..][0..2], 0xB4E0, .little); // push {r5, r6, r7}
+    std.mem.writeInt(u16, rom[0x992E..][0..2], 0xF000, .little); // bl 0x080099C8, first half
+    std.mem.writeInt(u16, rom[0x9930..][0..2], 0xF84B, .little); // bl 0x080099C8, second half
+    std.mem.writeInt(u16, rom[0x9994..][0..2], 0xBC38, .little); // pop {r3, r4, r5}
+    std.mem.writeInt(u16, rom[0x9996..][0..2], 0x4698, .little); // mov r8, r3
+    std.mem.writeInt(u16, rom[0x9998..][0..2], 0x46A1, .little); // mov r9, r4
+    std.mem.writeInt(u16, rom[0x999A..][0..2], 0x46AA, .little); // mov sl, r5
+    std.mem.writeInt(u16, rom[0x999C..][0..2], 0xBCF0, .little); // pop {r4, r5, r6, r7}
+    std.mem.writeInt(u16, rom[0x999E..][0..2], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x99A0..][0..2], 0x4700, .little); // bx r0
+    std.mem.writeInt(u16, rom[0x99C8..][0..2], 0xB530, .little); // push {r4, r5, lr}
+    std.mem.writeInt(u16, rom[0x99E8..][0..2], 0xF7F8, .little); // bl 0x080022E4, first half
+    std.mem.writeInt(u16, rom[0x99EA..][0..2], 0xFC7C, .little); // bl 0x080022E4, second half
+    std.mem.writeInt(u16, rom[0x99F4..][0..2], 0xBC30, .little); // pop {r4, r5}
+    std.mem.writeInt(u16, rom[0x99F6..][0..2], 0xBC02, .little); // pop {r1}
+    std.mem.writeInt(u16, rom[0x99F8..][0..2], 0x4708, .little); // bx r1
+    std.mem.writeInt(u16, rom[0x959C..][0..2], 0xE7D7, .little); // b 0x0800954E
+
+    const image = gba_loader.RomImage{ .bytes = rom };
+    var pending: std.ArrayList(armv4t_decode.CodeAddress) = .empty;
+    defer pending.deinit(std.testing.allocator);
+
+    try std.testing.expect(try enqueueMeasuredKirbyCoroutineResumeTargets(
+        std.testing.allocator,
+        &pending,
+        image,
+        &.{},
+    ));
+    try std.testing.expectEqual(@as(usize, 30), pending.items.len);
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_5368, .isa = .thumb },
+        pending.items[0],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_9412, .isa = .thumb },
+        pending.items[1],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_9418, .isa = .thumb },
+        pending.items[2],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_944E, .isa = .thumb },
+        pending.items[3],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_94CC, .isa = .thumb },
+        pending.items[4],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_9536, .isa = .thumb },
+        pending.items[5],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_958A, .isa = .thumb },
+        pending.items[6],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_95F0, .isa = .thumb },
+        pending.items[7],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_961C, .isa = .thumb },
+        pending.items[8],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_96A6, .isa = .thumb },
+        pending.items[9],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_96B4, .isa = .thumb },
+        pending.items[10],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_96C2, .isa = .thumb },
+        pending.items[11],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_96EC, .isa = .thumb },
+        pending.items[12],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_9862, .isa = .thumb },
+        pending.items[13],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_9874, .isa = .thumb },
+        pending.items[14],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_9896, .isa = .thumb },
+        pending.items[15],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_9932, .isa = .thumb },
+        pending.items[16],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_99EC, .isa = .thumb },
+        pending.items[17],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_22EA, .isa = .thumb },
+        pending.items[18],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_2D68, .isa = .thumb },
+        pending.items[19],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_2DC4, .isa = .thumb },
+        pending.items[20],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_929C, .isa = .thumb },
+        pending.items[21],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_92A8, .isa = .thumb },
+        pending.items[22],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_92B8, .isa = .thumb },
+        pending.items[23],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_92D6, .isa = .thumb },
+        pending.items[24],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_9344, .isa = .thumb },
+        pending.items[25],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_93BC, .isa = .thumb },
+        pending.items[26],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_91B2, .isa = .thumb },
+        pending.items[27],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_73A0, .isa = .thumb },
+        pending.items[28],
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = 0x0800_95C0, .isa = .thumb },
+        pending.items[29],
+    );
+
+    std.mem.writeInt(u16, rom[0x5366..][0..2], 0xFD2C, .little);
+    try std.testing.expect(!try enqueueMeasuredKirbyCoroutineResumeTargets(
+        std.testing.allocator,
+        &pending,
+        image,
+        &.{},
+    ));
+}
+
+test "kirby measured coroutine resume function keeps popped return dynamic" {
+    var rom: [0x55A0]u8 = std.mem.zeroes([0x55A0]u8);
+    std.mem.writeInt(u16, rom[0x559C..][0..2], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x559E..][0..2], 0x4700, .little); // bx r0
+
+    const image = gba_loader.RomImage{ .bytes = &rom };
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_5368, .isa = .thumb }, 0x0800_559E, 0),
+    );
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_5300, .isa = .thumb }, 0x0800_559E, 0),
+    );
+}
+
+test "kirby measured coroutine switch entry keeps popped return dynamic" {
+    var rom: [0x95E4]u8 = std.mem.zeroes([0x95E4]u8);
+    std.mem.writeInt(u16, rom[0x95C0..][0..2], 0xB500, .little); // push {lr}
+    std.mem.writeInt(u16, rom[0x95E0..][0..2], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x95E2..][0..2], 0x4700, .little); // bx r0
+
+    const image = gba_loader.RomImage{ .bytes = &rom };
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_95C0, .isa = .thumb }, 0x0800_95E2, 0),
+    );
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_95C2, .isa = .thumb }, 0x0800_95E2, 0),
+    );
+}
+
+test "kirby measured coroutine caller continuations keep popped returns dynamic" {
+    var rom: [0x99FA]u8 = std.mem.zeroes([0x99FA]u8);
+    std.mem.writeInt(u16, rom[0x22E4..][0..2], 0xB500, .little); // push {lr}
+    std.mem.writeInt(u16, rom[0x22E6..][0..2], 0xF002, .little); // bl 0x08005228, first half
+    std.mem.writeInt(u16, rom[0x22E8..][0..2], 0xFF9F, .little); // bl 0x08005228, second half
+    std.mem.writeInt(u16, rom[0x22F6..][0..2], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x22F8..][0..2], 0x4700, .little); // bx r0
+    std.mem.writeInt(u16, rom[0x91AC..][0..2], 0xB530, .little); // push {r4, r5, lr}
+    std.mem.writeInt(u16, rom[0x91AE..][0..2], 0xF000, .little); // bl 0x08009200, first half
+    std.mem.writeInt(u16, rom[0x91B0..][0..2], 0xF827, .little); // bl 0x08009200, second half
+    std.mem.writeInt(u16, rom[0x91F6..][0..2], 0xBC30, .little); // pop {r4, r5}
+    std.mem.writeInt(u16, rom[0x91F8..][0..2], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x91FA..][0..2], 0x4700, .little); // bx r0
+    std.mem.writeInt(u16, rom[0x2D54..][0..2], 0xB530, .little); // push {r4, r5, lr}
+    std.mem.writeInt(u16, rom[0x2D64..][0..2], 0xF7FF, .little); // bl 0x080022E4, first half
+    std.mem.writeInt(u16, rom[0x2D66..][0..2], 0xFABE, .little); // bl 0x080022E4, second half
+    std.mem.writeInt(u16, rom[0x2D6E..][0..2], 0xBC30, .little); // pop {r4, r5}
+    std.mem.writeInt(u16, rom[0x2D70..][0..2], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x2D72..][0..2], 0x4700, .little); // bx r0
+    std.mem.writeInt(u16, rom[0x2DB4..][0..2], 0xB510, .little); // push {r4, lr}
+    std.mem.writeInt(u16, rom[0x2DC0..][0..2], 0xF7FF, .little); // bl 0x080022E4, first half
+    std.mem.writeInt(u16, rom[0x2DC2..][0..2], 0xFA90, .little); // bl 0x080022E4, second half
+    std.mem.writeInt(u16, rom[0x2DD0..][0..2], 0xBC10, .little); // pop {r4}
+    std.mem.writeInt(u16, rom[0x2DD2..][0..2], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x2DD4..][0..2], 0x4700, .little); // bx r0
+    std.mem.writeInt(u16, rom[0x96E0..][0..2], 0xB500, .little); // push {lr}
+    std.mem.writeInt(u16, rom[0x96E8..][0..2], 0xF000, .little); // bl 0x0800973C, first half
+    std.mem.writeInt(u16, rom[0x96EA..][0..2], 0xF828, .little); // bl 0x0800973C, second half
+    std.mem.writeInt(u16, rom[0x971C..][0..2], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x971E..][0..2], 0x4700, .little); // bx r0
+    std.mem.writeInt(u16, rom[0x9200..][0..2], 0xB570, .little); // push {r4, r5, r6, lr}
+    std.mem.writeInt(u16, rom[0x9202..][0..2], 0x4656, .little); // mov r6, sl
+    std.mem.writeInt(u16, rom[0x9204..][0..2], 0x464D, .little); // mov r5, r9
+    std.mem.writeInt(u16, rom[0x9206..][0..2], 0x4644, .little); // mov r4, r8
+    std.mem.writeInt(u16, rom[0x9208..][0..2], 0xB470, .little); // push {r4, r5, r6}
+    std.mem.writeInt(u16, rom[0x9298..][0..2], 0xF7F9, .little); // bl 0x08002D54, first half
+    std.mem.writeInt(u16, rom[0x929A..][0..2], 0xFD5C, .little); // bl 0x08002D54, second half
+    std.mem.writeInt(u16, rom[0x92A4..][0..2], 0xF000, .little); // bl 0x08009398, first half
+    std.mem.writeInt(u16, rom[0x92A6..][0..2], 0xF878, .little); // bl 0x08009398, second half
+    std.mem.writeInt(u16, rom[0x92B4..][0..2], 0xF000, .little); // bl 0x08009398, first half
+    std.mem.writeInt(u16, rom[0x92B6..][0..2], 0xF870, .little); // bl 0x08009398, second half
+    std.mem.writeInt(u16, rom[0x92D2..][0..2], 0xF000, .little); // bl 0x08009398, first half
+    std.mem.writeInt(u16, rom[0x92D4..][0..2], 0xF861, .little); // bl 0x08009398, second half
+    std.mem.writeInt(u16, rom[0x9340..][0..2], 0xF7F8, .little); // bl 0x080022E4, first half
+    std.mem.writeInt(u16, rom[0x9342..][0..2], 0xFFD0, .little); // bl 0x080022E4, second half
+    std.mem.writeInt(u16, rom[0x936C..][0..2], 0xBC38, .little); // pop {r3, r4, r5}
+    std.mem.writeInt(u16, rom[0x936E..][0..2], 0x4698, .little); // mov r8, r3
+    std.mem.writeInt(u16, rom[0x9370..][0..2], 0x46A1, .little); // mov r9, r4
+    std.mem.writeInt(u16, rom[0x9372..][0..2], 0x46AA, .little); // mov sl, r5
+    std.mem.writeInt(u16, rom[0x9374..][0..2], 0xBC70, .little); // pop {r4, r5, r6}
+    std.mem.writeInt(u16, rom[0x9376..][0..2], 0xBC02, .little); // pop {r1}
+    std.mem.writeInt(u16, rom[0x9378..][0..2], 0x4708, .little); // bx r1
+    std.mem.writeInt(u16, rom[0x9398..][0..2], 0xB530, .little); // push {r4, r5, lr}
+    std.mem.writeInt(u16, rom[0x93B8..][0..2], 0xF7F8, .little); // bl 0x080022E4, first half
+    std.mem.writeInt(u16, rom[0x93BA..][0..2], 0xFF94, .little); // bl 0x080022E4, second half
+    std.mem.writeInt(u16, rom[0x93C4..][0..2], 0xBC30, .little); // pop {r4, r5}
+    std.mem.writeInt(u16, rom[0x93C6..][0..2], 0xBC02, .little); // pop {r1}
+    std.mem.writeInt(u16, rom[0x93C8..][0..2], 0x4708, .little); // bx r1
+    std.mem.writeInt(u16, rom[0x973C..][0..2], 0xB5F0, .little); // push {r4, r5, r6, r7, lr}
+    std.mem.writeInt(u16, rom[0x973E..][0..2], 0x464F, .little); // mov r7, r9
+    std.mem.writeInt(u16, rom[0x9740..][0..2], 0x4646, .little); // mov r6, r8
+    std.mem.writeInt(u16, rom[0x9742..][0..2], 0xB4C0, .little); // push {r6, r7}
+    std.mem.writeInt(u16, rom[0x985E..][0..2], 0xF7F9, .little); // bl 0x08002D54, first half
+    std.mem.writeInt(u16, rom[0x9860..][0..2], 0xFA79, .little); // bl 0x08002D54, second half
+    std.mem.writeInt(u16, rom[0x9870..][0..2], 0xF7F8, .little); // bl 0x080022E4, first half
+    std.mem.writeInt(u16, rom[0x9872..][0..2], 0xFD38, .little); // bl 0x080022E4, second half
+    std.mem.writeInt(u16, rom[0x9892..][0..2], 0xF7F9, .little); // bl 0x08002DB4, first half
+    std.mem.writeInt(u16, rom[0x9894..][0..2], 0xFA8F, .little); // bl 0x08002DB4, second half
+    std.mem.writeInt(u16, rom[0x9898..][0..2], 0xBC18, .little); // pop {r3, r4}
+    std.mem.writeInt(u16, rom[0x989A..][0..2], 0x4698, .little); // mov r8, r3
+    std.mem.writeInt(u16, rom[0x989C..][0..2], 0x46A1, .little); // mov r9, r4
+    std.mem.writeInt(u16, rom[0x989E..][0..2], 0xBCF0, .little); // pop {r4, r5, r6, r7}
+    std.mem.writeInt(u16, rom[0x98A0..][0..2], 0xBC02, .little); // pop {r1}
+    std.mem.writeInt(u16, rom[0x98A2..][0..2], 0x4708, .little); // bx r1
+    std.mem.writeInt(u16, rom[0x98A8..][0..2], 0xB5F0, .little); // push {r4, r5, r6, r7, lr}
+    std.mem.writeInt(u16, rom[0x98AA..][0..2], 0x4657, .little); // mov r7, sl
+    std.mem.writeInt(u16, rom[0x98AC..][0..2], 0x464E, .little); // mov r6, r9
+    std.mem.writeInt(u16, rom[0x98AE..][0..2], 0x4645, .little); // mov r5, r8
+    std.mem.writeInt(u16, rom[0x98B0..][0..2], 0xB4E0, .little); // push {r5, r6, r7}
+    std.mem.writeInt(u16, rom[0x992E..][0..2], 0xF000, .little); // bl 0x080099C8, first half
+    std.mem.writeInt(u16, rom[0x9930..][0..2], 0xF84B, .little); // bl 0x080099C8, second half
+    std.mem.writeInt(u16, rom[0x9994..][0..2], 0xBC38, .little); // pop {r3, r4, r5}
+    std.mem.writeInt(u16, rom[0x9996..][0..2], 0x4698, .little); // mov r8, r3
+    std.mem.writeInt(u16, rom[0x9998..][0..2], 0x46A1, .little); // mov r9, r4
+    std.mem.writeInt(u16, rom[0x999A..][0..2], 0x46AA, .little); // mov sl, r5
+    std.mem.writeInt(u16, rom[0x999C..][0..2], 0xBCF0, .little); // pop {r4, r5, r6, r7}
+    std.mem.writeInt(u16, rom[0x999E..][0..2], 0xBC01, .little); // pop {r0}
+    std.mem.writeInt(u16, rom[0x99A0..][0..2], 0x4700, .little); // bx r0
+    std.mem.writeInt(u16, rom[0x99C8..][0..2], 0xB530, .little); // push {r4, r5, lr}
+    std.mem.writeInt(u16, rom[0x99E8..][0..2], 0xF7F8, .little); // bl 0x080022E4, first half
+    std.mem.writeInt(u16, rom[0x99EA..][0..2], 0xFC7C, .little); // bl 0x080022E4, second half
+    std.mem.writeInt(u16, rom[0x99F4..][0..2], 0xBC30, .little); // pop {r4, r5}
+    std.mem.writeInt(u16, rom[0x99F6..][0..2], 0xBC02, .little); // pop {r1}
+    std.mem.writeInt(u16, rom[0x99F8..][0..2], 0x4708, .little); // bx r1
+
+    const image = gba_loader.RomImage{ .bytes = &rom };
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_22EA, .isa = .thumb }, 0x0800_22F8, 0),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_2D68, .isa = .thumb }, 0x0800_2D72, 0),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_2DC4, .isa = .thumb }, 0x0800_2DD4, 0),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_96EC, .isa = .thumb }, 0x0800_971E, 0),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_91B2, .isa = .thumb }, 0x0800_91FA, 0),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_929C, .isa = .thumb }, 0x0800_9378, 1),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_92A8, .isa = .thumb }, 0x0800_9378, 1),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_92B8, .isa = .thumb }, 0x0800_9378, 1),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_92D6, .isa = .thumb }, 0x0800_9378, 1),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_9344, .isa = .thumb }, 0x0800_9378, 1),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_93BC, .isa = .thumb }, 0x0800_93C8, 1),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_9862, .isa = .thumb }, 0x0800_98A2, 1),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_9874, .isa = .thumb }, 0x0800_98A2, 1),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_9896, .isa = .thumb }, 0x0800_98A2, 1),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_9932, .isa = .thumb }, 0x0800_99A0, 0),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_99EC, .isa = .thumb }, 0x0800_99F8, 1),
+    );
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_22EC, .isa = .thumb }, 0x0800_22F8, 0),
+    );
+}
+
+test "kirby measured IRQ dispatcher bx r0 resolves VBlank handler target" {
+    const rom_len = 0x0CFE00;
+    var rom = try std.testing.allocator.alloc(u8, rom_len);
+    defer std.testing.allocator.free(rom);
+    @memset(rom, 0);
+
+    std.mem.writeInt(u32, rom[0x0730..][0..4], 0x0800_0108, .little);
+    std.mem.writeInt(u32, rom[0x0734..][0..4], 0x0300_1030, .little);
+    std.mem.writeInt(u32, rom[0x0738..][0..4], 0x0300_7FFC, .little);
+    std.mem.writeInt(u32, rom[0x01C8..][0..4], 0xE92D_4000, .little); // stmfd sp!, {lr}
+    std.mem.writeInt(u32, rom[0x01CC..][0..4], 0xE28F_E000, .little); // add lr, pc, #0
+    std.mem.writeInt(u32, rom[0x01D0..][0..4], 0xE12F_FF10, .little); // bx r0
+    std.mem.writeInt(u32, rom[0x0CFDE8..][0..4], 0x0800_1519, .little);
+    std.mem.writeInt(u32, rom[0x0CFDEC..][0..4], 0x0800_1519, .little);
+    std.mem.writeInt(u32, rom[0x0CFDF0..][0..4], 0x0800_10CD, .little);
+    std.mem.writeInt(u16, rom[0x10CC..][0..2], 0xB500, .little); // push {lr}
+
+    const image = gba_loader.RomImage{ .bytes = rom };
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bl = .{ .target = .{ .address = 0x0800_10CC, .isa = .thumb } } },
+        try resolveBxTarget(image, .{ .address = 0x0300_1030, .isa = .arm }, 0x0300_10F8, 0),
+    );
+
+    std.mem.writeInt(u32, rom[0x0738..][0..4], 0x0300_7FF8, .little);
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
+        try resolveBxTarget(image, .{ .address = 0x0300_1030, .isa = .arm }, 0x0300_10F8, 0),
+    );
+}
+
+test "thumb bx-pc arm branch veneer resolves to the arm branch target" {
+    var rom: [0x238]u8 = std.mem.zeroes([0x238]u8);
+    std.mem.writeInt(u16, rom[0x08..][0..2], 0x4778, .little); // bx pc
+    std.mem.writeInt(u16, rom[0x0A..][0..2], 0x46C0, .little); // nop
+    std.mem.writeInt(u32, rom[0x0C..][0..4], 0xEA00_0088, .little); // b 0x08000234
+    std.mem.writeInt(u32, rom[0x234..][0..4], 0xE12F_FF1E, .little); // bx lr
+
+    const image = gba_loader.RomImage{ .bytes = &rom };
+    const bl = armv4t_decode.DecodedInstruction{ .bl = .{
+        .target = .{ .address = 0x0800_0008, .isa = .thumb },
+    } };
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bl = .{ .target = .{ .address = 0x0800_0234, .isa = .arm } } },
+        try resolveDecodedInstruction(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0000, bl),
+    );
+
+    std.mem.writeInt(u16, rom[0x0A..][0..2], 0x0000, .little);
+    try std.testing.expectEqualDeep(
+        bl,
+        try resolveDecodedInstruction(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0000, bl),
+    );
+}
+
+test "kirby arm interworking trampoline keeps bx r1 dynamic" {
+    var rom: [0x258]u8 = std.mem.zeroes([0x258]u8);
+    std.mem.writeInt(u32, rom[0x24C..][0..4], 0xE3A0_2001, .little); // mov r2, #1
+    std.mem.writeInt(u32, rom[0x250..][0..4], 0xE181_1002, .little); // orr r1, r1, r2
+    std.mem.writeInt(u32, rom[0x254..][0..4], 0xE12F_FF11, .little); // bx r1
+
+    const image = gba_loader.RomImage{ .bytes = &rom };
+    const decoded = armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } };
+    try std.testing.expectEqualDeep(
+        decoded,
+        try resolveDecodedInstruction(image, .{ .address = 0x0800_0234, .isa = .arm }, 0x0800_0254, decoded),
+    );
+
+    try std.testing.expectEqualDeep(
+        decoded,
+        try resolveDecodedInstruction(image, .{ .address = 0x0800_0200, .isa = .arm }, 0x0800_0254, decoded),
+    );
+}
+
+test "kirby arm coroutine pop-r1 bx-r1 exits stay dynamic" {
+    var rom: [0x2A8]u8 = std.mem.zeroes([0x2A8]u8);
+    std.mem.writeInt(u32, rom[0x280..][0..4], 0xE8BD_0002, .little); // ldmfd sp!, {r1}
+    std.mem.writeInt(u32, rom[0x284..][0..4], 0xE12F_FF11, .little); // bx r1
+    std.mem.writeInt(u32, rom[0x2A0..][0..4], 0xE8BD_0002, .little); // ldmfd sp!, {r1}
+    std.mem.writeInt(u32, rom[0x2A4..][0..4], 0xE12F_FF11, .little); // bx r1
+
+    const image = gba_loader.RomImage{ .bytes = &rom };
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_0258, .isa = .arm }, 0x0800_0284, 1),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_0258, .isa = .arm }, 0x0800_02A4, 1),
+    );
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_0288, .isa = .arm }, 0x0800_02A4, 1),
+    );
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_0200, .isa = .arm }, 0x0800_0284, 1),
+    );
+}
+
+test "kirby arm bx-ip literal veneer resolves measured target" {
+    var rom: [0x0CFDE8]u8 = std.mem.zeroes([0x0CFDE8]u8);
+    std.mem.writeInt(u32, rom[0x0CFDDC..][0..4], 0xE59F_C000, .little); // ldr ip, [pc]
+    std.mem.writeInt(u32, rom[0x0CFDE0..][0..4], 0xE12F_FF1C, .little); // bx ip
+    std.mem.writeInt(u32, rom[0x0CFDE4..][0..4], 0x0800_5655, .little);
+    std.mem.writeInt(u16, rom[0x5654..][0..2], 0xB500, .little); // push {lr}
+
+    const image = gba_loader.RomImage{ .bytes = &rom };
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_target = .{ .address = 0x0800_5654, .isa = .thumb } },
+        try resolveBxTarget(image, .{ .address = 0x080C_FDDC, .isa = .arm }, 0x080C_FDE0, 12),
+    );
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 12 } },
+        try resolveBxTarget(image, .{ .address = 0x080C_FDD8, .isa = .arm }, 0x080C_FDE0, 12),
+    );
 }
 
 test "tonc sbb_reg exposes the measured devkitARM IWRAM data span" {
@@ -3938,6 +6835,238 @@ test "thumb saved-lr return epilogue resolves exact low-register multi-save shap
     try tmp.dir.writeFile(io, .{ .sub_path = "thumb-pop-bx-return-multi-save.gba", .data = &rom });
 
     const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-bx-return-multi-save.gba");
+    defer image.deinit(std.testing.allocator);
+
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0006, 0);
+    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
+}
+
+test "thumb mov-ip-lr bx-ip helper resolves as a saved-lr return" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var rom: [8]u8 = .{
+        0xF4, 0x46, // mov ip, lr
+        0x00, 0x20, // movs r0, #0
+        0x60, 0x47, // bx ip
+        0x00, 0x00,
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-mov-ip-lr-bx-ip-return.gba", .data = &rom });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-mov-ip-lr-bx-ip-return.gba");
+    defer image.deinit(std.testing.allocator);
+
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0004, 12);
+    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
+}
+
+test "thumb pop-r4-r5 pop-r0 bx-r0 table helper tail resolves as return" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var rom: [8]u8 = .{
+        0x00, 0x20, // movs r0, #0
+        0x30, 0xBC, // pop {r4, r5}
+        0x01, 0xBC, // pop {r0}
+        0x00, 0x47, // bx r0
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-pop-r4-r5-pop-r0-bx-r0-return.gba", .data = &rom });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-r4-r5-pop-r0-bx-r0-return.gba");
+    defer image.deinit(std.testing.allocator);
+
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0006, 0);
+    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
+}
+
+test "thumb pop-r4 pop-r0 bx-r0 table helper tail resolves as return" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var rom: [8]u8 = .{
+        0x00, 0x20, // movs r0, #0
+        0x10, 0xBC, // pop {r4}
+        0x01, 0xBC, // pop {r0}
+        0x00, 0x47, // bx r0
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-pop-r4-pop-r0-bx-r0-return.gba", .data = &rom });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-r4-pop-r0-bx-r0-return.gba");
+    defer image.deinit(std.testing.allocator);
+
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0006, 0);
+    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
+}
+
+test "thumb pop-r4-r5-r6 pop-r0 bx-r0 table helper tail resolves as return" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var rom: [8]u8 = .{
+        0x00, 0x20, // movs r0, #0
+        0x70, 0xBC, // pop {r4, r5, r6}
+        0x01, 0xBC, // pop {r0}
+        0x00, 0x47, // bx r0
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-pop-r4-r5-r6-pop-r0-bx-r0-return.gba", .data = &rom });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-r4-r5-r6-pop-r0-bx-r0-return.gba");
+    defer image.deinit(std.testing.allocator);
+
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0006, 0);
+    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
+}
+
+test "thumb pop-r4-r5-r6-r7 pop-r0 bx-r0 table helper tail resolves as return" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var rom: [8]u8 = .{
+        0x00, 0x20, // movs r0, #0
+        0xF0, 0xBC, // pop {r4, r5, r6, r7}
+        0x01, 0xBC, // pop {r0}
+        0x00, 0x47, // bx r0
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-pop-r4-r5-r6-r7-pop-r0-bx-r0-return.gba", .data = &rom });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-r4-r5-r6-r7-pop-r0-bx-r0-return.gba");
+    defer image.deinit(std.testing.allocator);
+
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0006, 0);
+    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
+}
+
+test "thumb pop-r4-r5-r6 pop-r1 bx-r1 table helper tail resolves as return" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var rom: [8]u8 = .{
+        0x00, 0x20, // movs r0, #0
+        0x70, 0xBC, // pop {r4, r5, r6}
+        0x02, 0xBC, // pop {r1}
+        0x08, 0x47, // bx r1
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-pop-r4-r5-r6-pop-r1-bx-r1-return.gba", .data = &rom });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-r4-r5-r6-pop-r1-bx-r1-return.gba");
+    defer image.deinit(std.testing.allocator);
+
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0006, 1);
+    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
+}
+
+test "thumb saved-r8 pop-r0 bx-r0 commercial tail resolves as return" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom_bytes = &.{
+        0xF0, 0xB5, // push {r4, r5, r6, r7, lr}
+        0x47, 0x46, // mov r7, r8
+        0x80, 0xB4, // push {r7}
+        0x82, 0xB0, // sub sp, #8
+        0x02, 0xB0, // add sp, #8
+        0x08, 0xBC, // pop {r3}
+        0x98, 0x46, // mov r8, r3
+        0xF0, 0xBC, // pop {r4, r5, r6, r7}
+        0x01, 0xBC, // pop {r0}
+        0x00, 0x47, // bx r0
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-saved-r8-pop-r0-bx-r0-return.gba", .data = rom_bytes });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-saved-r8-pop-r0-bx-r0-return.gba");
+    defer image.deinit(std.testing.allocator);
+
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0012, 0);
+    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
+}
+
+test "thumb shared-frame jump-table case pop-r0 bx-r0 tail resolves as return" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom_bytes = &.{
+        0x02, 0xB0, // add sp, #8
+        0x08, 0xBC, // pop {r3}
+        0x98, 0x46, // mov r8, r3
+        0xF0, 0xBC, // pop {r4, r5, r6, r7}
+        0x01, 0xBC, // pop {r0}
+        0x00, 0x47, // bx r0
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-shared-frame-pop-r0-bx-r0-return.gba", .data = rom_bytes });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-shared-frame-pop-r0-bx-r0-return.gba");
+    defer image.deinit(std.testing.allocator);
+
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_000A, 0);
+    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
+}
+
+test "thumb overlay high-register pop-r3 bx-r3 tail resolves as return" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom_bytes = &.{
+        0x07, 0xB0, // add sp, #28
+        0xFF, 0xBC, // pop {r0, r1, r2, r3, r4, r5, r6, r7}
+        0x80, 0x46, // mov r8, r0
+        0x89, 0x46, // mov r9, r1
+        0x92, 0x46, // mov sl, r2
+        0x9B, 0x46, // mov fp, r3
+        0x08, 0xBC, // pop {r3}
+        0x18, 0x47, // bx r3
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-overlay-high-regs-pop-r3-bx-r3-return.gba", .data = rom_bytes });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-overlay-high-regs-pop-r3-bx-r3-return.gba");
+    defer image.deinit(std.testing.allocator);
+
+    const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_000E, 3);
+    try std.testing.expectEqualDeep(armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} }, resolved);
+
+    const near_miss_bytes = &.{
+        0x06, 0xB0, // add sp, #24
+        0xFF, 0xBC, // pop {r0, r1, r2, r3, r4, r5, r6, r7}
+        0x80, 0x46, // mov r8, r0
+        0x89, 0x46, // mov r9, r1
+        0x92, 0x46, // mov sl, r2
+        0x9B, 0x46, // mov fp, r3
+        0x08, 0xBC, // pop {r3}
+        0x18, 0x47, // bx r3
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-overlay-high-regs-near-miss.gba", .data = near_miss_bytes });
+
+    const near_miss = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-overlay-high-regs-near-miss.gba");
+    defer near_miss.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 3 } },
+        try resolveBxTarget(near_miss, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_000E, 3),
+    );
+}
+
+test "thumb pop-r0 bx-r0 table helper tail resolves as return" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var rom: [8]u8 = .{
+        0x00, 0x21, // movs r1, #0
+        0x08, 0x64, // str r0, [r1, #64]
+        0x01, 0xBC, // pop {r0}
+        0x00, 0x47, // bx r0
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-pop-r0-bx-r0-return.gba", .data = &rom });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-r0-bx-r0-return.gba");
     defer image.deinit(std.testing.allocator);
 
     const resolved = try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0006, 0);
@@ -4150,7 +7279,10 @@ test "thumb saved-lr return epilogue rejects local tail near-misses" {
 
         const result = resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, case.bx_address, case.bx_reg);
         if (case.expect_error) {
-            try std.testing.expectError(error.UnsupportedOpcode, result);
+            try std.testing.expectEqualDeep(
+                armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = case.bx_reg } },
+                try result,
+            );
         } else {
             try std.testing.expectEqualDeep(
                 armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} },
@@ -4193,6 +7325,30 @@ test "thumb push-lr pop-r0 bx-r0 resolves the measured commercial return shape" 
     }
 }
 
+test "thumb push-lr pop-r1 bx-r1 resolves the measured commercial return shape" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom_bytes = &.{
+        0x00, 0xB5, // push {lr}
+        0x02, 0x1C, // adds r2, r0, #0
+        0x10, 0x1C, // adds r0, r2, #0
+        0x02, 0xBC, // pop {r1}
+        0x08, 0x47, // bx r1
+        0x00, 0x00,
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-push-lr-pop-r1-bx-r1-return.gba", .data = rom_bytes });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-push-lr-pop-r1-bx-r1-return.gba");
+    defer image.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .thumb_saved_lr_return = {} },
+        try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0008, 1),
+    );
+}
+
 test "thumb push-lr movs-r0-imm bx-r0 still resolves through the generic path" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -4205,7 +7361,7 @@ test "thumb push-lr movs-r0-imm bx-r0 still resolves through the generic path" {
     defer image.deinit(std.testing.allocator);
 
     try std.testing.expectEqualDeep(
-        armv4t_decode.DecodedInstruction{ .bx_target = .{ .address = 0, .isa = .arm } },
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
         try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0004, 0),
     );
 }
@@ -4221,9 +7377,9 @@ test "thumb push-lr pop-r4 pop-r0 bx-r0 rejects the local near-miss" {
     const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-pop-r4-pop-r0-bx-r0-near-miss.gba");
     defer image.deinit(std.testing.allocator);
 
-    try std.testing.expectError(
-        error.UnsupportedOpcode,
-        resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0006, 0),
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
+        try resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, 0x0800_0006, 0),
     );
 }
 
@@ -4262,14 +7418,161 @@ test "thumb push-lr pop-r0 bx-r0 resolver rejects near-miss shapes" {
 
         const result = resolveBxTarget(image, .{ .address = 0x0800_0000, .isa = .thumb }, case.bx_address, case.bx_reg);
         if (case.expect_error) {
-            try std.testing.expectError(error.UnsupportedOpcode, result);
+            try std.testing.expectEqualDeep(
+                armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = case.bx_reg } },
+                try result,
+            );
         } else {
             try std.testing.expectEqualDeep(
-                armv4t_decode.DecodedInstruction{ .bx_target = .{ .address = 0, .isa = .arm } },
+                armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = case.bx_reg } },
                 try result,
             );
         }
     }
+}
+
+test "unresolved bx register remains a dynamic dispatch instruction" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom_bytes = &.{
+        0x01, 0x68, // ldr r1, [r0]
+        0x08, 0x47, // bx r1
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-dynamic-bx-r1.gba", .data = rom_bytes });
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-dynamic-bx-r1.gba");
+    defer image.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        try resolveDecodedInstruction(
+            image,
+            .{ .address = 0x0800_0000, .isa = .thumb },
+            0x0800_0002,
+            .{ .bx_reg = .{ .reg = 1 } },
+        ),
+    );
+}
+
+test "function-entry bx register veneer remains a dynamic dispatch instruction" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom_bytes = &.{
+        0x08, 0x47, // bx r1
+        0xC0, 0x46, // nop
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-bx-r1-veneer.gba", .data = rom_bytes });
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-bx-r1-veneer.gba");
+    defer image.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 1 } },
+        try resolveDecodedInstruction(
+            image,
+            .{ .address = 0x0800_0000, .isa = .thumb },
+            0x0800_0000,
+            .{ .bx_reg = .{ .reg = 1 } },
+        ),
+    );
+}
+
+test "thumb mov-pc runtime-loaded register remains a dynamic dispatch instruction" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rom_bytes = &.{
+        0x00, 0x68, // ldr r0, [r0]
+        0x87, 0x46, // mov pc, r0
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "thumb-mov-pc-r0-dispatch.gba", .data = rom_bytes });
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "thumb-mov-pc-r0-dispatch.gba");
+    defer image.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
+        try resolveDecodedInstruction(
+            image,
+            .{ .address = 0x0800_0000, .isa = .thumb },
+            0x0800_0002,
+            .{ .mov_reg = .{ .rd = 15, .rm = 0 } },
+        ),
+    );
+}
+
+test "linked thumb pointer table enqueues sibling dynamic targets" {
+    var bytes: [0x50]u8 = std.mem.zeroes([0x50]u8);
+    const targets = [_]u32{
+        0x0800_0011,
+        0x0800_0021,
+        0x0800_0031,
+        0x0800_0041,
+    };
+    for (targets, 0..) |target, index| {
+        std.mem.writeInt(u32, bytes[index * 4 ..][0..4], target, .little);
+    }
+
+    const image = gba_loader.RomImage{ .bytes = &bytes };
+    const lifted = [_]llvm_codegen.Function{
+        .{
+            .entry = .{ .address = 0x0800_0010, .isa = .thumb },
+            .instructions = &.{},
+        },
+    };
+    var pending: std.ArrayList(armv4t_decode.CodeAddress) = .empty;
+    defer pending.deinit(std.testing.allocator);
+
+    try std.testing.expect(try enqueueLinkedThumbPointerTableTargets(
+        std.testing.allocator,
+        &pending,
+        image,
+        &lifted,
+    ));
+
+    try std.testing.expectEqual(@as(usize, 3), pending.items.len);
+    try std.testing.expect(containsCodeAddress(pending.items, .{ .address = 0x0800_0020, .isa = .thumb }));
+    try std.testing.expect(containsCodeAddress(pending.items, .{ .address = 0x0800_0030, .isa = .thumb }));
+    try std.testing.expect(containsCodeAddress(pending.items, .{ .address = 0x0800_0040, .isa = .thumb }));
+}
+
+test "thumb mov-pc jump table enqueues even thumb table targets" {
+    var bytes: [0x30]u8 = std.mem.zeroes([0x30]u8);
+    const halfwords = [_]u16{
+        0x2D01, // cmp r5, #1
+        0x00A8, // lsls r0, r5, #2
+        0x4902, // ldr r1, [pc, #8]
+        0x1840, // adds r0, r0, r1
+        0x6800, // ldr r0, [r0]
+        0x4687, // mov pc, r0
+    };
+    for (halfwords, 0..) |halfword, index| {
+        std.mem.writeInt(u16, bytes[index * 2 ..][0..2], halfword, .little);
+    }
+    std.mem.writeInt(u32, bytes[0x10..][0..4], 0x0800_0018, .little);
+    std.mem.writeInt(u32, bytes[0x18..][0..4], 0x0800_0020, .little);
+    std.mem.writeInt(u32, bytes[0x1C..][0..4], 0x0800_0024, .little);
+
+    const image = gba_loader.RomImage{ .bytes = &bytes };
+    var pending: std.ArrayList(armv4t_decode.CodeAddress) = .empty;
+    defer pending.deinit(std.testing.allocator);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expect(try enqueueMeasuredThumbMovPcJumpTableTargets(
+        std.testing.allocator,
+        &output.writer,
+        &pending,
+        image,
+        .thumb,
+        0x0800_000A,
+        0,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), pending.items.len);
+    try std.testing.expect(containsCodeAddress(pending.items, .{ .address = 0x0800_0020, .isa = .thumb }));
+    try std.testing.expect(containsCodeAddress(pending.items, .{ .address = 0x0800_0024, .isa = .thumb }));
 }
 
 test "tonc fixture frontiers reflect the exact local thumb blx r3 veneer slice" {
@@ -4309,7 +7612,8 @@ test "tonc fixture frontiers reflect the exact local thumb blx r3 veneer slice" 
         .{
             .rom_path = "tests/fixtures/real/tonc/irq_demo.gba",
             .old_blocker = "Unsupported opcode 0x00004708 at 0x080006C6 for armv4t",
-            .next_blocker = "Unsupported opcode 0x00004718 at 0x08003078 for armv4t",
+            .cleared_blocker = "Unsupported opcode 0x00004718 at 0x08003078 for armv4t",
+            .next_blocker = "Unsupported opcode 0x0000468F at 0x08002240 for armv4t",
             .still_blocked_here = false,
         },
     };
@@ -4431,7 +7735,7 @@ test "minimal vblank fixture turns the signal pixel green" {
     );
 }
 
-test "minimal vblank model rejects non-vblank IE bits" {
+test "minimal vblank model preserves non-vblank IE bits without firing them" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4463,10 +7767,12 @@ test "minimal vblank model rejects non-vblank IE bits" {
     defer std.testing.allocator.free(result.stdout);
     defer std.testing.allocator.free(result.stderr);
 
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Unsupported interrupt source mask 0x0002 at 0x04000200 for gba") != null);
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Unsupported interrupt source mask") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "retired=") != null);
 }
 
-test "minimal vblank model rejects IME re-enable inside a handler" {
+test "minimal vblank model allows IME restore inside a handler" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4498,7 +7804,8 @@ test "minimal vblank model rejects IME re-enable inside a handler" {
     defer std.testing.allocator.free(result.stdout);
     defer std.testing.allocator.free(result.stderr);
 
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Unsupported nested IME enable at 0x04000208 for gba") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Unsupported nested IME enable at 0x04000208 for gba") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "retired=") != null);
 }
 
 test "minimal vblank model rejects byte writes to interrupt MMIO" {
@@ -4699,6 +8006,34 @@ test "build reports a structured diagnostic for an unsupported opcode" {
         output.writer.buffered(),
         "Unsupported opcode 0xE7F001F0 at 0x08000000 for armv4t\n",
     );
+}
+
+test "lift treats SoftReset swi as terminal control flow" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var rom: [8]u8 = undefined;
+    std.mem.writeInt(u32, rom[0..4], 0xEF000000, .little); // swi 0x00 (SoftReset)
+    std.mem.writeInt(u32, rom[4..8], 0xE7F001F0, .little); // unsupported if decoded as fallthrough
+    try tmp.dir.writeFile(io, .{ .sub_path = "softreset-terminal.gba", .data = &rom });
+
+    const image = try gba_loader.loadFile(io, std.testing.allocator, tmp.dir, "gba", "softreset-terminal.gba");
+    defer image.deinit(std.testing.allocator);
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const program = try liftRomWithOptions(std.testing.allocator, &output.writer, image, .retired_count, 10);
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), program.functions.len);
+    try std.testing.expectEqual(@as(usize, 1), program.functions[0].instructions.len);
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .swi = .{ .imm24 = 0 } },
+        program.functions[0].instructions[0].instruction,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "Unsupported opcode") == null);
 }
 
 test "lifted real jsmolka ppu fixtures still default to memory_summary" {
@@ -5350,6 +8685,84 @@ test "build executes CpuFastSet copy semantics on a synthetic ROM" {
     try std.testing.expectEqualStrings("", result.stderr);
 }
 
+test "build executes LZ77UnCompVram literal semantics on a synthetic ROM" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeLz77UnCompVramLiteralRom(tmp.dir, io, "lz77-vram-literal.gba");
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "lz77-vram-literal.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "lz77-vram-literal-native",
+            .output_mode = .auto,
+            .optimize = .release,
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./lz77-vram-literal-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("65\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "build executes LZ77UnCompVram through halfword-visible VRAM writes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeLz77UnCompVramHalfwordRom(tmp.dir, io, "lz77-vram-halfword.gba");
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "lz77-vram-halfword.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "lz77-vram-halfword-native",
+            .output_mode = .auto,
+            .optimize = .release,
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./lz77-vram-halfword-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("13330\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
 test "build executes CpuFastSet fill semantics on a synthetic ROM" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -5504,24 +8917,91 @@ test "CpuFastSet rejects unsupported control bits structurally" {
     try std.testing.expectEqualStrings("", result.stderr);
 }
 
-test "CpuFastSet rejects unsupported non-multiple count structurally" {
+test "build treats CpuFastSet count as 32-bit words" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeCpuFastSetBadCountRom(tmp.dir, io, "cpufastset-bad-count.gba");
+    try writeCpuFastSetWordCountRom(tmp.dir, io, "cpufastset-word-count.gba");
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "cpufastset-word-count.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "cpufastset-word-count-native",
+            .output_mode = .auto,
+            .optimize = .release,
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./cpufastset-word-count-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("0\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "llvm emission treats CpuFastSet count as a word count" {
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const program = llvm_codegen.Program{
+        .entry = .{ .address = 0x08000000, .isa = .arm },
+        .rom_base_address = 0x08000000,
+        .rom_bytes = &.{},
+        .save_hardware = .none,
+        .functions = &.{
+            .{
+                .entry = .{ .address = 0x08000000, .isa = .arm },
+                .instructions = &.{
+                    .{ .address = 0x08000000, .condition = .al, .size_bytes = 4, .instruction = .{ .swi = .{ .imm24 = 0x00000C } } },
+                },
+            },
+        },
+        .output_mode = .register_r0_decimal,
+        .instruction_limit = null,
+    };
+    try llvm_codegen.emitModule(&output.writer, program);
+
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "%cpufastset_word_count = and i32 %cpufastset_control") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "%cpufastset_copy_done = icmp uge i32 %cpufastset_copy_next_index, %cpufastset_word_count") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "%cpufastset_word_count = shl i32 %cpufastset_count, 3") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "%cpufastset_count_remainder") == null);
+}
+
+test "build advances VCOUNT byte reads deterministically" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeVCountPollRom(tmp.dir, io, "vcount-poll.gba");
 
     const native_path = if (standalone_build_cmd_test)
-        try buildFixtureNativeViaCli(std.testing.allocator, io, &tmp, "cpufastset-bad-count.gba", "cpufastset-bad-count-native", .retired_count, 500_000)
+        try buildFixtureNativeViaCli(std.testing.allocator, io, &tmp, "vcount-poll.gba", "vcount-poll-native", .retired_count, 100)
     else
         try buildFixtureNative(
             std.testing.allocator,
             io,
             tmp.dir,
-            "cpufastset-bad-count.gba",
-            "cpufastset-bad-count-native",
+            "vcount-poll.gba",
+            "vcount-poll-native",
             .retired_count,
-            500_000,
+            100,
         );
     defer std.testing.allocator.free(native_path);
 
@@ -5531,15 +9011,13 @@ test "CpuFastSet rejects unsupported non-multiple count structurally" {
         tmp.dir,
         native_path,
         "retired_count",
-        500_000,
+        100,
     );
     defer std.testing.allocator.free(result.stdout);
     defer std.testing.allocator.free(result.stderr);
 
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Unsupported CpuFastSet count 0x00000007 for gba") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "retired=4\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "retired=500000\n") == null);
+    try std.testing.expectEqualStrings("retired=14\n", result.stdout);
     try std.testing.expectEqualStrings("", result.stderr);
 }
 
