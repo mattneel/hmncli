@@ -157,6 +157,31 @@ pub const shims: []const shim_mod.ShimDecl = &.{
         .id = .{
             .kind = .shim,
             .namespace = "gba",
+            .name = "CpuFastSet",
+        },
+        .state = .implemented,
+        .args = &.{
+            .{ .name = "source", .ty = .guest_ptr },
+            .{ .name = "dest", .ty = .guest_ptr },
+            .{ .name = "control", .ty = .u32 },
+        },
+        .returns = .i32,
+        .effects = .memory_write,
+        .tests = &.{},
+        .doc_refs = &.{
+            .{
+                .label = "GBATEK BIOS CpuFastSet",
+                .url = "https://problemkaputt.de/gbatek.htm#biosmemorycopy",
+            },
+        },
+        .notes = &.{
+            "Commercial BIOS fast memory-copy shim used by Kirby; word-only GBA subset with count multiple-of-8 enforcement.",
+        },
+    },
+    .{
+        .id = .{
+            .kind = .shim,
+            .namespace = "gba",
             .name = "VBlankIntrWait",
         },
         .state = .implemented,

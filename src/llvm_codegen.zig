@@ -105,6 +105,10 @@ const cpuset_word_bit: u32 = 1 << 26;
 const cpuset_count_mask: u32 = 0x001F_FFFF;
 const cpuset_supported_mask: u32 = cpuset_fill_bit | cpuset_word_bit | cpuset_count_mask;
 const cpuset_unsupported_mask: u32 = ~cpuset_supported_mask;
+const cpufastset_fill_bit: u32 = 1 << 24;
+const cpufastset_count_mask: u32 = 0x001F_FFFF;
+const cpufastset_supported_mask: u32 = cpufastset_fill_bit | cpufastset_count_mask;
+const cpufastset_unsupported_mask: u32 = ~cpufastset_supported_mask;
 
 const RegionOffsetKind = enum {
     linear,
@@ -245,6 +249,32 @@ fn emitGbaCpuSetBadControlHelper(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("}}\n\n", .{});
 }
 
+fn emitGbaCpuFastSetBadControlHelper(writer: *Io.Writer) Io.Writer.Error!void {
+    try writer.print("define void @hmn_cpufastset_fail_bad_control(ptr %state, i32 %control) {{\n", .{});
+    try writer.print("entry:\n", .{});
+    try writer.print(
+        "  %cpufastset_stop_flag_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+        .{guest_state_stop_flag_field},
+    );
+    try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_cpufastset_bad_control, i32 %control)\n", .{});
+    try writer.print("  store i1 true, ptr %cpufastset_stop_flag_ptr, align 1\n", .{});
+    try writer.print("  ret void\n", .{});
+    try writer.print("}}\n\n", .{});
+}
+
+fn emitGbaCpuFastSetBadCountHelper(writer: *Io.Writer) Io.Writer.Error!void {
+    try writer.print("define void @hmn_cpufastset_fail_bad_count(ptr %state, i32 %count) {{\n", .{});
+    try writer.print("entry:\n", .{});
+    try writer.print(
+        "  %cpufastset_count_stop_flag_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+        .{guest_state_stop_flag_field},
+    );
+    try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_cpufastset_bad_count, i32 %count)\n", .{});
+    try writer.print("  store i1 true, ptr %cpufastset_count_stop_flag_ptr, align 1\n", .{});
+    try writer.print("  ret void\n", .{});
+    try writer.print("}}\n\n", .{});
+}
+
 fn emitGbaCpuSetShim(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("define i32 @shim_gba_CpuSet(ptr %state) {{\n", .{});
     try writer.print("entry:\n", .{});
@@ -331,6 +361,69 @@ fn emitGbaCpuSetShim(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("}}\n\n", .{});
 }
 
+fn emitGbaCpuFastSetShim(writer: *Io.Writer) Io.Writer.Error!void {
+    try writer.print("define i32 @shim_gba_CpuFastSet(ptr %state) {{\n", .{});
+    try writer.print("entry:\n", .{});
+    try writer.print(
+        "  %cpufastset_regs_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+        .{guest_state_regs_field},
+    );
+    try writer.print("  %cpufastset_r0_ptr = getelementptr inbounds [16 x i32], ptr %cpufastset_regs_ptr, i32 0, i32 0\n", .{});
+    try writer.print("  %cpufastset_r1_ptr = getelementptr inbounds [16 x i32], ptr %cpufastset_regs_ptr, i32 0, i32 1\n", .{});
+    try writer.print("  %cpufastset_r2_ptr = getelementptr inbounds [16 x i32], ptr %cpufastset_regs_ptr, i32 0, i32 2\n", .{});
+    try writer.print("  %cpufastset_source = load i32, ptr %cpufastset_r0_ptr, align 4\n", .{});
+    try writer.print("  %cpufastset_dest = load i32, ptr %cpufastset_r1_ptr, align 4\n", .{});
+    try writer.print("  %cpufastset_control = load i32, ptr %cpufastset_r2_ptr, align 4\n", .{});
+    try writer.print("  %cpufastset_bad_bits = and i32 %cpufastset_control, {d}\n", .{cpufastset_unsupported_mask});
+    try writer.print("  %cpufastset_bad_control = icmp ne i32 %cpufastset_bad_bits, 0\n", .{});
+    try writer.print("  br i1 %cpufastset_bad_control, label %cpufastset_bad_control_path, label %cpufastset_decode\n", .{});
+    try writer.print("cpufastset_bad_control_path:\n", .{});
+    try writer.print("  call void @hmn_cpufastset_fail_bad_control(ptr %state, i32 %cpufastset_control)\n", .{});
+    try writer.print("  ret i32 0\n", .{});
+    try writer.print("cpufastset_decode:\n", .{});
+    try writer.print("  %cpufastset_count = and i32 %cpufastset_control, {d}\n", .{cpufastset_count_mask});
+    try writer.print("  %cpufastset_count_is_zero = icmp eq i32 %cpufastset_count, 0\n", .{});
+    try writer.print("  br i1 %cpufastset_count_is_zero, label %cpufastset_done, label %cpufastset_count_check\n", .{});
+    try writer.print("cpufastset_count_check:\n", .{});
+    try writer.print("  %cpufastset_count_remainder = and i32 %cpufastset_count, 7\n", .{});
+    try writer.print("  %cpufastset_bad_count = icmp ne i32 %cpufastset_count_remainder, 0\n", .{});
+    try writer.print("  br i1 %cpufastset_bad_count, label %cpufastset_bad_count_path, label %cpufastset_mode\n", .{});
+    try writer.print("cpufastset_bad_count_path:\n", .{});
+    try writer.print("  call void @hmn_cpufastset_fail_bad_count(ptr %state, i32 %cpufastset_count)\n", .{});
+    try writer.print("  ret i32 0\n", .{});
+    try writer.print("cpufastset_mode:\n", .{});
+    try writer.print("  %cpufastset_word_source = and i32 %cpufastset_source, -4\n", .{});
+    try writer.print("  %cpufastset_word_dest = and i32 %cpufastset_dest, -4\n", .{});
+    try writer.print("  %cpufastset_fill_bits = and i32 %cpufastset_control, {d}\n", .{cpufastset_fill_bit});
+    try writer.print("  %cpufastset_is_fill = icmp ne i32 %cpufastset_fill_bits, 0\n", .{});
+    try writer.print("  br i1 %cpufastset_is_fill, label %cpufastset_fill_init, label %cpufastset_copy_loop\n", .{});
+    try writer.print("cpufastset_fill_init:\n", .{});
+    try writer.print("  %cpufastset_fill_value = call i32 @hmn_load32(ptr %state, i32 %cpufastset_word_source)\n", .{});
+    try writer.print("  br label %cpufastset_fill_loop\n", .{});
+    try writer.print("cpufastset_fill_loop:\n", .{});
+    try writer.print("  %cpufastset_fill_index = phi i32 [ 0, %cpufastset_fill_init ], [ %cpufastset_fill_next_index, %cpufastset_fill_loop ]\n", .{});
+    try writer.print("  %cpufastset_fill_dest = phi i32 [ %cpufastset_word_dest, %cpufastset_fill_init ], [ %cpufastset_fill_next_dest, %cpufastset_fill_loop ]\n", .{});
+    try writer.print("  call void @hmn_store32(ptr %state, i32 %cpufastset_fill_dest, i32 %cpufastset_fill_value)\n", .{});
+    try writer.print("  %cpufastset_fill_next_index = add i32 %cpufastset_fill_index, 1\n", .{});
+    try writer.print("  %cpufastset_fill_next_dest = add i32 %cpufastset_fill_dest, 4\n", .{});
+    try writer.print("  %cpufastset_fill_done = icmp uge i32 %cpufastset_fill_next_index, %cpufastset_count\n", .{});
+    try writer.print("  br i1 %cpufastset_fill_done, label %cpufastset_done, label %cpufastset_fill_loop\n", .{});
+    try writer.print("cpufastset_copy_loop:\n", .{});
+    try writer.print("  %cpufastset_copy_index = phi i32 [ 0, %cpufastset_mode ], [ %cpufastset_copy_next_index, %cpufastset_copy_loop ]\n", .{});
+    try writer.print("  %cpufastset_copy_source = phi i32 [ %cpufastset_word_source, %cpufastset_mode ], [ %cpufastset_copy_next_source, %cpufastset_copy_loop ]\n", .{});
+    try writer.print("  %cpufastset_copy_dest = phi i32 [ %cpufastset_word_dest, %cpufastset_mode ], [ %cpufastset_copy_next_dest, %cpufastset_copy_loop ]\n", .{});
+    try writer.print("  %cpufastset_copy_value = call i32 @hmn_load32(ptr %state, i32 %cpufastset_copy_source)\n", .{});
+    try writer.print("  call void @hmn_store32(ptr %state, i32 %cpufastset_copy_dest, i32 %cpufastset_copy_value)\n", .{});
+    try writer.print("  %cpufastset_copy_next_index = add i32 %cpufastset_copy_index, 1\n", .{});
+    try writer.print("  %cpufastset_copy_next_source = add i32 %cpufastset_copy_source, 4\n", .{});
+    try writer.print("  %cpufastset_copy_next_dest = add i32 %cpufastset_copy_dest, 4\n", .{});
+    try writer.print("  %cpufastset_copy_done = icmp uge i32 %cpufastset_copy_next_index, %cpufastset_count\n", .{});
+    try writer.print("  br i1 %cpufastset_copy_done, label %cpufastset_done, label %cpufastset_copy_loop\n", .{});
+    try writer.print("cpufastset_done:\n", .{});
+    try writer.print("  ret i32 0\n", .{});
+    try writer.print("}}\n\n", .{});
+}
+
 pub fn emitModule(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
     try emitPrelude(writer);
     try emitPsrHelpers(writer);
@@ -369,6 +462,8 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("@.fmt_irq_multi_if = private unnamed_addr constant [58 x i8] c\"Unsupported pending IF mask 0x%04x at 0x04000202 for gba\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_irq_byte_store = private unnamed_addr constant [57 x i8] c\"Unsupported byte interrupt MMIO store at 0x%08x for gba\\0A\\00\", align 1\n", .{});
     try writer.print("@.fmt_cpuset_bad_control = private unnamed_addr constant [43 x i8] c\"Unsupported CpuSet control 0x%08x for gba\\0A\\00\", align 1\n", .{});
+    try writer.print("@.fmt_cpufastset_bad_control = private unnamed_addr constant [47 x i8] c\"Unsupported CpuFastSet control 0x%08x for gba\\0A\\00\", align 1\n", .{});
+    try writer.print("@.fmt_cpufastset_bad_count = private unnamed_addr constant [45 x i8] c\"Unsupported CpuFastSet count 0x%08x for gba\\0A\\00\", align 1\n", .{});
     try writer.print("declare i32 @printf(ptr, ...)\n", .{});
     try writer.print("declare i32 @hmgba_dump_frame_raw(ptr, ptr, ptr, ptr)\n", .{});
     try writer.print("declare i16 @hmgba_sample_keyinput_for_frame(i64)\n", .{});
@@ -436,6 +531,9 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("}}\n\n", .{});
     try emitGbaCpuSetBadControlHelper(writer);
     try emitGbaCpuSetShim(writer);
+    try emitGbaCpuFastSetBadControlHelper(writer);
+    try emitGbaCpuFastSetBadCountHelper(writer);
+    try emitGbaCpuFastSetShim(writer);
     try writer.print("define i64 @hmn_gba_advance_frame(ptr %state) {{\n", .{});
     try writer.print("entry:\n", .{});
     try writer.print(
@@ -3249,6 +3347,7 @@ fn emitInstructionBody(writer: *Io.Writer, function: Function, node: Instruction
                 0x000006, 0x060000 => "Div",
                 0x000008, 0x080000 => "Sqrt",
                 0x00000B, 0x0B0000 => "CpuSet",
+                0x00000C, 0x0C0000 => "CpuFastSet",
                 else => unreachable,
             };
             try writer.print("  call i32 @shim_gba_{s}(ptr %state)\n", .{shim_name});

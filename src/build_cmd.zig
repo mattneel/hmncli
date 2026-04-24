@@ -2261,12 +2261,17 @@ fn isCpuSetSwi(imm24: u24) bool {
     return imm24 == 0x00000B or imm24 == 0x0B0000;
 }
 
+fn isCpuFastSetSwi(imm24: u24) bool {
+    return imm24 == 0x00000C or imm24 == 0x0C0000;
+}
+
 fn swiShimName(imm24: u24) ?[]const u8 {
     if (imm24 == 0x000000) return "SoftReset";
     if (isVBlankIntrWaitSwi(imm24)) return "VBlankIntrWait";
     if (isDivSwi(imm24)) return "Div";
     if (isSqrtSwi(imm24)) return "Sqrt";
     if (isCpuSetSwi(imm24)) return "CpuSet";
+    if (isCpuFastSetSwi(imm24)) return "CpuFastSet";
     return null;
 }
 
