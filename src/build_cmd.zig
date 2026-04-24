@@ -8395,9 +8395,10 @@ test "build emits window llvm hooks when requested" {
     );
     defer std.testing.allocator.free(llvm_bytes);
 
-    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "@hmgba_run_sdl3_window") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "@hmgba_sdl3_present_frame") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "@hmgba_sdl3_shutdown") != null);
     try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "@hm_runtime_max_instructions") != null);
-    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "call i32 @hmgba_run_sdl3_window") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "call i32 @hmgba_sdl3_present_frame") != null);
 }
 
 test "build keeps frame_raw runtime helper artifacts under .zig-cache" {

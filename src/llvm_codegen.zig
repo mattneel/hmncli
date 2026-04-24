@@ -85,6 +85,7 @@ const guest_state_vcount_field = 26;
 const guest_state_irq_regs_field = 27;
 const guest_state_nonlocal_pending_field = 28;
 const guest_state_nonlocal_target_field = 29;
+const guest_state_entry_target_field = 30;
 
 const io_dispstat_offset = 4;
 const io_vcount_address = 0x0400_0006;
@@ -604,7 +605,7 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("%Registers = type [16 x i32]\n", .{});
     try writer.print("%BankedFiqRegisters = type [7 x i32]\n", .{});
     try writer.print("%BankedIrqRegisters = type [2 x i32]\n", .{});
-    try writer.print("%GuestState = type {{ %Registers, i1, i1, i1, i1, i32, [262144 x i8], [32768 x i8], [1024 x i8], [1024 x i8], [98304 x i8], [1024 x i8], i1, i32, i32, %BankedFiqRegisters, [131072 x i8], i32, i32, i32, i64, i1, i64, i64, i64, i1, i32, %BankedIrqRegisters, i1, i32 }}\n", .{});
+    try writer.print("%GuestState = type {{ %Registers, i1, i1, i1, i1, i32, [262144 x i8], [32768 x i8], [1024 x i8], [1024 x i8], [98304 x i8], [1024 x i8], i1, i32, i32, %BankedFiqRegisters, [131072 x i8], i32, i32, i32, i64, i1, i64, i64, i64, i1, i32, %BankedIrqRegisters, i1, i32, i32 }}\n", .{});
     try writer.print("@.fmt_r0 = private unnamed_addr constant [4 x i8] c\"%d\\0A\\00\", align 1\n", .{});
     try writer.print(
         "@.fmt_mem = private unnamed_addr constant [79 x i8] c\"IO0=%08X IO8=%08X PAL0=%08X PAL2=%08X VRAM4000=%08X MAP0800=%08X MAP0804=%08X\\0A\\00\", align 1\n",
@@ -634,7 +635,8 @@ fn emitPrelude(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("@.fmt_multiboot_stub = private unnamed_addr constant [41 x i8] c\"Unsupported BIOS shim MultiBoot for gba\\0A\\00\", align 1\n", .{});
     try writer.print("declare i32 @printf(ptr, ...)\n", .{});
     try writer.print("declare i32 @hmgba_dump_frame_raw(ptr, ptr, ptr, ptr)\n", .{});
-    try writer.print("declare i32 @hmgba_run_sdl3_window(ptr, ptr, ptr, ptr)\n", .{});
+    try writer.print("declare i32 @hmgba_sdl3_present_frame(ptr, ptr, ptr, ptr)\n", .{});
+    try writer.print("declare void @hmgba_sdl3_shutdown()\n", .{});
     try writer.print("declare i16 @hmgba_sample_keyinput_for_frame(i64)\n", .{});
     try writer.print("declare i64 @hm_runtime_max_instructions(i64)\n", .{});
     try writer.print("declare i32 @hm_runtime_output_mode_frame_raw()\n", .{});
@@ -2144,13 +2146,13 @@ fn emitGuestFunction(writer: *Io.Writer, function: Function) Io.Writer.Error!voi
 fn emitGuestFunctionEntryDispatch(writer: *Io.Writer, function: Function) Io.Writer.Error!void {
     try writer.print(
         "  %entry_target_ptr_{x:0>8} = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
-        .{ function.entry.address, guest_state_nonlocal_target_field },
+        .{ function.entry.address, guest_state_entry_target_field },
     );
     try writer.print("  %entry_target_{x:0>8} = load i32, ptr %entry_target_ptr_{x:0>8}, align 4\n", .{ function.entry.address, function.entry.address });
     try writer.print("  store i32 0, ptr %entry_target_ptr_{x:0>8}, align 4\n", .{function.entry.address});
     try writer.print("  switch i32 %entry_target_{x:0>8}, label %entry_default_{x:0>8} [\n", .{ function.entry.address, function.entry.address });
     for (function.instructions, 0..) |node, index| {
-        if (!isInternalDispatchTarget(function, index)) continue;
+        if (!isFunctionEntryDispatchTarget(function, index)) continue;
         try writer.print("    i32 {d}, label %pc_{x:0>8}\n", .{ node.address, node.address });
     }
     try writer.print("  ]\n", .{});
@@ -2216,6 +2218,11 @@ fn emitGuestCallDispatcherBody(
             instructionSetName(function.entry.isa),
             function.entry.address,
         });
+        try writer.print(
+            "  %dispatch_entry_target_ptr_{x:0>8} = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+            .{ function.entry.address, guest_state_entry_target_field },
+        );
+        try writer.print("  store i32 0, ptr %dispatch_entry_target_ptr_{x:0>8}, align 4\n", .{function.entry.address});
         try writer.print("  call void @guest_{s}_{x:0>8}(ptr %state)\n", .{
             instructionSetName(function.entry.isa),
             function.entry.address,
@@ -2232,7 +2239,7 @@ fn emitGuestCallDispatcherBody(
             });
             try writer.print(
                 "  %dispatch_entry_target_ptr_{x:0>8} = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
-                .{ node.address, guest_state_nonlocal_target_field },
+                .{ node.address, guest_state_entry_target_field },
             );
             try writer.print("  store i32 {d}, ptr %dispatch_entry_target_ptr_{x:0>8}, align 4\n", .{ node.address, node.address });
             try writer.print("  call void @guest_{s}_{x:0>8}(ptr %state)\n", .{
@@ -2282,6 +2289,10 @@ fn functionOwnsInternalDispatchTarget(
 fn isInternalDispatchTarget(function: Function, index: usize) bool {
     if (function.instructions[index].address == function.entry.address) return false;
     return retiredBlockInfo(function, index).is_leader;
+}
+
+fn isFunctionEntryDispatchTarget(function: Function, index: usize) bool {
+    return function.instructions[index].address != function.entry.address;
 }
 
 fn programHasFunctionEntry(functions: []const Function, entry: armv4t_decode.CodeAddress) bool {
@@ -2415,6 +2426,10 @@ fn emitMain(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
         "  %state_nonlocal_target_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
         .{guest_state_nonlocal_target_field},
     );
+    try writer.print(
+        "  %state_entry_target_ptr = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+        .{guest_state_entry_target_field},
+    );
     try writer.print("  %state_sp_ptr = getelementptr inbounds [16 x i32], ptr %state_regs_ptr, i32 0, i32 13\n", .{});
     try writer.print("  call void @llvm.memset.p0.i64(ptr align 4 %state_regs_ptr, i8 0, i64 64, i1 false)\n", .{});
     try writer.print("  store i1 false, ptr %state_flag_n_ptr, align 1\n", .{});
@@ -2451,6 +2466,7 @@ fn emitMain(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
     try writer.print("  store i32 0, ptr %state_vcount_ptr, align 4\n", .{});
     try writer.print("  store i1 false, ptr %state_nonlocal_pending_ptr, align 1\n", .{});
     try writer.print("  store i32 0, ptr %state_nonlocal_target_ptr, align 4\n", .{});
+    try writer.print("  store i32 0, ptr %state_entry_target_ptr, align 4\n", .{});
     try writer.print("  %initial_keyinput = call i16 @hmgba_sample_keyinput_for_frame(i64 0)\n", .{});
     try writer.print(
         "  %state_keyinput_ptr = getelementptr inbounds [1024 x i8], ptr %state_io_ptr, i32 0, i32 {d}\n",
@@ -2462,6 +2478,11 @@ fn emitMain(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
         instructionSetName(program.entry.isa),
         program.entry.address,
     });
+    if (program.output_mode == .window) {
+        try emitWindowMainLoop(writer, program);
+        try writer.print("}}\n", .{});
+        return;
+    }
     try writer.print("  br label %nonlocal_dispatch_check\n", .{});
     try writer.print("nonlocal_dispatch_check:\n", .{});
     try writer.print("  %nonlocal_stop = load i1, ptr %state_stop_flag_ptr, align 1\n", .{});
@@ -2484,6 +2505,82 @@ fn emitMain(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
     try emitFinalOutput(writer, program.output_mode);
     try writer.print("  ret i32 0\n", .{});
     try writer.print("}}\n", .{});
+}
+
+fn emitWindowMainLoop(writer: *Io.Writer, program: Program) Io.Writer.Error!void {
+    try writer.print("  br label %window_dispatch_drain_check\n", .{});
+    try writer.print("window_dispatch_drain_check:\n", .{});
+    try writer.print("  %window_drain_pending = load i1, ptr %state_nonlocal_pending_ptr, align 1\n", .{});
+    try writer.print("  %window_drain_stop = load i1, ptr %state_stop_flag_ptr, align 1\n", .{});
+    try writer.print("  %window_drain_not_stop = xor i1 %window_drain_stop, true\n", .{});
+    try writer.print("  %window_drain_should_dispatch = and i1 %window_drain_pending, %window_drain_not_stop\n", .{});
+    try writer.print("  br i1 %window_drain_should_dispatch, label %window_drain_dispatch, label %window_present\n", .{});
+    try writer.print("window_drain_dispatch:\n", .{});
+    try writer.print("  %window_drain_target = load i32, ptr %state_nonlocal_target_ptr, align 4\n", .{});
+    try writer.print("  store i1 false, ptr %state_nonlocal_pending_ptr, align 1\n", .{});
+    try writer.print("  call void @hmn_call_guest_checked(ptr %state, i32 %window_drain_target)\n", .{});
+    try writer.print("  br label %window_dispatch_drain_check\n", .{});
+
+    try writer.print("window_present:\n", .{});
+    try writer.print(
+        "  %window_present_result = call i32 @hmgba_sdl3_present_frame(ptr %state_io_ptr, ptr %state_palette_ptr, ptr %state_vram_ptr, ptr %state_oam_ptr)\n",
+        .{},
+    );
+    try writer.print("  %window_present_ok = icmp eq i32 %window_present_result, 0\n", .{});
+    try writer.print("  br i1 %window_present_ok, label %window_after_present, label %window_present_nonzero\n", .{});
+    try writer.print("window_present_nonzero:\n", .{});
+    try writer.print("  %window_present_quit = icmp eq i32 %window_present_result, 10\n", .{});
+    try writer.print("  br i1 %window_present_quit, label %window_shutdown, label %window_output_error\n", .{});
+    try writer.print("window_after_present:\n", .{});
+    try writer.print("  %window_resume_pending = load i1, ptr %state_nonlocal_pending_ptr, align 1\n", .{});
+    try writer.print("  br i1 %window_resume_pending, label %window_resume_guest, label %window_present\n", .{});
+    try writer.print("window_resume_guest:\n", .{});
+    try writer.print("  store i1 false, ptr %state_stop_flag_ptr, align 1\n", .{});
+    try writer.print("  %window_frame_budget = call i64 @hm_runtime_max_instructions(i64 {d})\n", .{program.instruction_limit orelse gba_frame_instruction_interval});
+    try writer.print("  store i64 %window_frame_budget, ptr %state_instruction_budget_ptr, align 8\n", .{});
+    try writer.print("  %window_resume_target = load i32, ptr %state_nonlocal_target_ptr, align 4\n", .{});
+    try writer.print("  store i1 false, ptr %state_nonlocal_pending_ptr, align 1\n", .{});
+    try writer.print("  call void @hmn_call_guest_checked(ptr %state, i32 %window_resume_target)\n", .{});
+    try writer.print("  br label %window_dispatch_drain_check\n", .{});
+
+    try writer.print("window_output_error:\n", .{});
+    try writer.print("  switch i32 %window_present_result, label %window_shutdown [\n", .{});
+    try writer.print("    i32 2, label %window_output_bad_mode\n", .{});
+    try writer.print("    i32 4, label %window_output_missing_sdl\n", .{});
+    try writer.print("    i32 5, label %window_output_init_failed\n", .{});
+    try writer.print("    i32 6, label %window_output_create_failed\n", .{});
+    try writer.print("    i32 7, label %window_output_renderer_failed\n", .{});
+    try writer.print("    i32 8, label %window_output_texture_failed\n", .{});
+    try writer.print("    i32 9, label %window_output_render_failed\n", .{});
+    try writer.print("  ]\n", .{});
+    try emitWindowErrorPrintBlocks(writer);
+}
+
+fn emitWindowErrorPrintBlocks(writer: *Io.Writer) Io.Writer.Error!void {
+    try writer.print("window_output_bad_mode:\n", .{});
+    try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_window_bad_mode)\n", .{});
+    try writer.print("  br label %window_shutdown\n", .{});
+    try writer.print("window_output_missing_sdl:\n", .{});
+    try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_window_missing_sdl)\n", .{});
+    try writer.print("  br label %window_shutdown\n", .{});
+    try writer.print("window_output_init_failed:\n", .{});
+    try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_window_init_failed)\n", .{});
+    try writer.print("  br label %window_shutdown\n", .{});
+    try writer.print("window_output_create_failed:\n", .{});
+    try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_window_create_failed)\n", .{});
+    try writer.print("  br label %window_shutdown\n", .{});
+    try writer.print("window_output_renderer_failed:\n", .{});
+    try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_window_renderer_failed)\n", .{});
+    try writer.print("  br label %window_shutdown\n", .{});
+    try writer.print("window_output_texture_failed:\n", .{});
+    try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_window_texture_failed)\n", .{});
+    try writer.print("  br label %window_shutdown\n", .{});
+    try writer.print("window_output_render_failed:\n", .{});
+    try writer.print("  call i32 (ptr, ...) @printf(ptr @.fmt_window_render_failed)\n", .{});
+    try writer.print("  br label %window_shutdown\n", .{});
+    try writer.print("window_shutdown:\n", .{});
+    try writer.print("  call void @hmgba_sdl3_shutdown()\n", .{});
+    try writer.print("  ret i32 0\n", .{});
 }
 
 fn emitInstructionBlock(
@@ -2740,6 +2837,30 @@ fn emitInstructionAccountingPath(
     try writer.print("{s}_budget_stop_{x:0>8}:\n", .{ label_prefix, address });
     try writer.print(
         "  store i1 true, ptr %{s}_stop_flag_ptr_{x:0>8}, align 1\n",
+        .{ label_prefix, address },
+    );
+    try writer.print(
+        "  %{s}_resume_target_ptr_{x:0>8} = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+        .{ label_prefix, address, guest_state_nonlocal_target_field },
+    );
+    try writer.print(
+        "  store i32 {d}, ptr %{s}_resume_target_ptr_{x:0>8}, align 4\n",
+        .{ function_entry.address | if (function_entry.isa == .thumb) @as(u32, 1) else @as(u32, 0), label_prefix, address },
+    );
+    try writer.print(
+        "  %{s}_resume_entry_target_ptr_{x:0>8} = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+        .{ label_prefix, address, guest_state_entry_target_field },
+    );
+    try writer.print(
+        "  store i32 {d}, ptr %{s}_resume_entry_target_ptr_{x:0>8}, align 4\n",
+        .{ address, label_prefix, address },
+    );
+    try writer.print(
+        "  %{s}_resume_pending_ptr_{x:0>8} = getelementptr inbounds %GuestState, ptr %state, i32 0, i32 {d}\n",
+        .{ label_prefix, address, guest_state_nonlocal_pending_field },
+    );
+    try writer.print(
+        "  store i1 true, ptr %{s}_resume_pending_ptr_{x:0>8}, align 1\n",
         .{ label_prefix, address },
     );
     try writer.print("  br label %guest_return_{s}_{x:0>8}\n", .{
@@ -6225,7 +6346,7 @@ test "llvm emission dispatches unresolved bx register targets" {
     defer output.deinit();
 
     const program = Program{
-        .entry = .{ .address = 0x08000000, .isa = .thumb },
+        .entry = .{ .address = 0x08000000, .isa = .arm },
         .rom_base_address = 0x08000000,
         .rom_bytes = &.{},
         .save_hardware = .none,
@@ -6437,6 +6558,39 @@ test "llvm guest dispatcher enters containing function at internal guest targets
     try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "i32 134257264, label %pc_08009a70") != null);
 }
 
+test "llvm budget stops resume non-leader instructions through owning function entry" {
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const program = Program{
+        .entry = .{ .address = 0x08000000, .isa = .arm },
+        .rom_base_address = 0x08000000,
+        .rom_bytes = &.{},
+        .save_hardware = .none,
+        .functions = &.{
+            .{
+                .entry = .{ .address = 0x08000000, .isa = .arm },
+                .instructions = &.{
+                    .{ .address = 0x08000000, .condition = .al, .size_bytes = 4, .instruction = .{ .add_imm = .{ .rd = 0, .rn = 0, .imm = 1 } } },
+                    .{ .address = 0x08000004, .condition = .al, .size_bytes = 4, .instruction = .{ .add_imm = .{ .rd = 1, .rn = 1, .imm = 1 } } },
+                    .{ .address = 0x08000008, .condition = .al, .size_bytes = 4, .instruction = .{ .branch = .{ .cond = .al, .target = 0x08000000 } } },
+                },
+            },
+        },
+        .output_mode = .window,
+        .instruction_limit = 1,
+    };
+    try emitModule(&output.writer, program);
+
+    const llvm_bytes = output.writer.buffered();
+    const budget_stop = std.mem.indexOf(u8, llvm_bytes, "retired_block_regular_budget_stop_08000004:") orelse return error.TestExpectedEqual;
+    const dispatch_target = std.mem.indexOfPos(u8, llvm_bytes, budget_stop, "store i32 134217728, ptr %retired_block_regular_resume_target_ptr_08000004, align 4") orelse return error.TestExpectedEqual;
+    const entry_target = std.mem.indexOfPos(u8, llvm_bytes, budget_stop, "store i32 134217732, ptr %retired_block_regular_resume_entry_target_ptr_08000004, align 4") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "i32 134217732, label %pc_08000004") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "i32 134217732, label %dispatch_arm_08000000_from_08000004") == null);
+    try std.testing.expect(dispatch_target < entry_target);
+}
+
 test "llvm frame_raw output performs a final vblank dispatch before dumping" {
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
@@ -6467,7 +6621,40 @@ test "llvm frame_raw output performs a final vblank dispatch before dumping" {
     try std.testing.expect(dispatch_index < dump_index);
 }
 
-test "llvm window output performs a final vblank dispatch before presenting" {
+test "llvm budget stops preserve the current guest target for later resumption" {
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const program = Program{
+        .entry = .{ .address = 0x08000000, .isa = .thumb },
+        .rom_base_address = 0x08000000,
+        .rom_bytes = &.{},
+        .save_hardware = .none,
+        .functions = &.{
+            .{
+                .entry = .{ .address = 0x08000000, .isa = .arm },
+                .instructions = &.{
+                    .{ .address = 0x08000000, .condition = .al, .size_bytes = 4, .instruction = .{ .add_imm = .{ .rd = 0, .rn = 0, .imm = 1 } } },
+                    .{ .address = 0x08000004, .condition = .al, .size_bytes = 4, .instruction = .{ .branch = .{ .cond = .al, .target = 0x08000000 } } },
+                },
+            },
+        },
+        .output_mode = .window,
+        .instruction_limit = 1,
+    };
+    try emitModule(&output.writer, program);
+
+    const llvm_bytes = output.writer.buffered();
+    const budget_stop = std.mem.indexOf(u8, llvm_bytes, "retired_block_regular_budget_stop_08000000:") orelse return error.TestExpectedEqual;
+    const target_ptr = std.mem.indexOfPos(u8, llvm_bytes, budget_stop, "%retired_block_regular_resume_target_ptr_08000000 = getelementptr inbounds %GuestState") orelse return error.TestExpectedEqual;
+    const target_store = std.mem.indexOfPos(u8, llvm_bytes, budget_stop, "store i32 134217728, ptr %retired_block_regular_resume_target_ptr_08000000, align 4") orelse return error.TestExpectedEqual;
+    const pending_store = std.mem.indexOfPos(u8, llvm_bytes, budget_stop, "store i1 true, ptr %retired_block_regular_resume_pending_ptr_08000000, align 1") orelse return error.TestExpectedEqual;
+    try std.testing.expect(budget_stop < target_ptr);
+    try std.testing.expect(target_ptr < target_store);
+    try std.testing.expect(target_store < pending_store);
+}
+
+test "llvm window output emits a present and resume loop" {
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
 
@@ -6490,9 +6677,13 @@ test "llvm window output performs a final vblank dispatch before presenting" {
     try emitModule(&output.writer, program);
 
     const llvm_bytes = output.writer.buffered();
-    const frame_index = std.mem.indexOf(u8, llvm_bytes, "%final_frame_index = call i64 @hmn_gba_advance_frame(ptr %state)") orelse return error.TestExpectedEqual;
-    const dispatch_index = std.mem.lastIndexOf(u8, llvm_bytes, "call void @hmn_dispatch_vblank_irq(ptr %state)") orelse return error.TestExpectedEqual;
-    const window_index = std.mem.indexOf(u8, llvm_bytes, "call i32 @hmgba_run_sdl3_window") orelse return error.TestExpectedEqual;
-    try std.testing.expect(frame_index < dispatch_index);
-    try std.testing.expect(dispatch_index < window_index);
+    const first_call = std.mem.indexOf(u8, llvm_bytes, "call void @guest_arm_08000000(ptr %state)") orelse return error.TestExpectedEqual;
+    const present_index = std.mem.indexOf(u8, llvm_bytes, "call i32 @hmgba_sdl3_present_frame") orelse return error.TestExpectedEqual;
+    const reset_stop_index = std.mem.indexOfPos(u8, llvm_bytes, present_index, "store i1 false, ptr %state_stop_flag_ptr, align 1") orelse return error.TestExpectedEqual;
+    const resume_index = std.mem.indexOf(u8, llvm_bytes, "call void @hmn_call_guest_checked(ptr %state, i32 %window_resume_target)") orelse return error.TestExpectedEqual;
+    try std.testing.expect(first_call < present_index);
+    try std.testing.expect(present_index < reset_stop_index);
+    try std.testing.expect(reset_stop_index < resume_index);
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "call void @hmgba_sdl3_shutdown()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, llvm_bytes, "call i32 @hmgba_run_sdl3_window") == null);
 }

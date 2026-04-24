@@ -25,6 +25,7 @@ pub const dump_error_sdl3_window_failed: c_int = 6;
 pub const dump_error_sdl3_renderer_failed: c_int = 7;
 pub const dump_error_sdl3_texture_failed: c_int = 8;
 pub const dump_error_sdl3_render_failed: c_int = 9;
+pub const dump_window_quit: c_int = 10;
 
 const rtld_now: c_int = 2;
 const sdl_init_video: u32 = 0x0000_0020;
@@ -651,6 +652,13 @@ const SdlApi = struct {
     }
 };
 
+var window_sdl: ?SdlApi = null;
+var window_sdl_initialized = false;
+var window_handle: ?*SdlWindow = null;
+var window_renderer: ?*SdlRenderer = null;
+var window_texture: ?*SdlTexture = null;
+var window_frames_presented: u64 = 0;
+
 fn closeAndFail(library: *anyopaque) ?SdlApi {
     _ = dlclose(library);
     return null;
@@ -701,7 +709,52 @@ pub export fn hmgba_dump_frame_raw(
     return dump_ok;
 }
 
-pub export fn hmgba_run_sdl3_window(
+fn ensureSdl3Window() c_int {
+    if (window_texture != null) return dump_ok;
+
+    if (window_sdl == null) {
+        window_sdl = SdlApi.load() orelse return dump_error_sdl3_missing;
+    }
+    const sdl = window_sdl.?;
+
+    if (!window_sdl_initialized) {
+        if (!sdl.init(sdl_init_video)) {
+            hmgba_sdl3_shutdown();
+            return dump_error_sdl3_init_failed;
+        }
+        window_sdl_initialized = true;
+    }
+
+    window_handle = sdl.create_window(
+        "Homonculi GBA",
+        frame_width * 3,
+        frame_height * 3,
+        sdl_window_resizable | sdl_window_high_pixel_density,
+    ) orelse {
+        hmgba_sdl3_shutdown();
+        return dump_error_sdl3_window_failed;
+    };
+
+    window_renderer = sdl.create_renderer(window_handle, null) orelse {
+        hmgba_sdl3_shutdown();
+        return dump_error_sdl3_renderer_failed;
+    };
+
+    window_texture = sdl.create_texture(
+        window_renderer,
+        sdl_pixelformat_rgba32,
+        sdl_textureaccess_streaming,
+        frame_width,
+        frame_height,
+    ) orelse {
+        hmgba_sdl3_shutdown();
+        return dump_error_sdl3_texture_failed;
+    };
+
+    return dump_ok;
+}
+
+pub export fn hmgba_sdl3_present_frame(
     io: [*]const u8,
     palette: [*]const u8,
     vram: [*]const u8,
@@ -714,59 +767,63 @@ pub export fn hmgba_run_sdl3_window(
     var rgba: [rgba_len]u8 = undefined;
     dumpFrameRgba(io_bytes, palette_bytes, vram_bytes, oam_bytes, &rgba) catch return dump_error_unsupported_video_mode;
 
-    const sdl = SdlApi.load() orelse return dump_error_sdl3_missing;
-    defer _ = dlclose(sdl.library);
+    const setup_result = ensureSdl3Window();
+    if (setup_result != dump_ok) return setup_result;
+    const sdl = window_sdl.?;
 
-    if (!sdl.init(sdl_init_video)) return dump_error_sdl3_init_failed;
-    defer sdl.quit();
-
-    const window = sdl.create_window(
-        "Homonculi GBA",
-        frame_width * 3,
-        frame_height * 3,
-        sdl_window_resizable | sdl_window_high_pixel_density,
-    ) orelse return dump_error_sdl3_window_failed;
-    defer sdl.destroy_window(window);
-
-    const renderer = sdl.create_renderer(window, null) orelse return dump_error_sdl3_renderer_failed;
-    defer sdl.destroy_renderer(renderer);
-
-    const texture = sdl.create_texture(
-        renderer,
-        sdl_pixelformat_rgba32,
-        sdl_textureaccess_streaming,
-        frame_width,
-        frame_height,
-    ) orelse return dump_error_sdl3_texture_failed;
-    defer sdl.destroy_texture(texture);
-
-    if (!sdl.update_texture(texture, null, &rgba, frame_width * 4)) return dump_error_sdl3_render_failed;
-
-    var frames_presented: u64 = 0;
-    const autoclose_frames = windowAutocloseFrames();
-    var running = true;
-    while (running) {
-        var event: SdlEvent align(8) = undefined;
-        while (sdl.poll_event(&event)) {
-            if (event.type == sdl_event_quit) {
-                running = false;
-            }
-        }
-        if (!running) break;
-
-        if (!sdl.set_render_draw_color(renderer, 0, 0, 0, 255)) return dump_error_sdl3_render_failed;
-        if (!sdl.render_clear(renderer)) return dump_error_sdl3_render_failed;
-        if (!sdl.render_texture(renderer, texture, null, null)) return dump_error_sdl3_render_failed;
-        if (!sdl.render_present(renderer)) return dump_error_sdl3_render_failed;
-
-        frames_presented += 1;
-        if (autoclose_frames) |limit| {
-            if (frames_presented >= limit) break;
-        }
-        sdl.delay(16);
+    var event: SdlEvent align(8) = undefined;
+    while (sdl.poll_event(&event)) {
+        if (event.type == sdl_event_quit) return dump_window_quit;
     }
 
+    if (!sdl.update_texture(window_texture, null, &rgba, frame_width * 4)) return dump_error_sdl3_render_failed;
+    if (!sdl.set_render_draw_color(window_renderer, 0, 0, 0, 255)) return dump_error_sdl3_render_failed;
+    if (!sdl.render_clear(window_renderer)) return dump_error_sdl3_render_failed;
+    if (!sdl.render_texture(window_renderer, window_texture, null, null)) return dump_error_sdl3_render_failed;
+    if (!sdl.render_present(window_renderer)) return dump_error_sdl3_render_failed;
+
+    window_frames_presented += 1;
+    if (windowAutocloseFrames()) |limit| {
+        if (window_frames_presented >= limit) return dump_window_quit;
+    }
+    sdl.delay(16);
+
     return dump_ok;
+}
+
+pub export fn hmgba_sdl3_shutdown() void {
+    if (window_sdl) |sdl| {
+        if (window_texture) |texture| sdl.destroy_texture(texture);
+        if (window_renderer) |renderer| sdl.destroy_renderer(renderer);
+        if (window_handle) |window| sdl.destroy_window(window);
+        if (window_sdl_initialized) sdl.quit();
+        _ = dlclose(sdl.library);
+    }
+    window_texture = null;
+    window_renderer = null;
+    window_handle = null;
+    window_sdl_initialized = false;
+    window_sdl = null;
+    window_frames_presented = 0;
+}
+
+pub export fn hmgba_run_sdl3_window(
+    io: [*]const u8,
+    palette: [*]const u8,
+    vram: [*]const u8,
+    oam: [*]const u8,
+) c_int {
+    while (true) {
+        const result = hmgba_sdl3_present_frame(io, palette, vram, oam);
+        if (result == dump_window_quit) {
+            hmgba_sdl3_shutdown();
+            return dump_ok;
+        }
+        if (result != dump_ok) {
+            hmgba_sdl3_shutdown();
+            return result;
+        }
+    }
 }
 
 fn windowAutocloseFrames() ?u64 {
