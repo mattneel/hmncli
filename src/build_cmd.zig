@@ -2879,6 +2879,111 @@ fn writeCpuFastSetCopyRom(
     try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
 }
 
+fn writeCpuFastSetFillRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xE59F0010, // ldr r0, [pc, #0x10] ; source
+        0xE59F1010, // ldr r1, [pc, #0x10] ; dest
+        0xE59F2010, // ldr r2, [pc, #0x10] ; control
+        0xEF00000C, // swi 0x0C (CpuFastSet)
+        0xE591001C, // ldr r0, [r1, #28] ; eighth filled word
+        0xE1A0F00E, // mov pc, lr
+        0x08000024, // source literal
+        0x03000000, // dest literal
+        0x01000008, // eight words, fill mode
+        1234, // fill word
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
+fn writeCpuFastSetAlignRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xE59F0014, // ldr r0, [pc, #0x14] ; misaligned source
+        0xE59F1014, // ldr r1, [pc, #0x14] ; misaligned dest
+        0xE59F2014, // ldr r2, [pc, #0x14] ; control
+        0xEF00000C, // swi 0x0C (CpuFastSet)
+        0xE59F3010, // ldr r3, [pc, #0x10] ; aligned dest base
+        0xE5930000, // ldr r0, [r3]
+        0xE1A0F00E, // mov pc, lr
+        0x0800002D, // source literal: align down to 0x0800002C
+        0x03000002, // dest literal: align down to 0x03000000
+        0x00000008, // eight words, copy mode
+        0x03000000, // aligned dest base literal
+        42,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
+fn writeCpuFastSetBadControlRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xE59F000C, // ldr r0, [pc, #0x0C]
+        0xE59F100C, // ldr r1, [pc, #0x0C]
+        0xE59F200C, // ldr r2, [pc, #0x0C]
+        0xEF00000C, // swi 0x0C (CpuFastSet)
+        0xEAFFFFFE, // b . ; would spin until the instruction limit if stop_flag were ignored
+        0x08000020,
+        0x03000000,
+        0x04000008, // bit 26 is valid for CpuSet, unsupported for CpuFastSet
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
+fn writeCpuFastSetBadCountRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xE59F000C, // ldr r0, [pc, #0x0C]
+        0xE59F100C, // ldr r1, [pc, #0x0C]
+        0xE59F200C, // ldr r2, [pc, #0x0C]
+        0xEF00000C, // swi 0x0C (CpuFastSet)
+        0xEAFFFFFE, // b . ; would spin until the instruction limit if stop_flag were ignored
+        0x08000020,
+        0x03000000,
+        0x00000007, // GBA CpuFastSet count must be a multiple of 8 words
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
 fn writeCpuSetCopyAutoProbeRom(
     dir: std.Io.Dir,
     io: std.Io,
@@ -5175,6 +5280,45 @@ test "build executes CpuFastSet copy semantics on a synthetic ROM" {
     try std.testing.expectEqualStrings("", result.stderr);
 }
 
+test "build executes CpuFastSet fill semantics on a synthetic ROM" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeCpuFastSetFillRom(tmp.dir, io, "cpufastset-fill.gba");
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "cpufastset-fill.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "cpufastset-fill-native",
+            .output_mode = .auto,
+            .optimize = .release,
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./cpufastset-fill-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("1234\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
 test "build executes CpuSet fill semantics on a synthetic ROM" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -5251,6 +5395,84 @@ test "CpuSet rejects unsupported control bits structurally" {
     try std.testing.expectEqualStrings("", result.stderr);
 }
 
+test "CpuFastSet rejects unsupported control bits structurally" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeCpuFastSetBadControlRom(tmp.dir, io, "cpufastset-bad-control.gba");
+
+    const native_path = if (standalone_build_cmd_test)
+        try buildFixtureNativeViaCli(std.testing.allocator, io, &tmp, "cpufastset-bad-control.gba", "cpufastset-bad-control-native", .retired_count, 500_000)
+    else
+        try buildFixtureNative(
+            std.testing.allocator,
+            io,
+            tmp.dir,
+            "cpufastset-bad-control.gba",
+            "cpufastset-bad-control-native",
+            .retired_count,
+            500_000,
+        );
+    defer std.testing.allocator.free(native_path);
+
+    const result = try runNativeCapture(
+        std.testing.allocator,
+        io,
+        tmp.dir,
+        native_path,
+        "retired_count",
+        500_000,
+    );
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Unsupported CpuFastSet control 0x04000008 for gba") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "retired=4\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "retired=500000\n") == null);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "CpuFastSet rejects unsupported non-multiple count structurally" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeCpuFastSetBadCountRom(tmp.dir, io, "cpufastset-bad-count.gba");
+
+    const native_path = if (standalone_build_cmd_test)
+        try buildFixtureNativeViaCli(std.testing.allocator, io, &tmp, "cpufastset-bad-count.gba", "cpufastset-bad-count-native", .retired_count, 500_000)
+    else
+        try buildFixtureNative(
+            std.testing.allocator,
+            io,
+            tmp.dir,
+            "cpufastset-bad-count.gba",
+            "cpufastset-bad-count-native",
+            .retired_count,
+            500_000,
+        );
+    defer std.testing.allocator.free(native_path);
+
+    const result = try runNativeCapture(
+        std.testing.allocator,
+        io,
+        tmp.dir,
+        native_path,
+        "retired_count",
+        500_000,
+    );
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Unsupported CpuFastSet count 0x00000007 for gba") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "retired=4\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "retired=500000\n") == null);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
 test "build aligns CpuSet word-mode source and dest before copying" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -5278,6 +5500,45 @@ test "build aligns CpuSet word-mode source and dest before copying" {
 
     const result = try std.process.run(std.testing.allocator, io, .{
         .argv = &.{"./cpuset-align-word-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "build aligns CpuFastSet source and dest before copying" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeCpuFastSetAlignRom(tmp.dir, io, "cpufastset-align.gba");
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "cpufastset-align.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "cpufastset-align-native",
+            .output_mode = .auto,
+            .optimize = .release,
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./cpufastset-align-native"},
         .cwd = .{ .dir = tmp.dir },
         .stdout_limit = .limited(1024),
         .stderr_limit = .limited(1024),
