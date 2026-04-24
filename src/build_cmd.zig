@@ -113,6 +113,9 @@ fn liftRomWithOptions(
         functions.deinit(allocator);
     }
 
+    const runtime_code_translations = try detectRuntimeCopiedThumbThunkTranslations(allocator, image);
+    errdefer allocator.free(runtime_code_translations);
+
     var has_store = false;
     var has_self_loop = false;
 
@@ -144,6 +147,36 @@ fn liftRomWithOptions(
             image,
             functions.items,
         );
+        const callback_initializer_added = try enqueueCallbackInitializerLiteralTargets(
+            allocator,
+            &pending_functions,
+            image,
+            functions.items,
+        );
+        const global_callback_setter_added = try enqueueGlobalCallbackSetterLiteralTargets(
+            allocator,
+            &pending_functions,
+            image,
+            functions.items,
+        );
+        const callback_record_added = try enqueueLinkedThumbCallbackRecordTargets(
+            allocator,
+            &pending_functions,
+            image,
+            functions.items,
+        );
+        const referenced_table_added = try enqueueReferencedThumbPointerTableTargets(
+            allocator,
+            &pending_functions,
+            image,
+            functions.items,
+        );
+        const referenced_script_added = try enqueueReferencedThumbScriptDataTargets(
+            allocator,
+            &pending_functions,
+            image,
+            functions.items,
+        );
         const kirby_overlay_added = try enqueueMeasuredKirbyOverlayRuntimeTargets(
             allocator,
             &pending_functions,
@@ -168,7 +201,13 @@ fn liftRomWithOptions(
             image,
             functions.items,
         );
-        if (!linked_table_added and !kirby_overlay_added and !kirby_irq_added and !kirby_callback_added and !kirby_resume_added) break;
+        const runtime_translation_added = try enqueueRuntimeCodeTranslationSources(
+            allocator,
+            &pending_functions,
+            runtime_code_translations,
+            functions.items,
+        );
+        if (!linked_table_added and !callback_initializer_added and !global_callback_setter_added and !callback_record_added and !referenced_table_added and !referenced_script_added and !kirby_overlay_added and !kirby_irq_added and !kirby_callback_added and !kirby_resume_added and !runtime_translation_added) break;
     }
 
     sortFunctions(functions.items);
@@ -194,6 +233,7 @@ fn liftRomWithOptions(
         .rom_bytes = image.bytes,
         .save_hardware = detectSaveHardware(image.bytes),
         .functions = owned_functions,
+        .runtime_code_translations = runtime_code_translations,
         .output_mode = output_mode,
         .instruction_limit = if (requested_output_mode == .frame_raw or requested_output_mode == .retired_count or requested_output_mode == .window)
             max_instructions
@@ -243,7 +283,13 @@ fn liftFunction(
             return error.UnsupportedOpcode;
         };
 
-        try ensureDeclared(writer, decoded, address);
+        ensureDeclared(writer, decoded, address) catch |err| switch (err) {
+            error.UnsupportedOpcode => {
+                try renderUnsupportedOpcode(writer, raw_opcode, address);
+                return err;
+            },
+            else => |other| return other,
+        };
         try maybeEnqueueVectorTarget(
             allocator,
             writer,
@@ -795,6 +841,508 @@ fn enqueueLinkedThumbPointerTableTargets(
         offset = if (run_len == 0) run_start + 4 else offset;
     }
     return added;
+}
+
+fn enqueueRuntimeCodeTranslationSources(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(armv4t_decode.CodeAddress),
+    translations: []const llvm_codegen.RuntimeCodeTranslation,
+    functions: []const llvm_codegen.Function,
+) std.mem.Allocator.Error!bool {
+    var added = false;
+    for (translations) |translation| {
+        if (containsFunction(functions, translation.source)) continue;
+        if (containsCodeAddress(pending.items, translation.source)) continue;
+        try pending.append(allocator, translation.source);
+        added = true;
+    }
+    return added;
+}
+
+fn enqueueCallbackInitializerLiteralTargets(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(armv4t_decode.CodeAddress),
+    image: gba_loader.RomImage,
+    functions: []const llvm_codegen.Function,
+) BuildError!bool {
+    var added = false;
+    var offset: usize = 0;
+    while (offset + 4 <= image.bytes.len) : (offset += 2) {
+        if (!isThumbBlEncodingStart(image.bytes, offset)) continue;
+        const address = image.base_address + @as(u32, @intCast(offset));
+        const instruction = decodeRomInstructionUnchecked(image, .thumb, address) catch continue;
+        const bl = switch (instruction.instruction) {
+            .bl => |branch_link| branch_link,
+            else => continue,
+        };
+        if (bl.target.isa != .thumb) continue;
+        if (!isCallbackInitializerStoreFunction(image, bl.target.address)) continue;
+
+        const raw_targets = callbackInitializerCallsiteLiteralArgs(image, address) orelse continue;
+        for (raw_targets) |raw_target| {
+            const target = callbackLiteralCodeTarget(image, raw_target) orelse continue;
+            if (containsFunction(functions, target)) continue;
+            if (containsCodeAddress(pending.items, target)) continue;
+            try pending.append(allocator, target);
+            added = true;
+        }
+    }
+    return added;
+}
+
+fn enqueueGlobalCallbackSetterLiteralTargets(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(armv4t_decode.CodeAddress),
+    image: gba_loader.RomImage,
+    functions: []const llvm_codegen.Function,
+) BuildError!bool {
+    var added = false;
+    var offset: usize = 0;
+    while (offset + 4 <= image.bytes.len) : (offset += 2) {
+        if (!isThumbBlEncodingStart(image.bytes, offset)) continue;
+        const address = image.base_address + @as(u32, @intCast(offset));
+        const instruction = decodeRomInstructionUnchecked(image, .thumb, address) catch continue;
+        const bl = switch (instruction.instruction) {
+            .bl => |branch_link| branch_link,
+            else => continue,
+        };
+        if (bl.target.isa != .thumb) continue;
+        if (!isGlobalCallbackSetterFunction(image, bl.target.address)) continue;
+
+        const target = globalCallbackSetterCallsiteLiteralTarget(image, address) orelse continue;
+        if (containsFunction(functions, target)) continue;
+        if (containsCodeAddress(pending.items, target)) continue;
+        try pending.append(allocator, target);
+        added = true;
+    }
+    return added;
+}
+
+fn isGlobalCallbackSetterFunction(
+    image: gba_loader.RomImage,
+    address: u32,
+) bool {
+    const slot_load_insn = decodeRomInstructionUnchecked(image, .thumb, address) catch return false;
+    const slot_load = switch (slot_load_insn.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return false,
+    };
+    if (slot_load.rd != 1 or slot_load.base != 15) return false;
+    const slot = resolveThumbLiteralWordFromRom(image, slot_load_insn.address, slot_load) orelse return false;
+    if (!isWorkRamAddress(slot)) return false;
+
+    const store_insn = decodeRomInstructionUnchecked(image, .thumb, address + 2) catch return false;
+    if (!isWordStoreImmZero(store_insn.instruction, 0, 1)) return false;
+
+    const return_insn = decodeRomInstructionUnchecked(image, .thumb, address + 4) catch return false;
+    return switch (return_insn.instruction) {
+        .bx_lr => true,
+        else => false,
+    };
+}
+
+fn globalCallbackSetterCallsiteLiteralTarget(
+    image: gba_loader.RomImage,
+    bl_address: u32,
+) ?armv4t_decode.CodeAddress {
+    const load_insn = previousInstruction(image, .thumb, bl_address) catch return null;
+    const load = switch (load_insn.instruction) {
+        .ldr_word_imm => |ldr| ldr,
+        else => return null,
+    };
+    if (load.rd != 0 or load.base != 15) return null;
+    const raw_target = resolveThumbLiteralWordFromRom(image, load_insn.address, load) orelse return null;
+    return callbackLiteralCodeTarget(image, raw_target);
+}
+
+fn enqueueLinkedThumbCallbackRecordTargets(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(armv4t_decode.CodeAddress),
+    image: gba_loader.RomImage,
+    functions: []const llvm_codegen.Function,
+) std.mem.Allocator.Error!bool {
+    const record_stride = 24;
+    const callback_fields = [_]usize{ 8, 12 };
+
+    var added = false;
+    var offset: usize = 0;
+    while (offset + record_stride <= image.bytes.len) {
+        const run_start = offset;
+        var run_len: usize = 0;
+        var linked_to_lifted_function = false;
+
+        while (run_start + (run_len + 1) * record_stride <= image.bytes.len) {
+            const record_offset = run_start + run_len * record_stride;
+            var code_field_count: usize = 0;
+
+            for (callback_fields) |field_offset| {
+                const raw_target = armv4t_decode.readWord(image.bytes, record_offset + field_offset);
+                const target = callbackLiteralCodeTarget(image, raw_target) orelse continue;
+                code_field_count += 1;
+                if (containsFunction(functions, target)) linked_to_lifted_function = true;
+            }
+
+            if (code_field_count != callback_fields.len) break;
+            run_len += 1;
+        }
+
+        if (run_len >= 4 and linked_to_lifted_function) {
+            var record_index: usize = 0;
+            while (record_index < run_len) : (record_index += 1) {
+                const record_offset = run_start + record_index * record_stride;
+                for (callback_fields) |field_offset| {
+                    const raw_target = armv4t_decode.readWord(image.bytes, record_offset + field_offset);
+                    const target = callbackLiteralCodeTarget(image, raw_target) orelse continue;
+                    if (containsFunction(functions, target)) continue;
+                    if (containsCodeAddress(pending.items, target)) continue;
+                    try pending.append(allocator, target);
+                    added = true;
+                }
+            }
+        }
+
+        offset = if (run_len == 0) run_start + 4 else run_start + run_len * record_stride;
+    }
+
+    return added;
+}
+
+fn enqueueReferencedThumbPointerTableTargets(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(armv4t_decode.CodeAddress),
+    image: gba_loader.RomImage,
+    functions: []const llvm_codegen.Function,
+) std.mem.Allocator.Error!bool {
+    var added = false;
+    for (functions) |function| {
+        for (function.instructions) |node| {
+            const table_address = pcRelativeLiteralWordValue(image, function.entry.isa, node) orelse continue;
+            if (try enqueueThumbPointerTableAt(allocator, pending, image, functions, table_address)) {
+                added = true;
+            }
+        }
+    }
+    return added;
+}
+
+fn enqueueReferencedThumbScriptDataTargets(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(armv4t_decode.CodeAddress),
+    image: gba_loader.RomImage,
+    functions: []const llvm_codegen.Function,
+) std.mem.Allocator.Error!bool {
+    var added = false;
+    var reference_offset: usize = 0;
+    while (reference_offset + 4 <= image.bytes.len) : (reference_offset += 4) {
+        const script_address = armv4t_decode.readWord(image.bytes, reference_offset);
+        const script_offset = romOffsetForAddress(image, script_address, .arm) orelse continue;
+        const code_run_offset = thumbScriptDataCodeRunOffset(image, reference_offset, script_offset) orelse continue;
+        const entry_count = thumbScriptDataRunLength(image, code_run_offset);
+
+        for (0..entry_count) |index| {
+            const raw_target = armv4t_decode.readWord(image.bytes, code_run_offset + index * 8);
+            const target = referencedThumbTableCodeTarget(image, raw_target) orelse continue;
+            if (containsFunction(functions, target)) continue;
+            if (containsCodeAddress(pending.items, target)) continue;
+            try pending.append(allocator, target);
+            added = true;
+        }
+    }
+    return added;
+}
+
+fn thumbScriptDataCodeRunOffset(
+    image: gba_loader.RomImage,
+    reference_offset: usize,
+    script_offset: usize,
+) ?usize {
+    const direct_len = thumbScriptDataRunLength(image, script_offset);
+    if (direct_len >= 2) return script_offset;
+    if (direct_len == 1 and referencedThumbScriptPointerIsClustered(image, reference_offset)) return script_offset;
+    if (script_offset + 12 > image.bytes.len) return null;
+
+    const nested_script_pointer = armv4t_decode.readWord(image.bytes, script_offset);
+    _ = romOffsetForAddress(image, nested_script_pointer, .arm) orelse return null;
+
+    const nested_code_run_offset = script_offset + 8;
+    const nested_len = thumbScriptDataRunLength(image, nested_code_run_offset);
+    if (nested_len >= 2) return nested_code_run_offset;
+    if (nested_len == 1 and referencedThumbScriptPointerIsClustered(image, reference_offset)) return nested_code_run_offset;
+    return null;
+}
+
+fn referencedThumbScriptPointerIsClustered(
+    image: gba_loader.RomImage,
+    reference_offset: usize,
+) bool {
+    return thumbScriptPointerClusterLength(image, reference_offset) >= 2;
+}
+
+fn thumbScriptPointerClusterLength(
+    image: gba_loader.RomImage,
+    reference_offset: usize,
+) usize {
+    const max_cluster_words = 16;
+    var count: usize = 0;
+
+    var back = reference_offset;
+    while (count < max_cluster_words) {
+        if (!wordAtOffsetPointsToThumbScriptDataRun(image, back)) break;
+        count += 1;
+        if (back < 4) break;
+        back -= 4;
+    }
+
+    var forward = reference_offset + 4;
+    while (count < max_cluster_words and forward + 4 <= image.bytes.len) : (forward += 4) {
+        if (!wordAtOffsetPointsToThumbScriptDataRun(image, forward)) break;
+        count += 1;
+    }
+
+    return count;
+}
+
+fn wordAtOffsetPointsToThumbScriptDataRun(
+    image: gba_loader.RomImage,
+    offset: usize,
+) bool {
+    if (offset + 4 > image.bytes.len) return false;
+
+    const script_address = armv4t_decode.readWord(image.bytes, offset);
+    const script_offset = romOffsetForAddress(image, script_address, .arm) orelse return false;
+    if (thumbScriptDataRunLength(image, script_offset) >= 1) return true;
+    if (script_offset + 12 > image.bytes.len) return false;
+
+    const nested_script_pointer = armv4t_decode.readWord(image.bytes, script_offset);
+    _ = romOffsetForAddress(image, nested_script_pointer, .arm) orelse return false;
+    return thumbScriptDataRunLength(image, script_offset + 8) >= 1;
+}
+
+fn thumbScriptDataRunLength(
+    image: gba_loader.RomImage,
+    script_offset: usize,
+) usize {
+    if (script_offset < 4) return 0;
+    if (!scriptControlWordLooksPlausible(armv4t_decode.readWord(image.bytes, script_offset - 4))) return 0;
+
+    const max_entries = 128;
+    var entry_count: usize = 0;
+    while (entry_count < max_entries and script_offset + entry_count * 8 + 8 <= image.bytes.len) : (entry_count += 1) {
+        const raw_target = armv4t_decode.readWord(image.bytes, script_offset + entry_count * 8);
+        _ = referencedThumbTableCodeTarget(image, raw_target) orelse break;
+
+        const control = armv4t_decode.readWord(image.bytes, script_offset + entry_count * 8 + 4);
+        if (!scriptControlWordLooksPlausible(control)) break;
+    }
+    return entry_count;
+}
+
+fn scriptControlWordLooksPlausible(value: u32) bool {
+    return value < 0x0010_0000;
+}
+
+fn pcRelativeLiteralWordValue(
+    image: gba_loader.RomImage,
+    isa: armv4t_decode.InstructionSet,
+    node: llvm_codegen.InstructionNode,
+) ?u32 {
+    const load = switch (node.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (load.base != 15) return null;
+
+    const literal_address = pcValueForInstruction(isa, node.address) + load.offset;
+    const literal_offset = romOffsetForAddress(image, literal_address, isa) orelse return null;
+    if (literal_offset + 4 > image.bytes.len) return null;
+    return armv4t_decode.readWord(image.bytes, literal_offset);
+}
+
+fn enqueueThumbPointerTableAt(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(armv4t_decode.CodeAddress),
+    image: gba_loader.RomImage,
+    functions: []const llvm_codegen.Function,
+    table_address: u32,
+) std.mem.Allocator.Error!bool {
+    const table_offset = romOffsetForAddress(image, table_address, .arm) orelse return false;
+    const max_entries = 256;
+
+    var entry_count: usize = 0;
+    while (entry_count < max_entries and table_offset + (entry_count + 1) * 4 <= image.bytes.len) : (entry_count += 1) {
+        const raw_target = armv4t_decode.readWord(image.bytes, table_offset + entry_count * 4);
+        _ = referencedThumbTableCodeTarget(image, raw_target) orelse break;
+    }
+    if (entry_count < 4) return false;
+
+    var added = false;
+    for (0..entry_count) |index| {
+        const raw_target = armv4t_decode.readWord(image.bytes, table_offset + index * 4);
+        const target = referencedThumbTableCodeTarget(image, raw_target) orelse continue;
+        if (containsFunction(functions, target)) continue;
+        if (containsCodeAddress(pending.items, target)) continue;
+        try pending.append(allocator, target);
+        added = true;
+    }
+    return added;
+}
+
+fn referencedThumbTableCodeTarget(
+    image: gba_loader.RomImage,
+    raw_target: u32,
+) ?armv4t_decode.CodeAddress {
+    if ((raw_target & 1) == 0) return null;
+    const target = normalizeCodeTarget(raw_target);
+    if (target.isa != .thumb) return null;
+    if (offsetForAddress(image, target.address, target.isa) == null) return null;
+    _ = decodeImageInstructionUnchecked(image, .thumb, target.address) catch return null;
+    return target;
+}
+
+fn isThumbBlEncodingStart(bytes: []const u8, offset: usize) bool {
+    if (offset + 4 > bytes.len) return false;
+    const first = armv4t_decode.readHalfword(bytes, offset);
+    const second = armv4t_decode.readHalfword(bytes, offset + 2);
+    return (first & 0xF800) == 0xF000 and (second & 0xF800) == 0xF800;
+}
+
+fn isCallbackInitializerStoreFunction(
+    image: gba_loader.RomImage,
+    address: u32,
+) bool {
+    const push_insn = decodeRomInstructionUnchecked(image, .thumb, address) catch return false;
+    const push = switch (push_insn.instruction) {
+        .push => |mask| mask,
+        else => return false,
+    };
+    if (push != ((@as(u16, 1) << 4) | (@as(u16, 1) << 5) | (@as(u16, 1) << 14))) return false;
+
+    const stack_arg_load = decodeRomInstructionUnchecked(image, .thumb, address + 0x02) catch return false;
+    const stack_arg = switch (stack_arg_load.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return false,
+    };
+    if (stack_arg.rd != 5 or stack_arg.base != 13 or stack_arg.offset != 12) return false;
+
+    const slot0_load = decodeRomInstructionUnchecked(image, .thumb, address + 0x04) catch return false;
+    const slot0 = callbackInitializerSlotLoad(image, slot0_load, 4) orelse return false;
+    if (!isWorkRamAddress(slot0)) return false;
+
+    const store0 = decodeRomInstructionUnchecked(image, .thumb, address + 0x06) catch return false;
+    if (!isWordStoreImmZero(store0.instruction, 0, 4)) return false;
+
+    const slot1_load = decodeRomInstructionUnchecked(image, .thumb, address + 0x08) catch return false;
+    const slot1 = callbackInitializerSlotLoad(image, slot1_load, 0) orelse return false;
+    if (!isWorkRamAddress(slot1)) return false;
+
+    const store1 = decodeRomInstructionUnchecked(image, .thumb, address + 0x0A) catch return false;
+    if (!isWordStoreImmZero(store1.instruction, 1, 0)) return false;
+
+    const slot2_load = decodeRomInstructionUnchecked(image, .thumb, address + 0x0C) catch return false;
+    const slot2 = callbackInitializerSlotLoad(image, slot2_load, 0) orelse return false;
+    if (!isWorkRamAddress(slot2)) return false;
+
+    const store2 = decodeRomInstructionUnchecked(image, .thumb, address + 0x0E) catch return false;
+    if (!isWordStoreImmZero(store2.instruction, 2, 0)) return false;
+
+    return true;
+}
+
+fn callbackInitializerSlotLoad(
+    image: gba_loader.RomImage,
+    instruction: DecodedNode,
+    expected_rd: u4,
+) ?u32 {
+    const load = switch (instruction.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (load.rd != expected_rd or load.base != 15) return null;
+    return resolveThumbLiteralWordFromRom(image, instruction.address, load);
+}
+
+fn callbackInitializerCallsiteLiteralArgs(
+    image: gba_loader.RomImage,
+    bl_address: u32,
+) ?[3]u32 {
+    if (bl_address < image.base_address + 0x0C) return null;
+
+    const raw_r0 = thumbPcLiteralLoadRaw(image, bl_address - 0x0C, 0) orelse return null;
+    const raw_r1 = thumbPcLiteralLoadRaw(image, bl_address - 0x0A, 1) orelse return null;
+    const raw_r2 = thumbPcLiteralLoadRaw(image, bl_address - 0x08, 2) orelse return null;
+    _ = thumbPcLiteralLoadRaw(image, bl_address - 0x06, 3) orelse return null;
+
+    const stack_store = decodeRomInstructionUnchecked(image, .thumb, bl_address - 0x04) catch return null;
+    if (!isWordStoreImmZero(stack_store.instruction, 3, 13)) return null;
+
+    const mov_count = decodeRomInstructionUnchecked(image, .thumb, bl_address - 0x02) catch return null;
+    const mov = switch (mov_count.instruction) {
+        .movs_imm => |mov| mov,
+        else => return null,
+    };
+    if (mov.rd != 3) return null;
+
+    return .{ raw_r0, raw_r1, raw_r2 };
+}
+
+fn thumbPcLiteralLoadRaw(
+    image: gba_loader.RomImage,
+    address: u32,
+    expected_rd: u4,
+) ?u32 {
+    const instruction = decodeRomInstructionUnchecked(image, .thumb, address) catch return null;
+    const load = switch (instruction.instruction) {
+        .ldr_word_imm => |load| load,
+        else => return null,
+    };
+    if (load.rd != expected_rd or load.base != 15) return null;
+    return resolveThumbLiteralWordFromRom(image, instruction.address, load);
+}
+
+fn callbackLiteralCodeTarget(
+    image: gba_loader.RomImage,
+    raw_target: u32,
+) ?armv4t_decode.CodeAddress {
+    if ((raw_target & 1) == 0) return null;
+    const target = normalizeCodeTarget(raw_target);
+    if (target.isa != .thumb) return null;
+    if (offsetForAddress(image, target.address, target.isa) == null) return null;
+    if (!thumbFunctionEntryLooksPlausible(image, target.address)) return null;
+    return target;
+}
+
+fn thumbFunctionEntryLooksPlausible(
+    image: gba_loader.RomImage,
+    address: u32,
+) bool {
+    const halfword = mappedThumbHalfword(image, address) orelse return false;
+    if ((halfword & 0xFE00) == 0xB400) return true; // push {...}
+    if (halfword == 0x4770) return true; // bx lr, valid for tiny thunks
+    return false;
+}
+
+fn isWorkRamAddress(address: u32) bool {
+    return (address >= 0x0200_0000 and address < 0x0204_0000) or
+        (address >= 0x0300_0000 and address < 0x0300_8000);
+}
+
+fn isWordStoreImmZero(
+    instruction: armv4t_decode.DecodedInstruction,
+    expected_src: u4,
+    expected_base: u4,
+) bool {
+    const store = switch (instruction) {
+        .store => |store| store,
+        else => return false,
+    };
+    if (store.src != expected_src or store.base != expected_base or store.size != .word) return false;
+    return switch (store.addressing) {
+        .offset => |offset| switch (offset.offset) {
+            .imm => |imm| imm == 0 and !offset.subtract,
+            else => false,
+        },
+        else => false,
+    };
 }
 
 fn enqueueMeasuredKirbyOverlayRuntimeTargets(
@@ -1691,7 +2239,23 @@ fn measureThumbMovPcJumpTable(
 ) BuildError!?ThumbMovPcJumpTable {
     if (isa != .thumb) return null;
 
-    const load_target_insn = previousInstruction(image, isa, address) catch return null;
+    var load_target_insn = previousInstruction(image, isa, address) catch return null;
+    var skipped_literal_loads: usize = 0;
+    while (skipped_literal_loads < 4) : (skipped_literal_loads += 1) {
+        const found_load_target = switch (load_target_insn.instruction) {
+            .ldr_word_imm => |load| load.rd == reg and load.base == reg and load.offset == 0,
+            else => false,
+        };
+        if (found_load_target) break;
+
+        const is_unrelated_literal_load = switch (load_target_insn.instruction) {
+            .ldr_word_imm => |load| load.rd != reg and load.base == 15,
+            else => false,
+        };
+        if (!is_unrelated_literal_load) return null;
+        load_target_insn = previousInstruction(image, isa, load_target_insn.address) catch return null;
+    } else return null;
+
     const load_target = switch (load_target_insn.instruction) {
         .ldr_word_imm => |load| load,
         else => return null,
@@ -1827,6 +2391,120 @@ fn offsetForAddress(
     }
 
     return null;
+}
+
+fn detectRuntimeCopiedThumbThunkTranslations(
+    allocator: std.mem.Allocator,
+    image: gba_loader.RomImage,
+) std.mem.Allocator.Error![]llvm_codegen.RuntimeCodeTranslation {
+    var translations: std.ArrayList(llvm_codegen.RuntimeCodeTranslation) = .empty;
+    errdefer translations.deinit(allocator);
+
+    var offset: usize = 0;
+    while (offset + 0x40 <= image.bytes.len) : (offset += 2) {
+        if (!matchesRuntimeThumbCopyRoutine(image.bytes[offset..])) continue;
+
+        const source_raw = armv4t_decode.readWord(image.bytes, offset + 0x38);
+        const end_raw = armv4t_decode.readWord(image.bytes, offset + 0x3C);
+        if ((source_raw & 1) == 0 or (end_raw & 1) == 0) continue;
+
+        const source = normalizeCodeTarget(source_raw);
+        const end = normalizeCodeTarget(end_raw);
+        if (source.isa != .thumb or end.isa != .thumb) continue;
+        if (end.address <= source.address) continue;
+
+        const size = end.address - source.address;
+        if (size == 0 or size > 0x100) continue;
+
+        const source_offset = romOffsetForAddress(image, source.address, .thumb) orelse continue;
+        const end_offset = source_offset + size;
+        if (end_offset > image.bytes.len) continue;
+
+        const bytes = image.bytes[source_offset..end_offset];
+        if (!copiedThumbThunkIsPositionIndependent(source.address, bytes)) continue;
+        if (containsRuntimeCodeTranslation(translations.items, source, bytes)) continue;
+
+        try translations.append(allocator, .{
+            .source = source,
+            .target_region = .iwram,
+            .bytes = bytes,
+        });
+    }
+
+    return translations.toOwnedSlice(allocator);
+}
+
+fn matchesRuntimeThumbCopyRoutine(bytes: []const u8) bool {
+    if (bytes.len < 0x40) return false;
+
+    const expected = [_]struct {
+        offset: usize,
+        halfword: u16,
+    }{
+        .{ .offset = 0x00, .halfword = 0xB580 }, // push {r7, lr}
+        .{ .offset = 0x02, .halfword = 0xB083 }, // sub sp, #12
+        .{ .offset = 0x04, .halfword = 0x466F }, // mov r7, sp
+        .{ .offset = 0x06, .halfword = 0x6038 }, // str r0, [r7]
+        .{ .offset = 0x10, .halfword = 0x4809 }, // ldr r0, [pc, #36] ; source | thumb bit
+        .{ .offset = 0x12, .halfword = 0x60B8 }, // str r0, [r7, #8]
+        .{ .offset = 0x14, .halfword = 0x68B8 }, // ldr r0, [r7, #8]
+        .{ .offset = 0x16, .halfword = 0x2101 }, // movs r1, #1
+        .{ .offset = 0x18, .halfword = 0x4048 }, // eors r0, r1 ; clear thumb bit for data copy
+        .{ .offset = 0x1A, .halfword = 0x60B8 }, // str r0, [r7, #8]
+        .{ .offset = 0x1E, .halfword = 0x4907 }, // ldr r1, [pc, #28] ; source end | thumb bit
+        .{ .offset = 0x20, .halfword = 0x4A05 }, // ldr r2, [pc, #20] ; source | thumb bit
+        .{ .offset = 0x22, .halfword = 0x1A89 }, // subs r1, r1, r2
+        .{ .offset = 0x24, .halfword = 0x084A }, // lsrs r2, r1, #1
+        .{ .offset = 0x30, .halfword = 0xD106 }, // bne copy loop
+        .{ .offset = 0x32, .halfword = 0xE017 }, // branch to return
+    };
+
+    for (expected) |item| {
+        if (armv4t_decode.readHalfword(bytes, item.offset) != item.halfword) return false;
+    }
+    return true;
+}
+
+fn copiedThumbThunkIsPositionIndependent(
+    source_address: u32,
+    bytes: []const u8,
+) bool {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const decoded = armv4t_decode.decodeAt(bytes[offset..], .thumb, source_address + @as(u32, @intCast(offset))) catch return false;
+        if (thumbInstructionObservesPc(decoded.instruction)) return false;
+        offset += decoded.size_bytes;
+    }
+    return offset == bytes.len;
+}
+
+fn thumbInstructionObservesPc(instruction: armv4t_decode.DecodedInstruction) bool {
+    return switch (instruction) {
+        .ldr_word_imm => |load| load.base == 15,
+        .ldr_word_imm_signed => |load| load.base == 15,
+        .ldr_byte_imm => |load| load.base == 15,
+        .ldr_halfword_imm => |load| load.base == 15,
+        .ldr_signed_halfword_imm => |load| load.base == 15,
+        .ldr_signed_byte_imm => |load| load.base == 15,
+        .mov_reg => |mov| mov.rm == 15,
+        .movs_reg => |mov| mov.rm == 15,
+        .add_reg => |add| add.rn == 15 or add.rm == 15,
+        .add_shift_reg => |add| add.rn == 15 or add.rm == 15,
+        .add_reg_pc_target => true,
+        else => false,
+    };
+}
+
+fn containsRuntimeCodeTranslation(
+    translations: []const llvm_codegen.RuntimeCodeTranslation,
+    source: armv4t_decode.CodeAddress,
+    bytes: []const u8,
+) bool {
+    for (translations) |translation| {
+        if (translation.source.address != source.address or translation.source.isa != source.isa) continue;
+        if (std.mem.eql(u8, translation.bytes, bytes)) return true;
+    }
+    return false;
 }
 
 fn measuredDevkitArmIwramCodeSpan(image: gba_loader.RomImage) ?MeasuredDevkitArmCopySpan {
@@ -2269,6 +2947,8 @@ fn isRuntimeLoadedBxRegister(
     address: u32,
     reg: u4,
 ) BuildError!bool {
+    if (try measureThumbMovPcJumpTable(image, isa, address, reg) != null) return true;
+
     const previous = try previousInstruction(image, isa, address);
     return switch (previous.instruction) {
         .ldr_word_imm => |load| load.rd == reg and load.base != 15,
@@ -4275,9 +4955,12 @@ fn swiShimName(imm24: u24) ?[]const u8 {
     if (isSqrtSwi(imm24)) return "Sqrt";
     if (isCpuSetSwi(imm24)) return "CpuSet";
     if (isCpuFastSetSwi(imm24)) return "CpuFastSet";
+    if (imm24 == 0x00000E or imm24 == 0x0E0000) return "BgAffineSet";
     if (imm24 == 0x000011 or imm24 == 0x110000) return "LZ77UnCompWram";
     if (imm24 == 0x000012 or imm24 == 0x120000) return "LZ77UnCompVram";
     if (imm24 == 0x000013 or imm24 == 0x130000) return "HuffUnComp";
+    if (imm24 == 0x000014 or imm24 == 0x140000) return "RLUnCompWram";
+    if (imm24 == 0x000015 or imm24 == 0x150000) return "RLUnCompVram";
     if (imm24 == 0x000025 or imm24 == 0x250000) return "MultiBoot";
     if (imm24 == 0x000028 or imm24 == 0x280000) return "SoundDriverVSyncOff";
     return null;
@@ -4367,6 +5050,9 @@ fn compileLlvm(
     if (shouldLinkDl(options)) {
         try argv.append(allocator, "-ldl");
     }
+    if (shouldLinkMath(options)) {
+        try argv.append(allocator, "-lm");
+    }
     try argv.append(allocator, "-o");
     try argv.append(allocator, options.output_path);
 
@@ -4389,6 +5075,11 @@ fn compileLlvm(
 
 fn shouldLinkDl(options: BuildOptions) bool {
     if (options.output_mode != .window) return false;
+    const target = options.target orelse return true;
+    return std.mem.indexOf(u8, target, "linux") != null;
+}
+
+fn shouldLinkMath(options: BuildOptions) bool {
     const target = options.target orelse return true;
     return std.mem.indexOf(u8, target, "linux") != null;
 }
@@ -4856,6 +5547,34 @@ fn writeCpuSetCopyRom(
         0x04000002, // two 32-bit units, copy mode
         42, // source word 0
         99, // source word 1
+    };
+
+    var rom: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u32, rom[index * 4 ..][0..4], word, .little);
+    }
+    try dir.writeFile(io, .{ .sub_path = path, .data = &rom });
+}
+
+fn writeDma3ImmediateCopyRom(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const words = [_]u32{
+        0xE59F1024, // ldr r1, [pc, #0x24] ; DMA3 source register
+        0xE59F0024, // ldr r0, [pc, #0x24] ; source
+        0xE5810000, // str r0, [r1]
+        0xE3A00402, // mov r0, #0x02000000 ; dest
+        0xE5810004, // str r0, [r1, #4]
+        0xE3A0010A, // mov r0, #0x80000002 ; enable, immediate, two halfwords
+        0xE5810008, // str r0, [r1, #8]
+        0xE3A01402, // mov r1, #0x02000000 ; dest
+        0xE5910000, // ldr r0, [r1]
+        0xE12FFF1E, // bx lr
+        0x12345678, // source data
+        0x040000D4, // DMA3 source register literal
+        0x08000028, // source literal
     };
 
     var rom: [words.len * 4]u8 = undefined;
@@ -6061,6 +6780,353 @@ test "kirby measured IRQ handler runtime target is enqueued for dispatch" {
         armv4t_decode.CodeAddress{ .address = 0x0300_1030, .isa = .arm },
         pending.items[0],
     );
+}
+
+test "runtime-copied thumb thunk translation detects measured copy routine" {
+    var rom: [0x100]u8 = std.mem.zeroes([0x100]u8);
+    const source_offset = 0x20;
+    const copy_offset = 0x40;
+    const source_address = 0x0800_0000 + source_offset;
+    const end_address = source_address + 6;
+
+    const thunk_bytes = [_]u8{
+        0x80, 0xB5, // push {r7, lr}
+        0x01, 0xBC, // pop {r0}
+        0x00, 0x47, // bx r0
+    };
+    @memcpy(rom[source_offset..][0..thunk_bytes.len], &thunk_bytes);
+
+    const copy_halfwords = [_]u16{
+        0xB580, 0xB083, 0x466F, 0x6038,
+        0x480A, 0x6839, 0x1C4A, 0x6002,
+        0x4809, 0x60B8, 0x68B8, 0x2101,
+        0x4048, 0x60B8, 0x1D38, 0x4907,
+        0x4A05, 0x1A89, 0x084A, 0x1C11,
+        0x8001, 0x1D38, 0x8801, 0x2900,
+        0xD106, 0xE017,
+    };
+    for (copy_halfwords, 0..) |halfword, index| {
+        std.mem.writeInt(u16, rom[copy_offset + index * 2 ..][0..2], halfword, .little);
+    }
+    std.mem.writeInt(u32, rom[copy_offset + 0x38 ..][0..4], source_address | 1, .little);
+    std.mem.writeInt(u32, rom[copy_offset + 0x3C ..][0..4], end_address | 1, .little);
+
+    const image = gba_loader.RomImage{ .bytes = &rom };
+    const translations = try detectRuntimeCopiedThumbThunkTranslations(std.testing.allocator, image);
+    defer std.testing.allocator.free(translations);
+
+    try std.testing.expectEqual(@as(usize, 1), translations.len);
+    try std.testing.expectEqualDeep(
+        armv4t_decode.CodeAddress{ .address = source_address, .isa = .thumb },
+        translations[0].source,
+    );
+    try std.testing.expectEqual(llvm_codegen.RuntimeCodeTargetRegion.iwram, translations[0].target_region);
+    try std.testing.expectEqualSlices(u8, &thunk_bytes, translations[0].bytes);
+}
+
+test "callback initializer literals enqueue measured commercial thumb targets" {
+    const rom_len = 0x0387F0;
+    var rom = try std.testing.allocator.alloc(u8, rom_len);
+    defer std.testing.allocator.free(rom);
+    @memset(rom, 0);
+
+    std.mem.writeInt(u32, rom[0x0000..][0..4], 0xEAFF_FFFE, .little); // b .
+
+    std.mem.writeInt(u16, rom[0x15B78..][0..2], 0xB5F0, .little); // push {r4, r5, r6, r7, lr}
+    std.mem.writeInt(u16, rom[0x15B7A..][0..2], 0x4770, .little); // bx lr
+    std.mem.writeInt(u16, rom[0x15CA8..][0..2], 0xB5F0, .little); // push {r4, r5, r6, r7, lr}
+    std.mem.writeInt(u16, rom[0x15CAA..][0..2], 0x4770, .little); // bx lr
+
+    const initializer_halfwords = [_]u16{
+        0xB530, // push {r4, r5, lr}
+        0x9D03, // ldr r5, [sp, #12]
+        0x4C08, // ldr r4, [pc, #32]
+        0x6020, // str r0, [r4]
+        0x4808, // ldr r0, [pc, #32]
+        0x6001, // str r1, [r0]
+        0x4808, // ldr r0, [pc, #32]
+        0x6002, // str r2, [r0]
+        0x4808, // ldr r0, [pc, #32]
+        0x7003, // strb r3, [r0]
+        0x4808, // ldr r0, [pc, #32]
+        0x6005, // str r5, [r0]
+    };
+    for (initializer_halfwords, 0..) |halfword, index| {
+        std.mem.writeInt(u16, rom[0x1A768 + index * 2 ..][0..2], halfword, .little);
+    }
+    std.mem.writeInt(u32, rom[0x1A790..][0..4], 0x0201_2A54, .little);
+    std.mem.writeInt(u32, rom[0x1A794..][0..4], 0x0201_2A58, .little);
+    std.mem.writeInt(u32, rom[0x1A798..][0..4], 0x0201_2A5C, .little);
+    std.mem.writeInt(u32, rom[0x1A79C..][0..4], 0x0201_2A60, .little);
+    std.mem.writeInt(u32, rom[0x1A7A0..][0..4], 0x0201_2A64, .little);
+
+    const callsite_halfwords = [_]u16{
+        0x4827, // ldr r0, [pc, #156]
+        0x4928, // ldr r1, [pc, #160]
+        0x4A28, // ldr r2, [pc, #160]
+        0x4B29, // ldr r3, [pc, #164]
+        0x9300, // str r3, [sp]
+        0x2302, // movs r3, #2
+        0xF7E2, // bl 0x0801A768, first half
+        0xF80C, // bl 0x0801A768, second half
+    };
+    for (callsite_halfwords, 0..) |halfword, index| {
+        std.mem.writeInt(u16, rom[0x38740 + index * 2 ..][0..2], halfword, .little);
+    }
+    std.mem.writeInt(u32, rom[0x387E0..][0..4], 0x0801_5CA9, .little);
+    std.mem.writeInt(u32, rom[0x387E4..][0..4], 0x0801_5B79, .little);
+    std.mem.writeInt(u32, rom[0x387E8..][0..4], 0x0202_D000, .little);
+    std.mem.writeInt(u32, rom[0x387EC..][0..4], 0x0300_3314, .little);
+
+    const image = gba_loader.RomImage{ .bytes = rom };
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const program = try liftRomWithOptions(std.testing.allocator, &output.writer, image, .retired_count, 10);
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsFunction(
+        program.functions,
+        .{ .address = 0x0801_5B78, .isa = .thumb },
+    ));
+    try std.testing.expect(containsFunction(
+        program.functions,
+        .{ .address = 0x0801_5CA8, .isa = .thumb },
+    ));
+}
+
+test "global callback setter literals enqueue measured commercial thumb targets" {
+    const rom_len = 0x38400;
+    var rom = try std.testing.allocator.alloc(u8, rom_len);
+    defer std.testing.allocator.free(rom);
+    @memset(rom, 0);
+
+    std.mem.writeInt(u32, rom[0x0000..][0..4], 0xEAFF_FFFE, .little); // b .
+
+    std.mem.writeInt(u16, rom[0x3824C..][0..2], 0x4803, .little); // ldr r0, [pc, #12]
+    std.mem.writeInt(u16, rom[0x3824E..][0..2], 0xF000, .little); // bl 0x08038260, first half
+    std.mem.writeInt(u16, rom[0x38250..][0..2], 0xF807, .little); // bl 0x08038260, second half
+    std.mem.writeInt(u32, rom[0x3825C..][0..4], 0x0803_83F9, .little);
+
+    std.mem.writeInt(u16, rom[0x38260..][0..2], 0x4901, .little); // ldr r1, [pc, #4]
+    std.mem.writeInt(u16, rom[0x38262..][0..2], 0x6008, .little); // str r0, [r1]
+    std.mem.writeInt(u16, rom[0x38264..][0..2], 0x4770, .little); // bx lr
+    std.mem.writeInt(u32, rom[0x38268..][0..4], 0x0300_4478, .little);
+
+    std.mem.writeInt(u16, rom[0x383F8..][0..2], 0xB510, .little); // push {r4, lr}
+    std.mem.writeInt(u16, rom[0x383FA..][0..2], 0x4770, .little); // bx lr
+
+    const image = gba_loader.RomImage{ .bytes = rom };
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const program = try liftRomWithOptions(std.testing.allocator, &output.writer, image, .retired_count, 10);
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsFunction(
+        program.functions,
+        .{ .address = 0x0803_83F8, .isa = .thumb },
+    ));
+}
+
+test "linked thumb callback records enqueue sibling dynamic targets" {
+    var rom: [0x400]u8 = std.mem.zeroes([0x400]u8);
+
+    const linked_target = armv4t_decode.CodeAddress{ .address = 0x0800_0200, .isa = .thumb };
+    const sibling_targets = [_]armv4t_decode.CodeAddress{
+        .{ .address = 0x0800_0300, .isa = .thumb },
+        .{ .address = 0x0800_0320, .isa = .thumb },
+        .{ .address = 0x0800_0340, .isa = .thumb },
+        .{ .address = 0x0800_0360, .isa = .thumb },
+    };
+
+    std.mem.writeInt(u16, rom[0x0200..][0..2], 0xB510, .little);
+    for (sibling_targets) |target| {
+        const offset = target.address - 0x0800_0000;
+        std.mem.writeInt(u16, rom[offset..][0..2], 0xB510, .little);
+    }
+
+    const table_offset = 0x80;
+    for (sibling_targets, 0..) |target, index| {
+        const record_offset = table_offset + index * 24;
+        std.mem.writeInt(u32, rom[record_offset + 8 ..][0..4], linked_target.address | 1, .little);
+        std.mem.writeInt(u32, rom[record_offset + 12 ..][0..4], target.address | 1, .little);
+    }
+
+    const image = gba_loader.RomImage{ .bytes = &rom };
+    var pending: std.ArrayList(armv4t_decode.CodeAddress) = .empty;
+    defer pending.deinit(std.testing.allocator);
+
+    const functions = [_]llvm_codegen.Function{
+        .{ .entry = linked_target, .instructions = &.{} },
+    };
+
+    try std.testing.expect(try enqueueLinkedThumbCallbackRecordTargets(
+        std.testing.allocator,
+        &pending,
+        image,
+        &functions,
+    ));
+    try std.testing.expectEqual(@as(usize, sibling_targets.len), pending.items.len);
+    for (sibling_targets, 0..) |target, index| {
+        try std.testing.expectEqualDeep(target, pending.items[index]);
+    }
+}
+
+test "referenced thumb pointer tables enqueue indexed dynamic targets" {
+    var rom: [0x400]u8 = std.mem.zeroes([0x400]u8);
+
+    const table_address: u32 = 0x0800_0080;
+    const targets = [_]armv4t_decode.CodeAddress{
+        .{ .address = 0x0800_0200, .isa = .thumb },
+        .{ .address = 0x0800_0220, .isa = .thumb },
+        .{ .address = 0x0800_0240, .isa = .thumb },
+        .{ .address = 0x0800_0260, .isa = .thumb },
+    };
+
+    std.mem.writeInt(u32, rom[0x40..][0..4], table_address, .little);
+    for (targets, 0..) |target, index| {
+        std.mem.writeInt(u32, rom[0x80 + index * 4 ..][0..4], target.address | 1, .little);
+        const first_halfword: u16 = if (index == 0) 0x0600 else 0xB510;
+        std.mem.writeInt(u16, rom[target.address - 0x0800_0000 ..][0..2], first_halfword, .little);
+    }
+
+    const node = llvm_codegen.InstructionNode{
+        .address = 0x0800_0000,
+        .condition = .al,
+        .size_bytes = 2,
+        .instruction = .{ .ldr_word_imm = .{ .rd = 6, .base = 15, .offset = 0x3C } },
+    };
+    const functions = [_]llvm_codegen.Function{
+        .{
+            .entry = .{ .address = 0x0800_0000, .isa = .thumb },
+            .instructions = &.{node},
+        },
+    };
+
+    const image = gba_loader.RomImage{ .bytes = &rom };
+    var pending: std.ArrayList(armv4t_decode.CodeAddress) = .empty;
+    defer pending.deinit(std.testing.allocator);
+
+    try std.testing.expect(try enqueueReferencedThumbPointerTableTargets(
+        std.testing.allocator,
+        &pending,
+        image,
+        &functions,
+    ));
+    try std.testing.expectEqual(@as(usize, targets.len), pending.items.len);
+    for (targets, 0..) |target, index| {
+        try std.testing.expectEqualDeep(target, pending.items[index]);
+    }
+}
+
+test "referenced thumb script data enqueues command dynamic targets" {
+    var rom: [0x400]u8 = std.mem.zeroes([0x400]u8);
+
+    const script_pointer_address: u32 = 0x0800_0100;
+    const targets = [_]armv4t_decode.CodeAddress{
+        .{ .address = 0x0800_0200, .isa = .thumb },
+        .{ .address = 0x0800_0220, .isa = .thumb },
+        .{ .address = 0x0800_0240, .isa = .thumb },
+    };
+
+    std.mem.writeInt(u32, rom[0x40..][0..4], script_pointer_address, .little);
+    std.mem.writeInt(u32, rom[0xFC..][0..4], 0x0007_0000, .little);
+    for (targets, 0..) |target, index| {
+        const command_offset = 0x100 + index * 8;
+        std.mem.writeInt(u32, rom[command_offset..][0..4], target.address | 1, .little);
+        std.mem.writeInt(u32, rom[command_offset + 4 ..][0..4], 0x0001_0000 + @as(u32, @intCast(index)), .little);
+        std.mem.writeInt(u16, rom[target.address - 0x0800_0000 ..][0..2], 0x1C02, .little);
+    }
+
+    const image = gba_loader.RomImage{ .bytes = &rom };
+    var pending: std.ArrayList(armv4t_decode.CodeAddress) = .empty;
+    defer pending.deinit(std.testing.allocator);
+
+    try std.testing.expect(try enqueueReferencedThumbScriptDataTargets(
+        std.testing.allocator,
+        &pending,
+        image,
+        &.{},
+    ));
+    try std.testing.expectEqual(@as(usize, targets.len), pending.items.len);
+    for (targets, 0..) |target, index| {
+        try std.testing.expectEqualDeep(target, pending.items[index]);
+    }
+}
+
+test "referenced nested thumb script data skips the list pointer and enqueues command targets" {
+    var rom: [0x400]u8 = std.mem.zeroes([0x400]u8);
+
+    const nested_record_address: u32 = 0x0800_0120;
+    const nested_list_address: u32 = 0x0800_0100;
+    const targets = [_]armv4t_decode.CodeAddress{
+        .{ .address = 0x0800_0200, .isa = .thumb },
+        .{ .address = 0x0800_0220, .isa = .thumb },
+        .{ .address = 0x0800_0240, .isa = .thumb },
+    };
+
+    std.mem.writeInt(u32, rom[0x40..][0..4], nested_record_address, .little);
+    std.mem.writeInt(u32, rom[0x11C..][0..4], 0x0007_0000, .little);
+    std.mem.writeInt(u32, rom[0x120..][0..4], nested_list_address, .little);
+    std.mem.writeInt(u32, rom[0x124..][0..4], 0x0006_0005, .little);
+    for (targets, 0..) |target, index| {
+        const command_offset = 0x128 + index * 8;
+        std.mem.writeInt(u32, rom[command_offset..][0..4], target.address | 1, .little);
+        std.mem.writeInt(u32, rom[command_offset + 4 ..][0..4], 0x0001_0000 + @as(u32, @intCast(index)), .little);
+        std.mem.writeInt(u16, rom[target.address - 0x0800_0000 ..][0..2], 0x1C02, .little);
+    }
+
+    const image = gba_loader.RomImage{ .bytes = &rom };
+    var pending: std.ArrayList(armv4t_decode.CodeAddress) = .empty;
+    defer pending.deinit(std.testing.allocator);
+
+    try std.testing.expect(try enqueueReferencedThumbScriptDataTargets(
+        std.testing.allocator,
+        &pending,
+        image,
+        &.{},
+    ));
+    try std.testing.expectEqual(@as(usize, targets.len), pending.items.len);
+    for (targets, 0..) |target, index| {
+        try std.testing.expectEqualDeep(target, pending.items[index]);
+    }
+}
+
+test "referenced clustered single-entry thumb script data enqueues command targets" {
+    var rom: [0x400]u8 = std.mem.zeroes([0x400]u8);
+
+    const first_script_address: u32 = 0x0800_0100;
+    const second_script_address: u32 = 0x0800_0120;
+    const first_target = armv4t_decode.CodeAddress{ .address = 0x0800_0200, .isa = .thumb };
+    const second_target = armv4t_decode.CodeAddress{ .address = 0x0800_0220, .isa = .thumb };
+
+    std.mem.writeInt(u32, rom[0x40..][0..4], first_script_address, .little);
+    std.mem.writeInt(u32, rom[0x44..][0..4], second_script_address, .little);
+
+    std.mem.writeInt(u32, rom[0xFC..][0..4], 0x0007_0000, .little);
+    std.mem.writeInt(u32, rom[0x100..][0..4], first_target.address | 1, .little);
+    std.mem.writeInt(u32, rom[0x104..][0..4], 0x0001_0000, .little);
+    std.mem.writeInt(u16, rom[first_target.address - 0x0800_0000 ..][0..2], 0x1C02, .little);
+
+    std.mem.writeInt(u32, rom[0x11C..][0..4], 0x0007_0000, .little);
+    std.mem.writeInt(u32, rom[0x120..][0..4], second_target.address | 1, .little);
+    std.mem.writeInt(u32, rom[0x124..][0..4], 0x0001_0000, .little);
+    std.mem.writeInt(u16, rom[second_target.address - 0x0800_0000 ..][0..2], 0x1C02, .little);
+
+    const image = gba_loader.RomImage{ .bytes = &rom };
+    var pending: std.ArrayList(armv4t_decode.CodeAddress) = .empty;
+    defer pending.deinit(std.testing.allocator);
+
+    try std.testing.expect(try enqueueReferencedThumbScriptDataTargets(
+        std.testing.allocator,
+        &pending,
+        image,
+        &.{},
+    ));
+    try std.testing.expectEqual(@as(usize, 2), pending.items.len);
+    try std.testing.expect(containsCodeAddress(pending.items, first_target));
+    try std.testing.expect(containsCodeAddress(pending.items, second_target));
 }
 
 test "kirby measured interworking callback target is enqueued for dispatch" {
@@ -7557,6 +8623,7 @@ test "thumb mov-pc jump table enqueues even thumb table targets" {
         0x4902, // ldr r1, [pc, #8]
         0x1840, // adds r0, r0, r1
         0x6800, // ldr r0, [r0]
+        0x4B02, // ldr r3, [pc, #8]
         0x4687, // mov pc, r0
     };
     for (halfwords, 0..) |halfword, index| {
@@ -7578,12 +8645,22 @@ test "thumb mov-pc jump table enqueues even thumb table targets" {
         &pending,
         image,
         .thumb,
-        0x0800_000A,
+        0x0800_000C,
         0,
     ));
     try std.testing.expectEqual(@as(usize, 2), pending.items.len);
     try std.testing.expect(containsCodeAddress(pending.items, .{ .address = 0x0800_0020, .isa = .thumb }));
     try std.testing.expect(containsCodeAddress(pending.items, .{ .address = 0x0800_0024, .isa = .thumb }));
+
+    try std.testing.expectEqualDeep(
+        armv4t_decode.DecodedInstruction{ .bx_reg = .{ .reg = 0 } },
+        try resolveDecodedInstruction(
+            image,
+            .{ .address = 0x0800_0000, .isa = .thumb },
+            0x0800_000C,
+            .{ .mov_reg = .{ .rd = 15, .rm = 0 } },
+        ),
+    );
 }
 
 test "tonc fixture frontiers reflect the exact local thumb blx r3 veneer slice" {
@@ -8700,6 +9777,45 @@ test "build executes CpuSet copy semantics on a synthetic ROM" {
 
     try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("99\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "build executes DMA3 immediate copy semantics on a synthetic ROM" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeDma3ImmediateCopyRom(tmp.dir, io, "dma3-immediate-copy.gba");
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(
+        io,
+        std.testing.allocator,
+        tmp.dir,
+        &output.writer,
+        .{
+            .rom_path = "dma3-immediate-copy.gba",
+            .machine_name = "gba",
+            .target = "x86_64-linux",
+            .output_path = "dma3-immediate-copy-native",
+            .output_mode = .auto,
+            .optimize = .release,
+        },
+    );
+
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{"./dma3-immediate-copy-native"},
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("305419896\n", result.stdout);
     try std.testing.expectEqualStrings("", result.stderr);
 }
 

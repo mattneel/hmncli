@@ -277,6 +277,54 @@ pub const shims: []const shim_mod.ShimDecl = &.{
         .id = .{
             .kind = .shim,
             .namespace = "gba",
+            .name = "RLUnCompWram",
+        },
+        .state = .implemented,
+        .args = &.{
+            .{ .name = "source", .ty = .guest_ptr },
+            .{ .name = "dest", .ty = .guest_ptr },
+        },
+        .returns = .i32,
+        .effects = .memory_write,
+        .tests = &.{},
+        .doc_refs = &.{
+            .{
+                .label = "GBATEK BIOS RLUnCompWram",
+                .url = "https://problemkaputt.de/gbatek.htm#biosdecompressionfunctions",
+            },
+        },
+        .notes = &.{
+            "Commercial BIOS run-length decompression shim; writes decompressed bytes through guest-memory helpers.",
+        },
+    },
+    .{
+        .id = .{
+            .kind = .shim,
+            .namespace = "gba",
+            .name = "RLUnCompVram",
+        },
+        .state = .implemented,
+        .args = &.{
+            .{ .name = "source", .ty = .guest_ptr },
+            .{ .name = "dest", .ty = .guest_ptr },
+        },
+        .returns = .i32,
+        .effects = .memory_write,
+        .tests = &.{},
+        .doc_refs = &.{
+            .{
+                .label = "GBATEK BIOS RLUnCompVram",
+                .url = "https://problemkaputt.de/gbatek.htm#biosdecompressionfunctions",
+            },
+        },
+        .notes = &.{
+            "Commercial BIOS run-length decompression shim; writes decompressed bytes through guest-memory helpers.",
+        },
+    },
+    .{
+        .id = .{
+            .kind = .shim,
+            .namespace = "gba",
             .name = "MultiBoot",
         },
         .state = .stubbed,
@@ -295,6 +343,31 @@ pub const shims: []const shim_mod.ShimDecl = &.{
         },
         .notes = &.{
             "Build-visible commercial BIOS wrapper. Runtime emits a structured diagnostic unless a future fixture proves it is needed.",
+        },
+    },
+    .{
+        .id = .{
+            .kind = .shim,
+            .namespace = "gba",
+            .name = "BgAffineSet",
+        },
+        .state = .implemented,
+        .args = &.{
+            .{ .name = "source", .ty = .guest_ptr },
+            .{ .name = "dest", .ty = .guest_ptr },
+            .{ .name = "count", .ty = .u32 },
+        },
+        .returns = .i32,
+        .effects = .memory_write,
+        .tests = &.{},
+        .doc_refs = &.{
+            .{
+                .label = "GBATEK BIOS BgAffineSet",
+                .url = "https://problemkaputt.de/gbatek.htm#biosarithmetic",
+            },
+        },
+        .notes = &.{
+            "Commercial BIOS affine-parameter shim used by Advance Wars; computes BG affine destination structs through guest-memory helpers.",
         },
     },
     .{
