@@ -12,11 +12,14 @@ This is not an emulator. There is no interpreter, no JIT, no runtime recompilati
 - The GBA path passes the bundled real-ROM validation set in this repo: `arm`, `thumb`, `bios`, `memory`, `save`, `unsafe`, and the `ppu` fixtures derived from `jsmolka/gba-tests`.
 - The first `tonc` bring-up ladder is green for `sbb_reg`, `obj_demo`, and `key_demo`.
 - The minimal synthetic VBlank interrupt fixture is green under deterministic `VBlankIntrWait` dispatch.
-- `irq_demo` remains intentionally deferred: its current first blocker is still `Unsupported opcode 0x00004718 at 0x08003078 for armv4t`, and its upstream shape exceeds the current VBlank-only interrupt model.
-- A limited `frame_raw` dump path exists for framebuffer inspection: Mode 4, Mode 0 regular BG0 tiles, and the minimal regular OBJ path needed by the current `tonc` demos.
+- `irq_demo` remains intentionally deferred: its current first blocker is `Unsupported opcode 0x0000468F at 0x08002240 for armv4t`, and its upstream shape exceeds the current VBlank-only interrupt model.
+- A `frame_raw` dump path exists for framebuffer inspection: Mode 4, Mode 0 regular BG0-BG3 tile backgrounds, BG priority layering, 4bpp and 8bpp regular tiles, screenblock selection, tile flips, and the current regular/affine OBJ subset.
+- Mode 0 rendering now uses a per-pixel layer compositor, so OBJ priority is resolved against BG priority instead of relying on incidental draw order.
 - mGBA-backed raw frame goldens now exist for the green `tonc` demos: `sbb_reg`, `obj_demo`, and `key_demo`.
 - Deterministic scripted KEYINPUT exists for bring-up smoke tests.
-- There is still no audio backend and no second machine target.
+- Local-only commercial probing is active. Developer-supplied commercial ROMs live under `.zig-cache/local-commercial-roms/` and are never committed.
+- The current local Kirby probe reaches and renders the story/title sequence frame through `frame_raw`, including tiled BG layers and OAM sprites. This is a local bring-up checkpoint, not a committed commercial fixture or compatibility claim.
+- There is still no SDL/window backend, no audio backend, and no second machine target.
 
 ## Quickstart
 
