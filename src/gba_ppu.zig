@@ -21,6 +21,12 @@ pub const FrameError = error{
     UnsupportedVideoMode,
 };
 
+const LayerPixel = struct {
+    priority: u8,
+    tie: u8,
+    written: bool,
+};
+
 fn expand5(value: u5) u8 {
     return (@as(u8, value) << 3) | (@as(u8, value) >> 2);
 }
@@ -57,12 +63,53 @@ fn writeObjPaletteColor(
     rgba[rgba_offset + 3] = 255;
 }
 
+fn shouldWriteLayerPixel(pixel: LayerPixel, priority: u8, tie: u8) bool {
+    if (!pixel.written) return true;
+    if (priority < pixel.priority) return true;
+    if (priority > pixel.priority) return false;
+    return tie < pixel.tie;
+}
+
+fn writeCompositedBgPaletteColor(
+    rgba: *[rgba_len]u8,
+    layers: *[frame_width * frame_height]LayerPixel,
+    palette: *const [1024]u8,
+    x: usize,
+    y: usize,
+    palette_index: usize,
+    priority: u8,
+    tie: u8,
+) void {
+    const pixel_index = (y * frame_width) + x;
+    if (!shouldWriteLayerPixel(layers[pixel_index], priority, tie)) return;
+    layers[pixel_index] = .{ .priority = priority, .tie = tie, .written = true };
+    writePaletteColor(rgba, palette, x, y, palette_index);
+}
+
+fn writeCompositedObjPaletteColor(
+    rgba: *[rgba_len]u8,
+    layers: *[frame_width * frame_height]LayerPixel,
+    palette: *const [1024]u8,
+    x: usize,
+    y: usize,
+    palette_index: usize,
+    priority: u8,
+    tie: u8,
+) void {
+    const pixel_index = (y * frame_width) + x;
+    if (!shouldWriteLayerPixel(layers[pixel_index], priority, tie)) return;
+    layers[pixel_index] = .{ .priority = priority, .tie = tie, .written = true };
+    writeObjPaletteColor(rgba, palette, x, y, palette_index);
+}
+
 fn fillBackdrop(
     palette: *const [1024]u8,
     rgba: *[rgba_len]u8,
+    layers: *[frame_width * frame_height]LayerPixel,
 ) void {
     for (0..frame_height) |y| {
         for (0..frame_width) |x| {
+            layers[(y * frame_width) + x] = .{ .priority = 4, .tie = 0xFF, .written = true };
             writePaletteColor(rgba, palette, x, y, 0);
         }
     }
@@ -106,6 +153,7 @@ fn renderRegularBg(
     palette: *const [1024]u8,
     vram: *const [98304]u8,
     rgba: *[rgba_len]u8,
+    layers: *[frame_width * frame_height]LayerPixel,
     bg_index: usize,
 ) void {
     const bgcnt_offset = 0x08 + (bg_index * 2);
@@ -115,6 +163,8 @@ fn renderRegularBg(
     const cbb: usize = @intCast((bgcnt >> 2) & 0x3);
     const sbb: usize = @intCast((bgcnt >> 8) & 0x1F);
     const color_256 = (bgcnt & 0x0080) != 0;
+    const priority: u8 = @intCast(bgcnt & 0x0003);
+    const tie: u8 = 1 + @as(u8, @intCast(bg_index));
     const size: u2 = @truncate((bgcnt >> 14) & 0x3);
     const hofs = std.mem.readInt(u16, io[hofs_offset..][0..2], .little) & 0x01FF;
     const vofs = std.mem.readInt(u16, io[vofs_offset..][0..2], .little) & 0x01FF;
@@ -139,7 +189,7 @@ fn renderRegularBg(
                 tilePixel4bpp(vram, cbb, tile_id, source_x, source_y);
             if (color_index == 0) continue;
             const palette_index = if (color_256) color_index else (palbank * 16) + color_index;
-            writePaletteColor(rgba, palette, x, y, palette_index);
+            writeCompositedBgPaletteColor(rgba, layers, palette, x, y, palette_index, priority, tie);
         }
     }
 }
@@ -152,7 +202,8 @@ fn dumpMode0Rgba(
     rgba: *[rgba_len]u8,
 ) void {
     const dispcnt = std.mem.readInt(u16, io[0..2], .little);
-    fillBackdrop(palette, rgba);
+    var layers: [frame_width * frame_height]LayerPixel = undefined;
+    fillBackdrop(palette, rgba, &layers);
     var priority: i32 = 3;
     while (priority >= 0) : (priority -= 1) {
         var bg_index: i32 = 3;
@@ -163,11 +214,11 @@ fn dumpMode0Rgba(
             const bgcnt_offset = 0x08 + (bg * 2);
             const bgcnt = std.mem.readInt(u16, io[bgcnt_offset..][0..2], .little);
             if (@as(i32, @intCast(bgcnt & 0x0003)) != priority) continue;
-            renderRegularBg(io, palette, vram, rgba, bg);
+            renderRegularBg(io, palette, vram, rgba, &layers, bg);
         }
     }
     if ((dispcnt & 0x1000) != 0) {
-        renderObjLayer(io, palette, vram, oam, rgba);
+        renderObjLayer(io, palette, vram, oam, rgba, &layers);
     }
 }
 
@@ -252,6 +303,7 @@ fn renderRegular4bppObj(
     palette: *const [1024]u8,
     vram: *const [98304]u8,
     rgba: *[rgba_len]u8,
+    layers: *[frame_width * frame_height]LayerPixel,
     attr0: u16,
     attr1: u16,
     attr2: u16,
@@ -262,6 +314,7 @@ fn renderRegular4bppObj(
     const obj_y = signedObjY(attr0);
     const tile_id: usize = @intCast(attr2 & 0x03FF);
     const palbank: usize = @intCast((attr2 >> 12) & 0xF);
+    const priority: u8 = @intCast((attr2 >> 10) & 0x3);
     const hflip = (attr1 & 0x1000) != 0;
     const vflip = (attr1 & 0x2000) != 0;
 
@@ -275,7 +328,16 @@ fn renderRegular4bppObj(
             const source_y = if (vflip) size.height - 1 - py else py;
             const color_index = objTilePixel4bpp(vram, tile_id, size.width, one_dimensional, source_x, source_y);
             if (color_index == 0) continue;
-            writeObjPaletteColor(rgba, palette, @intCast(screen_x), @intCast(screen_y), (palbank * 16) + color_index);
+            writeCompositedObjPaletteColor(
+                rgba,
+                layers,
+                palette,
+                @intCast(screen_x),
+                @intCast(screen_y),
+                (palbank * 16) + color_index,
+                priority,
+                0,
+            );
         }
     }
 }
@@ -284,6 +346,7 @@ fn renderRegular8bppObj(
     palette: *const [1024]u8,
     vram: *const [98304]u8,
     rgba: *[rgba_len]u8,
+    layers: *[frame_width * frame_height]LayerPixel,
     attr0: u16,
     attr1: u16,
     attr2: u16,
@@ -293,6 +356,7 @@ fn renderRegular8bppObj(
     const obj_x = signedObjX(attr1);
     const obj_y = signedObjY(attr0);
     const tile_id: usize = @intCast(attr2 & 0x03FF);
+    const priority: u8 = @intCast((attr2 >> 10) & 0x3);
     const hflip = (attr1 & 0x1000) != 0;
     const vflip = (attr1 & 0x2000) != 0;
 
@@ -306,7 +370,16 @@ fn renderRegular8bppObj(
             const source_y = if (vflip) size.height - 1 - py else py;
             const color_index = objTilePixel8bpp(vram, tile_id, size.width, one_dimensional, source_x, source_y);
             if (color_index == 0) continue;
-            writeObjPaletteColor(rgba, palette, @intCast(screen_x), @intCast(screen_y), color_index);
+            writeCompositedObjPaletteColor(
+                rgba,
+                layers,
+                palette,
+                @intCast(screen_x),
+                @intCast(screen_y),
+                color_index,
+                priority,
+                0,
+            );
         }
     }
 }
@@ -322,6 +395,7 @@ fn renderAffine8bppObj(
     vram: *const [98304]u8,
     oam: *const [1024]u8,
     rgba: *[rgba_len]u8,
+    layers: *[frame_width * frame_height]LayerPixel,
     attr0: u16,
     attr1: u16,
     attr2: u16,
@@ -331,6 +405,7 @@ fn renderAffine8bppObj(
     const obj_x = signedObjX(attr1);
     const obj_y = signedObjY(attr0);
     const tile_id: usize = @intCast(attr2 & 0x03FF);
+    const priority: u8 = @intCast((attr2 >> 10) & 0x3);
     const affine_index: usize = @intCast((attr1 >> 9) & 0x1F);
     const display_width = if ((attr0 & 0x0200) != 0) size.width * 2 else size.width;
     const display_height = if ((attr0 & 0x0200) != 0) size.height * 2 else size.height;
@@ -364,7 +439,16 @@ fn renderAffine8bppObj(
                 @intCast(source_y),
             );
             if (color_index == 0) continue;
-            writeObjPaletteColor(rgba, palette, @intCast(screen_x), @intCast(screen_y), color_index);
+            writeCompositedObjPaletteColor(
+                rgba,
+                layers,
+                palette,
+                @intCast(screen_x),
+                @intCast(screen_y),
+                color_index,
+                priority,
+                0,
+            );
         }
     }
 }
@@ -375,6 +459,7 @@ fn renderObjLayer(
     vram: *const [98304]u8,
     oam: *const [1024]u8,
     rgba: *[rgba_len]u8,
+    layers: *[frame_width * frame_height]LayerPixel,
 ) void {
     const dispcnt = std.mem.readInt(u16, io[0..2], .little);
     const one_dimensional = (dispcnt & 0x0040) != 0;
@@ -390,11 +475,11 @@ fn renderObjLayer(
         if (((attr0 >> 10) & 0x3) != 0) continue; // no semi-transparent / OBJ-window
 
         if (affine and (attr0 & 0x2000) != 0) {
-            renderAffine8bppObj(palette, vram, oam, rgba, attr0, attr1, attr2, one_dimensional);
+            renderAffine8bppObj(palette, vram, oam, rgba, layers, attr0, attr1, attr2, one_dimensional);
         } else if ((attr0 & 0x2000) != 0) {
-            renderRegular8bppObj(palette, vram, rgba, attr0, attr1, attr2, one_dimensional);
+            renderRegular8bppObj(palette, vram, rgba, layers, attr0, attr1, attr2, one_dimensional);
         } else {
-            renderRegular4bppObj(palette, vram, rgba, attr0, attr1, attr2, one_dimensional);
+            renderRegular4bppObj(palette, vram, rgba, layers, attr0, attr1, attr2, one_dimensional);
         }
     }
 }
@@ -682,6 +767,33 @@ test "mode0 renderer composites a regular 4bpp obj in 1d mapping" {
 
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, rgba[((20 * frame_width) + 10) * 4 ..][0..4]);
     try std.testing.expectEqualSlices(u8, &.{ 0, 66, 0, 255 }, rgba[((20 * frame_width) + 11) * 4 ..][0..4]);
+}
+
+test "mode0 renderer keeps low-priority obj behind higher-priority bg" {
+    var io: [1024]u8 = std.mem.zeroes([1024]u8);
+    var palette: [1024]u8 = std.mem.zeroes([1024]u8);
+    var vram: [98304]u8 = std.mem.zeroes([98304]u8);
+    var oam: [1024]u8 = std.mem.zeroes([1024]u8);
+    var rgba: [rgba_len]u8 = undefined;
+
+    std.mem.writeInt(u16, io[0..2], 0x1140, .little); // mode 0 + BG0 + OBJ + 1D mapping
+    std.mem.writeInt(u16, io[8..10], 0x0100, .little); // BG0 priority 0, SBB1
+    std.mem.writeInt(u16, vram[0x800..][0..2], 0x0000, .little);
+    vram[0] = 0x01;
+    std.mem.writeInt(u16, palette[2..4], 0x001F, .little);
+
+    for (0..128) |obj_index| {
+        std.mem.writeInt(u16, oam[obj_index * 8 ..][0..2], 0x0200, .little); // regular OBJ disabled
+    }
+    vram[0x10000] = 0x01;
+    std.mem.writeInt(u16, palette[0x202..][0..2], 0x03E0, .little);
+    std.mem.writeInt(u16, oam[0..2], 0, .little); // y
+    std.mem.writeInt(u16, oam[2..4], 0, .little); // x
+    std.mem.writeInt(u16, oam[4..6], 0x0C00, .little); // tile 0, OBJ priority 3
+
+    try dumpFrameRgba(&io, &palette, &vram, &oam, &rgba);
+
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, rgba[0..4]);
 }
 
 test "mode0 renderer composites a regular 8bpp obj in 2d mapping" {
